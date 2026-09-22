@@ -1,0 +1,13 @@
+# Ambiente Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Materiale delle lezioni (grande, non versionare)
+lezioni/
+trascrizioni/
+testdata/
+
+# Cache
+.pipcache/
+.piptmp/
