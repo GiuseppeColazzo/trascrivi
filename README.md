@@ -245,6 +245,30 @@ English-only models (anything ending in `.en`, plus every `distil-*`) combined w
 language are rejected with **HTTP 422** before the job is created, so you find out immediately instead of
 after ten minutes of GPU time.
 
+#### Beam size — what it actually buys you
+
+Beam search keeps several candidate decodings alive and keeps the most likely one, so it trades time for
+accuracy. Measured on this machine (RTX 4060 Laptop 8 GB, `small`, float16, 5 minutes of a real lecture):
+
+| Beam | Time | Speed | Words |
+|---|---|---|---|
+| 1 (greedy) | 22.7 s | 13.2x realtime | 792 |
+| **5** (default) | 25.7 s | 11.7x realtime | 793 |
+| 10 | 30.4 s | 9.9x realtime | 807 |
+
+Comparing the text of beam 1 against beam 5 on the same clip, about 10% of the words differ, and the
+differences are mostly punctuation and disfluencies (`small, because` vs `small because`) rather than
+misheard terminology. On clean lecture audio:
+
+- **5** is the balanced default and what the form pre-fills.
+- **1** is worth it while iterating (a quick draft before committing to a 90-minute run) or on CPU, where
+  every extra candidate costs real minutes.
+- **10+** is not worth it here: ~18% more time than the default for a text that is essentially the same. On
+  noisy recordings or strong accents the curve is a little more favourable to wider beams, but the ceiling
+  is low.
+
+The field applies to **that job only**; it is not persisted, so every new lecture starts again at 5.
+
 ---
 
 ## REST API
