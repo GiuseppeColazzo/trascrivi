@@ -66,7 +66,12 @@ Rules for "replace":
 - Never add or remove information, never translate, never reorder words.
 
 Be strict. Most chunks contain only a handful of real recognition errors; returning very few items, or none at all, is the correct answer for clean audio.
-At most 15 items in "replacements", 12 words per "reason". "glossary" is optional and at most 3 entries."""
+Hard limits, and they are low on purpose:
+- at most 5 items in "replacements". A 30-minute stretch usually contains two or three real errors, not twenty.
+- every item must carry "confidence": 0.9 or higher. If you are not that sure, leave it out.
+- 12 words per "reason". "glossary" is optional and at most 3 entries.
+
+Do not try to fill the quota. Filling it with guesses is worse than returning nothing: a wrong suggestion costs the reader more than a missed correction."""
 
 
 # ── Chunking ─────────────────────────────────────────────────────────────────
@@ -101,6 +106,13 @@ def chunk_segments(segments: list[dict], budget: int = 8000) -> list[list[dict]]
 def chunk_text(chunk: list[dict]) -> str:
     from .textutil import fmt_ts
     return "\n".join(f"[{fmt_ts(s.get('start', 0.0))}] {s.get('text', '')}" for s in chunk)
+
+
+# Sotto questa confidenza la proposta viene scartata. Misurato: senza soglia il
+# modello riempie la quota di ipotesi (0.4-0.7); con cap basso e soglia 0.9
+# restano solo le correzioni difendibili. Una correzione sbagliata costa al
+# lettore più di una correzione mancata.
+MIN_CONFIDENCE = 0.9
 
 
 # ── Chiavi ───────────────────────────────────────────────────────────────────
@@ -259,6 +271,9 @@ def _clean_proposals(payload: dict) -> list[dict]:
             conf = float(conf) if conf is not None else None
         except (TypeError, ValueError):
             conf = None
+        # Sotto la soglia la proposta non arriva nemmeno in review.
+        if conf is not None and conf < MIN_CONFIDENCE:
+            continue
         out.append({
             "find": find,
             "replace": replace,

@@ -182,23 +182,43 @@ def test_clean_proposals_drops_invalid_entries_and_normalizes_fields():
     payload = {
         "replacements": [
             {"find": "  pie torch  ", "replace": "PyTorch", "kind": "TERM",
-             "confidence": "0.5", "reason": "termine tecnico"},
+             "confidence": "0.95", "reason": "termine tecnico"},
             {"replace": "senza find"},
             {"find": "x", "confidence": "non-un-numero"},
-            {"find": "y", "confidence": 0},
+            {"find": "y", "confidence": 0.9},
             "non sono un dict",
         ]
     }
 
     out = _clean_proposals(payload)
 
+    # L'entry senza confidenza valida (None) resta: la soglia si applica solo a
+    # un valore numerico, non all'assenza del campo.
     assert [p["find"] for p in out] == ["pie torch", "x", "y"]
     assert out[0] == {"find": "pie torch", "replace": "PyTorch", "reason": "termine tecnico",
-                      "kind": "term", "confidence": 0.5}
+                      "kind": "term", "confidence": 0.95}
     assert out[1]["replace"] == ""
     assert out[1]["kind"] == "other"
     assert out[1]["confidence"] is None
-    assert out[2]["confidence"] == 0.0
+    assert out[2]["confidence"] == 0.9
+
+
+def test_clean_proposals_drops_low_confidence_guesses():
+    """
+    Il modello riempie la quota di ipotesi quando glielo si consente: sotto la
+    soglia la proposta non deve arrivare in review. Misurato: con cap 15 le
+    proposte avevano confidenza 0.4-0.7 e molte erano inapplicabili.
+    """
+    payload = {"replacements": [
+        {"find": "a electoral band", "replace": "exponential", "confidence": 0.6},
+        {"find": "technological religions", "replace": "technological revolutions", "confidence": 0.95},
+        {"find": "the quality as well", "replace": "the inequality as well", "confidence": 0.4},
+        {"find": "the Pillar M's", "replace": "the algorithms", "confidence": 0.9},
+    ]}
+
+    out = _clean_proposals(payload)
+
+    assert [p["find"] for p in out] == ["technological religions", "the Pillar M's"]
 
 
 def test_clean_proposals_without_replacements_key():

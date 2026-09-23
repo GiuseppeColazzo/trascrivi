@@ -206,6 +206,13 @@ kind of thing you actually want:
 | `gave back` | `give-back` | noun, not a verb, in this sentence |
 | `environmental research of knowledge` | `environmental erosion of knowledge` | collocation |
 
+The prompt also **caps the output at 5 items per chunk and requires `confidence >= 0.9`** (anything
+lower is dropped before review). This matters more than it looks: given room, the model fills the quota
+with guesses — with a cap of 15 the same chunk produced 14 edits whose confidence was 0.4–0.7, including
+invented wording like *"It hasn't been the same as what has happened"*. With the low cap it returns 6,
+all defensible, at **1/3 of the output tokens**. Volume is not value here: a wrong suggestion costs the
+reader more than a missed correction.
+
 #### Proposal flags
 
 Every proposal is validated against the actual segments and tagged. You can only apply what the engine
@@ -226,23 +233,26 @@ If a chunk is still too big to fit in one answer (the JSON gets cut off mid-obje
 
 #### Cost of a lecture
 
-Measured on a real 88-minute lecture (203 segments, 65 756 characters → 18 chunks, 47 s of wall clock):
+Measured on a real 88-minute lecture (203 segments, 65 756 characters → 18 chunks, 28 s of wall clock):
 
-| | Tokens |
-|---|---|
-| Input | 27 558 (23 936 cached, 3 622 fresh) |
-| Output | 12 018 (all of it text: thinking is disabled) |
+| | Before | Now (cap 5, confidence ≥ 0.9) |
+|---|---|---|
+| Proposals returned | 563 | 61 |
+| Input tokens | 27 558 | 29 088 |
+| Output tokens | 12 018 | **4 714** |
+| Off-peak cost, 10 lectures | $0.078 | **$0.034** |
 
 At the published `deepseek-flash` rates ([api-docs.deepseek.com](https://api-docs.deepseek.com/quick_start/pricing),
-USD per 1M tokens; cache hit is 50× cheaper than a cache miss):
+USD per 1M tokens; a cache hit is 50× cheaper than a miss):
 
 | Rate | 1 lecture | 10 lectures |
 |---|---|---|
-| Off-peak ($0.003 hit / $0.15 miss / $0.60 output) | **$0.008** | **$0.08** |
-| Peak ($0.006 hit / $0.30 miss / $1.20 output) | $0.016 | $0.16 |
+| Off-peak ($0.003 hit / $0.15 miss / $0.60 output) | **$0.003** | **$0.03** |
+| Peak ($0.006 hit / $0.30 miss / $1.20 output) | $0.007 | $0.07 |
 
-Output dominates the bill (~78%), which is exactly why the restrictive prompt pays off twice: fewer
-proposals mean less to read *and* less to pay for.
+Output dominates the bill (~78% before, ~50% now), which is why the low cap pays off twice: fewer
+proposals mean less to read *and* less to pay for. The input side is nearly free because the system
+prompt is served from DeepSeek's context cache across all 18 chunks.
 
 The agent is **opt-in per job** and can be **re-run on any existing transcript** from the Transcript
 screen.
