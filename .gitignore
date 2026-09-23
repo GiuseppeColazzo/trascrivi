@@ -8,6 +8,14 @@ lezioni/
 trascrizioni/
 testdata/
 
+# Stato e dati della piattaforma (DB, copie audio, chiavi API, trascrizioni)
+data/
+
+# Segreti e cache locali
+.env
+.uvcache/
+.pytest_cache/
+
 # Cache
 .pipcache/
 .piptmp/

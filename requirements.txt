@@ -1,0 +1,20 @@
+# Dipendenze runtime della piattaforma web.
+# faster-whisper (con ctranslate2, av, onnxruntime) va installato a parte:
+#   .\.venv\Scripts\python.exe -m pip install faster-whisper
+faster-whisper
+rich
+requests
+
+# --- Aggiunte per la piattaforma web ---
+# Server HTTP + validazione JSON. Non esistono alternative in stdlib.
+fastapi
+uvicorn
+python-multipart      # parsing multipart per l'upload dei file audio
+
+# Cifratura delle API key dei provider LLM (Fernet). Gia' presente nel venv.
+cryptography
+# Client OpenAI-compatibile: un adapter copre OpenRouter, DeepSeek e Ollama.
+openai
+
+# --- Solo sviluppo ---
+pytest

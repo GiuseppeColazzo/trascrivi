@@ -18,6 +18,11 @@ Ottimizzazioni rispetto alla versione sequenziale
    `--skip-existing` per riprendere lotti interrotti senza rifare il lavoro.
 6. Progresso aggregato e riepilogo tempi per file.
 
+Questo file resta il MOTORE di trascrizione ed e' usato sia dalla CLI sia dalla
+piattaforma web (modulo `trascrivi`). Le funzioni pubbliche sono retrocompatibili:
+la piattaforma passa solo i parametri extra keyword-only
+(`progress_cb`, `should_stop`, `return_segments`, `write_segments`, `initial_prompt`).
+
 Installazione:
     python -m venv --system-site-packages .venv
     .venv\\Scripts\\pip install faster-whisper
@@ -40,6 +45,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Iterable
 
 # ── Compatibilità Windows / Hugging Face ────────────────────────────────────
 # DEVE stare PRIMA di importare faster_whisper (che importa huggingface_hub).
@@ -103,6 +109,27 @@ def _register_cuda_dlls() -> bool:
 
 
 _CUDA_DLLS_REGISTERED = _register_cuda_dlls()
+
+
+def _make_console_utf8_safe() -> None:
+    """
+    Evita il crash di rich sulla console Windows in code page 1252.
+
+    Il riepilogo finale contiene emoji (✅, 🌍…): su un `cmd` legacy la codifica
+    fallisce con
+        UnicodeEncodeError: 'charmap' codec can't encode character '\\u2705'
+    e la trascrizione va a buon fine ma il processo termina con errore. Forziamo
+    UTF-8 con `backslashreplace`: il testo resta leggibile e nessuna stampa può
+    più far cadere il processo a lavoro completato.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+_make_console_utf8_safe()
 
 # ── Dipendenze esterne ──────────────────────────────────────────────────────
 try:
@@ -168,8 +195,15 @@ DEFAULT_LANGUAGE = "en"
 LARGE_MODEL_MIN_VRAM_GB = 4.0
 
 # Marcatore dei WAV temporanei prodotti dalle versioni precedenti dello script.
-# Viene usato solo per ignorarli se ne trovi ancora in giro.
+# Viene usato solo per ignorare se ne trovi ancora in giro.
 TEMP_MARKER = ".trascrivi_tmp.wav"
+
+
+def is_english_only(model_name: str) -> bool:
+    """True se il modello funziona solo in inglese (distil-* o *.en)."""
+    return model_name.startswith(ENGLISH_ONLY_PREFIXES) or model_name.endswith(
+        ENGLISH_ONLY_SUFFIX
+    )
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -199,7 +233,6 @@ def _md(msg: str) -> str:
 
 
 def _strip_markup(msg: str) -> str:
-    import re
     return re.sub(r"\[/?[a-zA-Z0-9_# =. ]+\]", "", msg)
 
 
@@ -229,6 +262,17 @@ def cuda_free_vram_gb(device_index: int = 0) -> float | None:
         if torch.cuda.is_available():
             free, _total = torch.cuda.mem_get_info(device_index)
             return free / (1024 ** 3)
+    except Exception:
+        pass
+    return None
+
+
+def cuda_gpu_name(device_index: int = 0) -> str | None:
+    """Nome della GPU, o None se non disponibile."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name(device_index)
     except Exception:
         pass
     return None
@@ -314,6 +358,32 @@ def _fmt_ts(seconds: float) -> str:
 
 _TS_RE = re.compile(r"^\[(\d+):(\d{2})(?::(\d{2}))?\]")
 
+# Valori sentinella per il canale di stop condiviso (usato dalla piattaforma web).
+STOP_ERROR = "error"
+STOP_STOP = "stop"
+
+
+def read_stop_flag(shared: object | None) -> str | None:
+    """
+    Legge il motivo di stop da un oggetto condiviso, in modo tollerante.
+
+    La piattaforma web passa una `multiprocessing.Event` (che non sa comunicare
+    il motivo); qui accettiamo anche oggetti con `read_flag()`/`value`. Tutto il
+    resto viene interpretato come "nessuno stop".
+    """
+    if shared is None:
+        return None
+    value = getattr(shared, "value", None)
+    for candidate in (shared, value):
+        read_flag = getattr(candidate, "read_flag", None)
+        if callable(read_flag):
+            try:
+                flag = read_flag()
+            except Exception:
+                continue
+            return flag if flag in (STOP_STOP, STOP_ERROR) else None
+    return None
+
 
 def last_transcribed_seconds(output_path: Path) -> float:
     """
@@ -326,7 +396,7 @@ def last_transcribed_seconds(output_path: Path) -> float:
         return 0.0
     try:
         last = 0.0
-        # Legge il file al contrario: l'ultima riga è quella che ci interessa.
+        # Legge il file al termine: l'ultima riga utile è quella che ci interessa.
         with output_path.open("r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 m = _TS_RE.match(line)
@@ -366,20 +436,44 @@ def trascrivi_file(
     clip_seconds: float | None = None,
     resume_from: float = 0.0,
     flush_every: float = 30.0,
-) -> tuple[str, float, str, float]:
+    initial_prompt: str | None = None,
+    audio_duration: float | None = None,
+    progress_cb: Callable[[float, int], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    return_segments: bool = False,
+    write_segments: bool = False,
+) -> tuple:
     """
     Trascrive un file. Restituisce (testo, durata_audio, lingua, secondi_trascorsi).
+
+    Con return_segments=True restituisce in coda la lista dei segmenti
+    [{"start": float, "end": float, "text": str}], utile alla piattaforma web.
 
     clip_seconds limita l'elaborazione ai primi N secondi (utile per prove rapide).
     resume_from riparte da un istante gia' trascritto (vedi --resume).
     flush_every scrive su disco ogni N secondi di audio, cosi' un'interruzione
     non fa perdere il lavoro fatto.
+    progress_cb(end_seconds, count) viene chiamata dopo ogni segmento.
+    should_stop() viene interrogata a ogni segmento: se restituisce True il loop
+    si interrompe in modo pulito e il file parziale resta valido.
+    audio_duration è la durata nota del file (da probe_media): serve alla
+    pipeline batched, che con `clip_timestamps` non accetta una fine "infinita".
+    write_segments accetta anche le righe `[mm:ss] testo` in un file di input
+    gia' trascritto (import di trascrizioni esistenti).
     Il testo include timestamp [mm:ss] se write_timestamps e' attivo.
     """
     logger.info(_md(f"📂  Apertura file: [bold]{audio_path.name}[/bold]"))
     t_start = time.time()
 
     # ── Avvio: con batch_size > 1 usiamo la pipeline batched ────────────────
+    # ATTENZIONE: BatchedInferencePipeline usa il VAD per formare i batch.
+    # Con vad_filter=False e senza clip_timestamps fallisce con
+    #   RuntimeError: No clip timestamps found.
+    # Senza VAD quindi si resta sul percorso non batched (batch_size=1): è la
+    # stessa scelta che farebbe ctranslate2, ma esplicita e senza crash.
+    if not vad_filter and batch_size and batch_size > 1:
+        logger.warning(_md("⚠️   VAD disattivato: batching non disponibile, uso batch=1."))
+        batch_size = 1
     use_batched = batch_size and batch_size > 1
     common = dict(
         language=language,
@@ -388,24 +482,41 @@ def trascrivi_file(
         vad_parameters=dict(min_silence_duration_ms=500),
         word_timestamps=word_timestamps,
     )
+    if initial_prompt:
+        common["initial_prompt"] = initial_prompt
 
-    # clip_timestamps accetta una sequenza di intervalli [start, end, ...]:
-    # la usiamo per la ripresa (start = punto raggiunto) e per --benchmark.
+    # Con un intervallo di clip (ripresa o benchmark) NON si usa il batching:
+    # BatchedInferencePipeline, quando riceve clip_timestamps, costruisce un solo
+    # chunk e scarta il resto dell'audio (verificato: 30 minuti di lezione
+    # producevano un unico segmento "Let's start..."). Il percorso non batched
+    # (WhisperModel.transcribe) gestisce clip_timestamps in modo corretto.
     clip_start = resume_from if resume_from > 0 else 0.0
     clip_end = float(clip_seconds) if clip_seconds else None
+    clip_args: dict = {}
     if clip_end is not None or clip_start > 0:
-        if clip_end is None or clip_end <= clip_start:
-            common["clip_timestamps"] = [clip_start, clip_start + 1e9]
+        if clip_end is not None and clip_end > clip_start:
+            end_value = clip_end
+        elif audio_duration and audio_duration > clip_start:
+            # Fine "aperta" (ripresa fino in fondo): chiudiamo alla durata reale.
+            end_value = float(audio_duration)
         else:
-            common["clip_timestamps"] = [clip_start, clip_end]
+            end_value = clip_start + 3600.0
+        clip_args = {"clip_timestamps": [clip_start, end_value]}
+        if use_batched:
+            logger.warning(
+                _md("⚠️   Intervallo di clip richiesto: batching disattivato (batch=1).")
+            )
+            use_batched = False
 
     if use_batched:
         pipeline = BatchedInferencePipeline(model=model)
         segments, info = pipeline.transcribe(
-            str(audio_path), batch_size=batch_size, **common
+            str(audio_path), batch_size=batch_size, **common, **clip_args
         )
     else:
-        segments, info = model.transcribe(str(audio_path), batch_size=1, **common)
+        # `batch_size` è un parametro di BatchedInferencePipeline, non di
+        # WhisperModel.transcribe: passarlo qui è un TypeError.
+        segments, info = model.transcribe(str(audio_path), **common, **clip_args)
 
     detected_lang = info.language or (language or "?")
     duration_s = info.duration or 0.0
@@ -442,23 +553,35 @@ def trascrivi_file(
     # Nota: faster-whisper restituisce un generatore pigro, quindi il tempo di
     # inferenza viene speso QUI, non nella chiamata transcribe().
     testo_segmenti: list[str] = []
+    segmenti: list[dict] = []
     n_segmenti = 0
     last_flush = 0.0
+    stopped = False
     transcribe_seconds = 0.0
 
     def _on_segment(seg) -> str:
         """Formatta un segmento e, se serve, svuota il buffer su disco."""
         nonlocal n_segmenti, last_flush
-        line = f"[{_fmt_ts(seg.start)}] {seg.text.strip()}" if write_timestamps else seg.text.strip()
-        testo_segmenti.append(line)
+        linea = seg.text.strip()
+        # Con write_segments il file di output è pensato per essere riletto con
+        # parse_raw (import): i timestamp servono anche quando l'utente non li
+        # vuole nel testo finale.
+        testo_segmenti.append(f"[{_fmt_ts(seg.start)}] {linea}"
+                              if (write_timestamps or write_segments) else linea)
+        if return_segments:
+            segmenti.append({"start": float(seg.start), "end": float(seg.end), "text": linea})
         n_segmenti += 1
+        # Il flush incrementale resta attivo anche raccogliendo i segmenti in
+        # memoria: è ciò che rende riprendibile un job interrotto.
         if fh is not None and seg.end - last_flush >= flush_every:
             fh.write("\n".join(testo_segmenti) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
             testo_segmenti.clear()
             last_flush = seg.end
-        return line
+        if progress_cb is not None:
+            progress_cb(float(seg.end), n_segmenti)
+        return linea
 
     if RICH_AVAILABLE:
         console = Console(stderr=True)
@@ -478,6 +601,9 @@ def trascrivi_file(
             for seg in segments:
                 _on_segment(seg)
                 progress.update(task, completed=min(seg.end, effective_duration))
+                if should_stop is not None and should_stop():
+                    stopped = True
+                    break
             progress.update(task, completed=max(effective_duration, 1.0))
         transcribe_seconds = time.time() - t_start
     else:
@@ -489,10 +615,16 @@ def trascrivi_file(
                 _on_segment(seg)
                 pbar.update(max(0.0, seg.end - prev_end))
                 prev_end = seg.end
+                if should_stop is not None and should_stop():
+                    stopped = True
+                    break
             pbar.close()
         except ImportError:
             for seg in segments:
                 _on_segment(seg)
+                if should_stop is not None and should_stop():
+                    stopped = True
+                    break
         transcribe_seconds = time.time() - t_start
 
     # ── Flush finale + chiusura ─────────────────────────────────────────────
@@ -508,6 +640,9 @@ def trascrivi_file(
         os.fsync(fh.fileno())
         fh.close()
 
+    if stopped:
+        logger.warning(_md(f"⏹   {audio_path.name}: interrotto dall'utente, output parziale salvato."))
+
     rt = effective_duration / transcribe_seconds if transcribe_seconds > 0 else 0.0
     logger.info(
         _md(
@@ -516,6 +651,8 @@ def trascrivi_file(
             f"({n_segmenti} segmenti, [magenta]{rt:.1f}x realtime[/magenta])"
         )
     )
+    if return_segments:
+        return testo, duration_s, detected_lang, transcribe_seconds, segmenti
     return testo, duration_s, detected_lang, transcribe_seconds
 
 
@@ -546,7 +683,7 @@ def _worker_task(job: tuple[str, str]) -> tuple[str, str, float, str, float, str
     log = logging.getLogger("trascrittore")
     target = Path(out)
     start_at = resume_offset(target, _WORKER_CFG.get("resume", False) and
-                             _WORKER_CFG["write_timestamps"])
+                             _WORKER_CFG.get("write_timestamps", False))
     try:
         testo, durata, lingua, secondi = trascrivi_file(
             Path(src), _WORKER_MODEL, _WORKER_CFG["language"], log,
@@ -641,6 +778,9 @@ Modelli consigliati per lezioni in inglese (veloci, accuratezza ~large-v3):
                         help="Timestamp a livello di parola (piu' lento)")
     parser.add_argument("--no-vad", action="store_true",
                         help="Disattiva il filtro VAD (silenzio rimosso)")
+    parser.add_argument("--initial-prompt", default=None, metavar="TESTO",
+                        help="Vocabolario/contesto iniziale per migliorare il lessico "
+                             "(nomi propri, sigle, termini tecnici del corso)")
     parser.add_argument("--skip-existing", action="store_true",
                         help="Salta i file il cui .txt esiste gia'")
     parser.add_argument("--resume", action="store_true",
@@ -721,6 +861,7 @@ def run_sequential(audio_files, out_map, model, args, logger):
         target = Path(target)
         start_at = resume_offset(target, args.resume and args.timestamps)
         try:
+            _has_audio, known_duration = probe_media(audio_path)
             testo, durata, lingua, secondi = trascrivi_file(
                 audio_path, model, args.language_normalized, logger,
                 batch_size=args.batch_size_resolved,
@@ -731,6 +872,8 @@ def run_sequential(audio_files, out_map, model, args, logger):
                 clip_seconds=args.benchmark,
                 resume_from=start_at,
                 output_path=target,
+                initial_prompt=args.initial_prompt,
+                audio_duration=known_duration,
             )
             results.append((src, str(target), durata, lingua, secondi, None))
         except Exception as exc:  # noqa: BLE001
@@ -748,10 +891,7 @@ def main(argv: list[str] | None = None) -> None:
     args.language_normalized = None if lang.lower() in {"auto", ""} else lang.lower()
 
     # ── Vincoli modello/lingua ───────────────────────────────────────────────
-    eng_only = args.model.startswith(ENGLISH_ONLY_PREFIXES) or args.model.endswith(
-        ENGLISH_ONLY_SUFFIX
-    )
-    if eng_only and args.language_normalized not in (None, "en"):
+    if is_english_only(args.model) and args.language_normalized not in (None, "en"):
         logger.error(
             _md(
                 f"❌  Il modello [bold]{args.model}[/bold] funziona solo in inglese, "
@@ -760,7 +900,7 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
         sys.exit(2)
-    if eng_only and args.language_normalized is None:
+    if is_english_only(args.model) and args.language_normalized is None:
         # Con auto-detection i modelli .en non sono affidabili: forziamo 'en'.
         logger.warning(
             _md(f"⚠️   {args.model} è solo-inglese: imposto la lingua a 'en'.")

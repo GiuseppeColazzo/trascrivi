@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trascrivi — lecture registry</title>
+<script>
+  // Applicato prima del CSS per evitare il lampo di tema sbagliato.
+  (function () {
+    var saved = localStorage.getItem("trascrivi-theme");
+    var dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.dataset.theme = saved || (dark ? "dark" : "light");
+  })();
+</script>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎓</text></svg>">
+</head>
+<body>
+<header class="app">
+  <a class="brand" href="#/"><span class="dot"></span>Trascrivi</a>
+  <nav aria-label="Main">
+    <button class="ghost" data-nav="#/">Library</button>
+    <button class="ghost" data-nav="#/jobs">Jobs <span id="navJobs" class="badge hidden">0</span></button>
+    <button class="ghost" data-nav="#/settings">Settings</button>
+  </nav>
+  <div class="search">
+    <label class="hidden" for="globalSearch">Search transcripts</label>
+    <input id="globalSearch" type="search" placeholder="Search all transcripts…" autocomplete="off">
+  </div>
+  <button id="themeToggle" class="ghost" title="Toggle light/dark" aria-label="Toggle light/dark theme">🌙</button>
+</header>
+
+<main id="view" aria-live="polite"></main>
+<div id="toasts" aria-live="assertive"></div>
+
+<dialog id="confirmDialog">
+  <form method="dialog">
+    <h2 id="confirmTitle">Confirm</h2>
+    <p id="confirmText"></p>
+    <div class="split" style="justify-content:flex-end">
+      <button value="cancel">Cancel</button>
+      <button id="confirmOk" class="danger" value="ok">Delete</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/app.js" type="module"></script>
+</body>
+</html>
