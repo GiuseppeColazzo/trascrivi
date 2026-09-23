@@ -90,7 +90,7 @@ def test_reasoning_exhaustion_suggests_a_non_reasoning_model(monkeypatch):
     detail = llm._error_detail(diag)
 
     assert "internal reasoning" in detail
-    assert "deepseek-chat" in detail
+    assert "deepseek-flash" in detail
 
 
 def test_unreadable_key_is_reported_not_silently_ignored(monkeypatch, tmp_path):

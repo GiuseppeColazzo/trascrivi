@@ -409,35 +409,102 @@ def cleanup_source(source: dict) -> None:
 
 def _maybe_queue_agent(job: dict, payload: dict, result: dict) -> None:
     """
-    Se l'utente ha spuntato "run correction agent", accoda il job agente.
+    Accoda i job LLM che l'utente ha chiesto al momento della trascrizione.
 
     L'accodamento avviene qui e non nell'endpoint perché prima serve la
-    trascrizione: così l'ordine è garantito e il fallimento dell'agente non
+    trascrizione: così l'ordine è garantito e il fallimento di un job LLM non
     tocca il lavoro di trascrizione, che è già salvato.
+
+    Due follow-up possibili, indipendenti fra loro:
+    * `run_summary`  -> riassunto della lezione appena trascritta;
+    * `run_agent`    -> correzione degli errori di riconoscimento.
     """
-    if not payload.get("run_agent"):
-        return
     transcript_id = result.get("transcript_id")
     if not transcript_id:
         return
-    provider_id = payload.get("provider_id")
-    if provider_id is None:
+    wanted_summary = bool(payload.get("run_summary"))
+
+    if payload.get("run_agent"):
+        _queue_llm_job(job, "llm_fix",
+                       {"transcript_id": transcript_id, "provider_id": payload.get("provider_id"),
+                        "instruction": payload.get("instruction") or ""},
+                       transcript_id, "agent")
+    if wanted_summary:
+        _queue_llm_job(job, "llm_summary",
+                       {"transcript_id": transcript_id,
+                        "provider_id": payload.get("summary_provider_id")
+                        or payload.get("provider_id"),
+                        "style": payload.get("summary_style") or "",
+                        "instruction": payload.get("summary_instruction") or ""},
+                       transcript_id, "summary")
+
+
+def _queue_llm_job(job: dict, kind: str, payload: dict, transcript_id: int, label: str) -> None:
+    """Crea il job LLM, risolvendo il provider e segnalando in `message` se manca."""
+    if payload.get("provider_id") is None:
         providers = [p for p in db.list_providers() if p["enabled"] and p["has_key"]]
         if not providers:
-            db.update_job(job["id"], message=(db.get_job(job["id"]) or {}).get("message", "")
-                          + " . agent skipped: no provider")
-            log.warning("job %s: agente richiesto ma nessun provider configurato", job["id"])
+            current = (db.get_job(job["id"]) or {}).get("message") or ""
+            db.update_job(job["id"], message=f"{current} . {label} skipped: no provider")
+            log.warning("job %s: %s richiesto ma nessun provider configurato", job["id"], label)
             return
-        provider_id = providers[0]["id"]
-    agent_job = db.create_job(
-        "llm_fix",
-        {"transcript_id": transcript_id, "provider_id": provider_id,
-         "instruction": payload.get("instruction") or ""},
-        project_id=job.get("project_id"), transcript_id=transcript_id,
+        payload["provider_id"] = providers[0]["id"]
+    new_job = db.create_job(kind, payload, project_id=job.get("project_id"),
+                            transcript_id=transcript_id)
+    enqueue(new_job)
+    log.info("job %s: accodato job %s %s per la trascrizione %s",
+             job["id"], kind, new_job, transcript_id)
+
+
+def run_summary(job_id: int, payload: dict) -> dict:
+    """Genera e salva il riassunto di una trascrizione."""
+    from . import summary as summary_mod
+
+    transcript_id = int(payload["transcript_id"])
+    transcript = db.get_transcript(transcript_id)
+    if transcript is None:
+        raise ValueError("Transcript not found")
+
+    provider = db.get_provider(int(payload["provider_id"])) if payload.get("provider_id") else None
+    if provider is None:
+        raise ValueError("LLM provider not configured")
+
+    settings = config.load_settings()
+    style = payload.get("style") or settings.summary_style or "study"
+
+    def on_progress(fraction: float, message: str) -> None:
+        _set_progress(job_id, progress=round(min(0.99, fraction), 3), message=message)
+
+    on_progress(0.05, "preparing the transcript")
+    result = summary_mod.summarize(
+        provider, transcript, settings,
+        style=style, instructions=payload.get("instruction") or "",
+        on_progress=on_progress,
     )
-    enqueue(agent_job)
-    log.info("job %s: accodato job agente %s per la trascrizione %s",
-             job["id"], agent_job, transcript_id)
+
+    summary_id = db.create_summary(
+        transcript_id, job_id=job_id, style=result["style"], language=result["language"],
+        provider=result["provider"], model=result["model"], title=result["title"],
+        overview=result["overview"], markdown=result["markdown"],
+        n_words=result["words"], target_words=result["target_words"],
+        source_words=result["source_words"], tokens_in=result["tokens_in"],
+        tokens_out=result["tokens_out"], cache_hit=result["cache_hit"],
+        cost_usd=result["cost_usd"], elapsed_s=result["elapsed_s"],
+    )
+    db.add_revision(transcript_id, "summary", 0,
+                    f"{result['style']} summary: {result['words']} words "
+                    f"(target {result['target_words']}) from "
+                    f"{result['provider']}/{result['model']}")
+
+    return {
+        "summary_id": summary_id,
+        "transcript_id": transcript_id,
+        "words": result["words"],
+        "target_words": result["target_words"],
+        "cost_usd": result["cost_usd"],
+        "message": (f"{result['words']} words of {result['target_words']} . "
+                    f"${result['cost_usd']:.4f}"),
+    }
 
 
 def _finish_transcribe_cleanup(job: dict, payload: dict) -> None:
@@ -469,6 +536,8 @@ def _run_job(job: dict) -> None:
             result = run_transcribe(job_id, payload)
         elif kind == "llm_fix":
             result = run_agent(job_id, payload)
+        elif kind == "llm_summary":
+            result = run_summary(job_id, payload)
         else:
             raise ValueError(f"Unknown job kind: {kind}")
 
@@ -506,6 +575,8 @@ def _message_for(kind: str, result: dict) -> str:
     if kind == "transcribe":
         return (f"{result.get('segments', 0)} segments . "
                 f"{result.get('language', '?').upper()} . {result.get('device', '?')}")
+    if kind == "llm_summary":
+        return f"{result.get('words', 0)} of {result.get('target_words', 0)} words"
     return f"{result.get('proposals', 0)} proposals"
 
 

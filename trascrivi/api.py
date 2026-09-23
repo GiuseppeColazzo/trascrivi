@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,7 @@ from typing import Any
 from fastapi import APIRouter, Body, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from trascrivi_audio import MODELS
 
@@ -34,6 +35,10 @@ from .textutil import build_markdown, parse_raw, segments_to_text, text_to_segme
 log = logging.getLogger("trascrivi.api")
 
 router = APIRouter(prefix="/api")
+
+# Colore di un corso: finisce in uno stile inline nel frontend, quindi
+# accettiamo solo le tre forme esadecimali che scriviamo noi.
+_HEX_COLOR = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
 
 # Cartelle di sistema che non hanno senso come sorgente audio e la cui
 # cancellazione sarebbe catastrofica: le rifiutiamo prima di qualunque altra
@@ -47,8 +52,21 @@ _FORBIDDEN_ROOTS = {
 class ProjectIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     code: str = ""
-    color: str = "#4f46e5"
+    color: str = "#ff4a17"
     description: str = ""
+
+    @field_validator("color")
+    @classmethod
+    def _color_is_hex(cls, value: str) -> str:
+        """Il colore finisce in uno stile inline: solo #rgb/#rrggbb/#rrggbbaa.
+
+        Il frontend sanifica comunque prima di scriverlo nel DOM, ma un valore
+        arbitrario non deve nemmeno entrare nel database.
+        """
+        value = (value or "").strip()
+        if not _HEX_COLOR.match(value):
+            raise ValueError("color must be #rgb, #rrggbb or #rrggbbaa")
+        return value
 
 
 class ProjectPatch(BaseModel):
@@ -58,10 +76,19 @@ class ProjectPatch(BaseModel):
     description: str | None = None
     archived: bool | None = None
 
+    @field_validator("color")
+    @classmethod
+    def _color_is_hex(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not _HEX_COLOR.match(value):
+            raise ValueError("color must be #rgb, #rrggbb or #rrggbbaa")
+        return value
+
 
 class SourcePathIn(BaseModel):
     path: str
-
 
 class TranscribeIn(BaseModel):
     project_id: int
@@ -82,12 +109,28 @@ class TranscribeIn(BaseModel):
     run_agent: bool = False
     provider_id: int | None = None
     instruction: str = ""
+    run_summary: bool = False
+    summary_provider_id: int | None = None
+    summary_style: str = ""
+    summary_instruction: str = ""
 
 
 class FixIn(BaseModel):
     provider_id: int | None = None
     instruction: str = ""
     chunk_chars: int | None = None
+
+
+class SummaryIn(BaseModel):
+    provider_id: int | None = None
+    style: str = ""
+    instruction: str = ""
+    chunk_chars: int | None = None
+
+
+class SummaryPatch(BaseModel):
+    title: str | None = None
+    markdown: str | None = None
 
 
 class TranscriptPatch(BaseModel):
@@ -475,6 +518,111 @@ def create_fix_job(transcript_id: int, body: FixIn) -> dict:
     return {"job": db.get_job(job_id)}
 
 
+# ── Riassunti ────────────────────────────────────────────────────────────────
+@router.post("/transcripts/{transcript_id}/summary", status_code=201)
+def create_summary_job(transcript_id: int, body: SummaryIn) -> dict:
+    """
+    Accoda la generazione del riassunto. Un riassunto non viene calcolato online:
+    è un job, come l'agente, così la pagina non resta bloccata e si vede il
+    progresso nella coda.
+    """
+    transcript = db.get_transcript(transcript_id)
+    if not transcript:
+        raise HTTPException(404, "Transcript not found")
+    if not (transcript.get("segments") or transcript.get("text")):
+        raise HTTPException(422, "This transcript is empty")
+    provider_id = body.provider_id
+    if provider_id is None:
+        providers = [p for p in db.list_providers() if p["enabled"] and p["has_key"]]
+        if not providers:
+            raise HTTPException(422, "Configure an LLM provider first (Settings -> Providers)")
+        provider_id = providers[0]["id"]
+    job_id = db.create_job(
+        "llm_summary",
+        {"transcript_id": transcript_id, "provider_id": provider_id,
+         "style": body.style, "instruction": body.instruction,
+         "chunk_chars": body.chunk_chars},
+        project_id=transcript["project_id"], transcript_id=transcript_id,
+    )
+    jobs.enqueue(job_id)
+    return {"job": db.get_job(job_id)}
+
+
+@router.get("/transcripts/{transcript_id}/summaries")
+def get_summaries(transcript_id: int, limit: int = 50) -> dict:
+    if not db.get_transcript(transcript_id):
+        raise HTTPException(404, "Transcript not found")
+    return {"summaries": db.list_summaries(transcript_id, limit)}
+
+
+@router.get("/summaries/{summary_id}")
+def get_summary(summary_id: int) -> dict:
+    s = db.get_summary(summary_id)
+    if not s:
+        raise HTTPException(404, "Summary not found")
+    return s
+
+
+@router.patch("/summaries/{summary_id}")
+def patch_summary(summary_id: int, body: SummaryPatch) -> dict:
+    """Modifica manuale del documento: da qui in poi il record è marcato `edited`."""
+    if not db.get_summary(summary_id):
+        raise HTTPException(404, "Summary not found")
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    if fields:
+        fields["edited"] = 1
+        # Se il documento è cambiato a mano, titolo e anteprima vanno riletti da
+        # lì: restano derivati, così non possono divergere dal testo.
+        if "markdown" in fields:
+            from . import summary as summary_mod
+            fields.setdefault("title", summary_mod.title_from_markdown(fields["markdown"]))
+            fields["overview"] = summary_mod._overview(fields["markdown"])
+        db.update_summary(summary_id, fields)
+    return db.get_summary(summary_id) or {}
+
+
+@router.delete("/summaries/{summary_id}")
+def delete_summary(summary_id: int) -> dict:
+    if not db.get_summary(summary_id):
+        raise HTTPException(404, "Summary not found")
+    db.delete_summary(summary_id)
+    return {"deleted": summary_id}
+
+
+@router.get("/summaries/{summary_id}/export")
+def export_summary(summary_id: int, format: str = "md") -> Any:
+    """
+    Il documento. Markdown è il formato naturale: è quello che il modello scrive.
+
+    `txt` e `json` esistono solo come comodità per chi vuole incollarlo altrove o
+    conservarlo strutturato.
+    """
+    s = db.get_summary(summary_id)
+    if not s:
+        raise HTTPException(404, "Summary not found")
+    fmt = (format or "md").lower()
+    stem = _slug(s.get("title") or f"summary-{summary_id}") or f"summary-{summary_id}"
+    if fmt in ("md", "markdown"):
+        return PlainTextResponse(s.get("markdown") or "", media_type="text/markdown; charset=utf-8",
+                                 headers=_download_headers(f"{stem}.md"))
+    if fmt == "json":
+        payload = json.dumps(
+            {k: s.get(k) for k in ("id", "title", "overview", "markdown", "style", "language",
+                                   "model", "provider", "strategy", "n_words", "cost_usd",
+                                   "created_at")},
+            ensure_ascii=False, indent=2)
+        return PlainTextResponse(payload, media_type="application/json; charset=utf-8",
+                                 headers=_download_headers(f"{stem}.json"))
+    if fmt in ("txt", "text"):
+        # Senza i marcatori markdown, per chi lo incolla in un documento.
+        plain = re.sub(r"^[#>\s]*", "", s.get("markdown") or "", flags=re.M)
+        plain = re.sub(r"\*\*(.+?)\*\*", r"\1", plain)
+        plain = re.sub(r"`([^`]+)`", r"\1", plain)
+        return PlainTextResponse(plain, media_type="text/plain; charset=utf-8",
+                                 headers=_download_headers(f"{stem}.txt"))
+    raise HTTPException(422, "format must be md, txt or json")
+
+
 # ── Trascrizioni ─────────────────────────────────────────────────────────────
 @router.get("/transcripts")
 def get_transcripts(project_id: int | None = None, limit: int = 200) -> dict:
@@ -488,6 +636,9 @@ def get_transcript(transcript_id: int) -> dict:
         raise HTTPException(404, "Transcript not found")
     t["segments"] = t["segments"] or []
     t["n_proposals_pending"] = len(db.list_proposals(transcript_id, "pending"))
+    summaries = db.list_summaries(transcript_id)
+    t["n_summaries"] = len(summaries)
+    t["latest_summary_id"] = summaries[0]["id"] if summaries else None
     t["revisions"] = db.list_revisions(transcript_id)
     project = db.get_project(t["project_id"])
     t["project_name"] = project["name"] if project else None
@@ -569,13 +720,18 @@ def export_transcript(transcript_id: int, format: str = "txt") -> Any:
     safe = _slug(t["title"]) or f"transcript-{transcript_id}"
     return PlainTextResponse(
         payload, media_type=f"{media}; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{safe}.{ext}"'},
+        headers=_download_headers(f"{safe}.{ext}"),
     )
 
 
 def _slug(text: str) -> str:
     keep = [c if (c.isalnum() or c in " -_") else "" for c in text.strip()]
     return "-".join("".join(keep).split())[:60].strip("-")
+
+
+def _download_headers(filename: str) -> dict:
+    """Intestazione che fa scaricare il file invece di aprirlo nel browser."""
+    return {"Content-Disposition": f'attachment; filename="{filename}"'}
 
 
 # ── Proposte di correzione ───────────────────────────────────────────────────
@@ -767,7 +923,8 @@ def provider_models(provider_id: int) -> dict:
 _SETTINGS_FIELDS = {"default_project_id", "default_model", "default_language",
                     "default_device", "default_compute_type", "default_provider_id",
                     "flush_every", "llm_chunk_chars", "delete_sources_after_job",
-                    "backup_keep"}
+                    "summary_max_tokens", "summary_style",
+                    "summary_language", "backup_keep"}
 
 
 @router.get("/settings")

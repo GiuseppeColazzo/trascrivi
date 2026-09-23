@@ -321,7 +321,7 @@ def ask_with_fallback(provider: dict, transcript_text: str, extra_instruction: s
     Un modello "reasoning" può consumare l'intero budget di token senza scrivere
     nulla nel contenuto (finish_reason="length", reasoning_tokens == completion).
     In quel caso alzare il budget non serve: se ne mangia altri. Si riprova una
-    sola volta con `fallback_model`, che per DeepSeek è `deepseek-chat`
+    sola volta con `fallback_model`, che per DeepSeek è `deepseek-flash`
     (non-reasoning): stessa qualità su questo compito, una frazione del costo.
     """
     model = (provider.get("model") or "").strip()
@@ -409,8 +409,7 @@ def ask_chunk(provider: dict, chunk: list[dict], extra_instruction: str = "",
 
 def _chat_once(provider: dict, model: str, transcript_text: str,
                extra_instruction: str, max_tokens: int) -> tuple[str, dict]:
-    """Una singola chiamata: restituisce (contenuto, diagnostica)."""
-    client = _client(provider)
+    """Una singola chiamata dell'agente correzioni."""
     user = (
         "Transcript chunk (each line starts with [mm:ss]; the timestamps are NOT part "
         "of the text and must never appear inside \"find\"):\n\n"
@@ -418,20 +417,34 @@ def _chat_once(provider: dict, model: str, transcript_text: str,
     )
     if extra_instruction:
         user += f"\n\nAdditional course-specific instructions:\n{extra_instruction}"
+    return chat_completion(provider, model, SYSTEM_PROMPT, user, max_tokens=max_tokens)
+
+
+def chat_completion(provider: dict, model: str, system: str, user: str, *,
+                    max_tokens: int, temperature: float = 0.0,
+                    json_mode: bool = True) -> tuple[str, dict]:
+    """
+    Una chiamata chat generica sullo stesso adattatore dei provider.
+
+    È il punto unico in cui si decide come parlare ai provider: il riassunto la
+    usa invece di reimplementare JSON mode e disattivazione del thinking, così
+    una correzione vale per entrambe le funzioni.
+    """
+    client = _client(provider)
 
     kwargs: dict = {
         "model": model,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "temperature": 0,
+        "temperature": temperature,
         "max_tokens": max_tokens,
     }
     # `response_format` non è supportato allo stesso modo da tutti i provider:
     # lo usiamo dove è sicuro, perché costringe il modello a produrre JSON.
     name = provider.get("name")
-    if name in ("ollama", "deepseek"):
+    if json_mode and name in ("ollama", "deepseek"):
         kwargs["response_format"] = {"type": "json_object"}
     reasoning_requested = name in REASONING_EFFORT_PROVIDERS
 
@@ -455,6 +468,10 @@ def _chat_once(provider: dict, model: str, transcript_text: str,
             raise
 
     content, diag = extract_content(resp)
+    # `finish_reason="length"` su un output JSON significa JSON tagliato a metà:
+    # chi chiama deve saperlo, altrimenti interpreta un troncamento come un
+    # modello che "non collabora".
+    diag["model"] = model
     return content, dict(diag)
 
 
@@ -475,7 +492,7 @@ def _error_detail(diag: dict) -> str:
             f"The model spent the whole {diag.get('completion_tokens')}-token budget on "
             f"internal reasoning and returned no text (finish_reason="
             f"{diag.get('finish_reason')!r}). Use a non-reasoning model such as "
-            f"'deepseek-chat' for this task."
+            f"'deepseek-flash' for this task."
         )
     if diag.get("finish_reason") == "length":
         return (f"The response was cut off at the token limit "
@@ -522,3 +539,21 @@ def extract_content(resp) -> tuple[str, dict]:
 def estimate_tokens(text: str) -> int:
     """Stima grossolana (~4 caratteri per token) per il costo mostrato a schermo."""
     return max(1, len(text) // 4)
+
+
+def token_usage(diag: dict) -> dict:
+    """
+    Conteggi token normalizzati, inclusi i token serviti dalla cache.
+
+    DeepSeek riporta `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` e la
+    differenza di prezzo fra i due è 50×: senza separarli il costo stimato è
+    sbagliato di un ordine di grandezza. Gli altri provider non li espongono e
+    ricadiamo su "tutto miss".
+    """
+    usage = diag.get("usage") or {}
+    prompt = int(usage.get("prompt_tokens") or 0)
+    completion = int(usage.get("completion_tokens") or 0)
+    hit = int(usage.get("prompt_cache_hit_tokens") or 0)
+    miss = usage.get("prompt_cache_miss_tokens")
+    miss = int(miss) if miss is not None else max(0, prompt - hit)
+    return {"prompt": prompt, "completion": completion, "hit": hit, "miss": miss}

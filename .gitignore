@@ -19,3 +19,13 @@ data/
 # Cache
 .pipcache/
 .piptmp/
+
+# Documentazione prodotta dalle ricerche web: materiale di lavoro, non parte del
+# progetto. Convenzione: <argomento>-<AAAA-MM-GG>.md nella radice; i README non
+# hanno date nel nome, quindi non finiscono qui.
+/*-20[0-9][0-9]-[0-9][0-9]*.md
+
+# Artefatti del collaudo frontend (.smoke/smoke.mjs)
+.smoke/__app_under_test.mjs
+.smoke/bench_summary_results.json
+

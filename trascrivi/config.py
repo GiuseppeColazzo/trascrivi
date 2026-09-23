@@ -53,6 +53,12 @@ class Settings:
     default_provider_id: int | None = None
     flush_every: float = 10.0          # secondi di audio tra due flush su disco
     llm_chunk_chars: int = 4000       # budget caratteri per chunk dell'agente
+    # Riassunto: il documento si scrive in una sola chiamata, quindi non c'e' un
+    # budget di caratteri da configurare. `summary_max_tokens` e' solo il tetto
+    # massimo: il tetto effettivo viene calcolato dal budget di parole.
+    summary_max_tokens: int = 8000
+    summary_style: str = "study"
+    summary_language: str = ""         # vuoto = stessa lingua della trascrizione
     delete_sources_after_job: bool = True
     backup_keep: int = 5               # numero di backup da conservare
     extra: dict = field(default_factory=dict)

@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS projects (
   id          INTEGER PRIMARY KEY,
   name        TEXT NOT NULL,
   code        TEXT,
-  color       TEXT DEFAULT '#4f46e5',
+  color       TEXT DEFAULT '#ff4a17',
   description TEXT DEFAULT '',
   archived    INTEGER NOT NULL DEFAULT 0,
   created_at  REAL NOT NULL,
@@ -120,6 +120,35 @@ CREATE TABLE IF NOT EXISTS revisions (
   created_at    REAL NOT NULL
 );
 
+-- Un riassunto per riga, non una colonna su transcripts: rigenerare o cambiare
+-- stile non deve distruggere il precedente. `markdown` e' il documento, ed e'
+-- l'unico contenuto: la tab lo mostra e lo esporta cosi' com'e'.
+CREATE TABLE IF NOT EXISTS summaries (
+  id            INTEGER PRIMARY KEY,
+  transcript_id INTEGER NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+  job_id        INTEGER,
+  style         TEXT NOT NULL DEFAULT 'study',
+  language      TEXT,
+  provider      TEXT DEFAULT '',
+  model         TEXT DEFAULT '',
+  title         TEXT DEFAULT '',
+  overview      TEXT DEFAULT '',
+  markdown      TEXT NOT NULL DEFAULT '',
+  n_words       INTEGER DEFAULT 0,
+  target_words  INTEGER DEFAULT 0,
+  source_words  INTEGER DEFAULT 0,
+  tokens_in     INTEGER DEFAULT 0,
+  tokens_out    INTEGER DEFAULT 0,
+  cache_hit     INTEGER DEFAULT 0,
+  cost_usd      REAL DEFAULT 0,
+  elapsed_s     REAL DEFAULT 0,
+  edited        INTEGER NOT NULL DEFAULT 0,
+  created_at    REAL NOT NULL,
+  updated_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_summaries_transcript
+  ON summaries(transcript_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS terms (
   id         INTEGER PRIMARY KEY,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -168,9 +197,16 @@ END;
 
 PROVIDER_DEFAULTS = [
     ("ollama", "http://localhost:11434/v1", "qwen2.5:7b", ""),
-    ("deepseek", "https://api.deepseek.com", "deepseek-chat", "deepseek-chat"),
+    ("deepseek", "https://api.deepseek.com", "deepseek-flash", ""),
     ("openrouter", "https://openrouter.ai/api/v1", "deepseek/deepseek-chat-v3.1", ""),
 ]
+
+# Modelli DeepSeek ritirati il 2026-07-24: `deepseek-chat` e `deepseek-reasoner`
+# non esistono piu' nel listino. Un database creato prima di quella data li ha
+# ancora salvati e ogni chiamata fallirebbe; li rimappiamo sul modello corrente
+# SOLO se il valore e' rimasto quello seminato da noi, per non sovrascrivere una
+# scelta esplicita dell'utente.
+RETIRED_DEEPSEEK = ("deepseek-chat", "deepseek-reasoner")
 
 
 def now() -> float:
@@ -201,13 +237,19 @@ def init_db() -> None:
                 "enabled, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (name, base_url, model, fallback, 1 if name == "ollama" else 0, ts),
             )
-        # Il modello di ripiego serve solo dove un modello "reasoning" può
-        # esaurire il budget senza produrre output: se la colonna è vuota lo
-        # completiamo, senza toccare una scelta esplicita dell'utente.
-        conn.execute(
-            "UPDATE providers SET fallback_model = 'deepseek-chat' "
-            "WHERE name = 'deepseek' AND (fallback_model IS NULL OR fallback_model = '')"
-        )
+        # Migrazione dei nomi di modello DeepSeek ritirati: senza, un database
+        # creato prima del 2026-07-24 continua a chiamare `deepseek-chat` e ogni
+        # richiesta dell'agente o del riassunto fallisce con "model not found".
+        marks = ",".join("?" for _ in RETIRED_DEEPSEEK)
+        for column in ("model", "fallback_model"):
+            cur = conn.execute(
+                f"UPDATE providers SET {column} = 'deepseek-flash' "
+                f"WHERE name = 'deepseek' AND {column} IN ({marks})",
+                RETIRED_DEEPSEEK,
+            )
+            if cur.rowcount:
+                log.info("migrazione: providers.deepseek.%s aggiornato a deepseek-flash (%d righe)",
+                         column, cur.rowcount)
         conn.commit()
 
 
@@ -218,6 +260,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "proposals": [("segment_index", "INTEGER"), ("context", "TEXT DEFAULT ''")],
         "transcripts": [("source_ref", "TEXT")],
         "providers": [("fallback_model", "TEXT DEFAULT ''")],
+        # `summaries` è nata con una struttura a punti e citazioni, poi sostituita
+        # dal documento markdown: `n_words` è arrivata dopo, e `target_words` /
+        # `source_words` con il budget di lunghezza. Senza queste righe un
+        # database che ha già la tabella vecchia fallisce su ogni INSERT e SELECT,
+        # perché `CREATE TABLE IF NOT EXISTS` non tocca una tabella esistente.
+        "summaries": [("n_words", "INTEGER DEFAULT 0"),
+                      ("target_words", "INTEGER DEFAULT 0"),
+                      ("source_words", "INTEGER DEFAULT 0")],
     }
     for table, columns in wanted.items():
         existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -289,7 +339,7 @@ def get_project(project_id: int) -> dict | None:
     return row("SELECT * FROM projects WHERE id = ?", (project_id,))
 
 
-def create_project(name: str, code: str = "", color: str = "#4f46e5",
+def create_project(name: str, code: str = "", color: str = "#ff4a17",
                    description: str = "") -> int:
     ts = now()
     return execute(
@@ -618,6 +668,63 @@ def add_revision(transcript_id: int, kind: str, n_changes: int, summary: str = "
 def list_revisions(transcript_id: int) -> list[dict]:
     return rows("SELECT * FROM revisions WHERE transcript_id = ? ORDER BY id DESC",
                 (transcript_id,))
+
+
+# ── Riassunti ────────────────────────────────────────────────────────────────
+SUMMARY_FIELDS = {"title", "overview", "markdown", "edited"}
+
+
+def create_summary(transcript_id: int, *, job_id: int | None = None, style: str = "study",
+                   language: str | None = None, provider: str = "", model: str = "",
+                   title: str = "", overview: str = "", markdown: str = "",
+                   n_words: int = 0, target_words: int = 0,
+                   source_words: int = 0, tokens_in: int = 0,
+                   tokens_out: int = 0, cache_hit: int = 0, cost_usd: float = 0.0,
+                   elapsed_s: float = 0.0) -> int:
+    ts = now()
+    return execute(
+        """INSERT INTO summaries(transcript_id, job_id, style, language, provider, model,
+                                 title, overview, markdown, n_words, target_words,
+                                 source_words, tokens_in, tokens_out, cache_hit, cost_usd,
+                                 elapsed_s, edited, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+        (transcript_id, job_id, style, language, provider, model, title, overview,
+         markdown, n_words, target_words, source_words, tokens_in, tokens_out,
+         cache_hit, cost_usd, elapsed_s, ts, ts),
+    )
+
+
+def get_summary(summary_id: int) -> dict | None:
+    return row("SELECT * FROM summaries WHERE id = ?", (summary_id,))
+
+
+def list_summaries(transcript_id: int, limit: int = 50) -> list[dict]:
+    """Elenco per la UI: senza `markdown`, che è il campo grosso."""
+    return rows(
+        "SELECT id, transcript_id, job_id, style, language, provider, model, title, overview, "
+        "n_words, target_words, source_words, tokens_in, tokens_out, cost_usd, "
+        "elapsed_s, edited, created_at, updated_at FROM summaries WHERE transcript_id = ? "
+        "ORDER BY created_at DESC LIMIT ?",
+        (transcript_id, limit),
+    )
+
+
+def latest_summary(transcript_id: int) -> dict | None:
+    return row("SELECT * FROM summaries WHERE transcript_id = ? ORDER BY created_at DESC LIMIT 1",
+               (transcript_id,))
+
+
+def update_summary(summary_id: int, fields: dict) -> None:
+    clean = {k: v for k, v in fields.items() if k in SUMMARY_FIELDS}
+    if not clean:
+        return
+    sets = ", ".join(f"{k} = ?" for k in clean)
+    execute(f"UPDATE summaries SET {sets}, updated_at = ? WHERE id = ?",
+            (*clean.values(), now(), summary_id))
+
+
+def delete_summary(summary_id: int) -> None:
+    execute("DELETE FROM summaries WHERE id = ?", (summary_id,))
 
 
 # ── Glossario di materia ─────────────────────────────────────────────────────

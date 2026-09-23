@@ -6,10 +6,12 @@ university subject, add a lecture either by dragging the file into the browser o
 absolute path on disk, and a background worker transcribes it while the page shows progress, realtime
 speed and an ETA. The finished transcript lands in a searchable registry where you can read it, edit it
 line by line, export it as `.txt`/`.md`/`.json`/segments, and optionally hand it to an LLM **correction
-agent** that proposes anchored, individually reviewable fixes instead of rewriting your text. Courses
-also carry a deterministic glossary of `find → replace` rules, so a correction accepted once is applied
-silently to every later lecture of that course. Everything runs offline on your machine — no account, no
-telemetry, and no network call at all unless you explicitly configure a cloud LLM provider.
+agent** that proposes anchored, individually reviewable fixes instead of rewriting your text, or to a
+**summary** step that turns a lecture into exam notes where every bullet carries a sentence quoted
+verbatim from the transcript — and each quote is checked against the transcript before it is stored.
+Courses also carry a deterministic glossary of `find → replace` rules, so a correction accepted once is
+applied silently to every later lecture of that course. Everything runs offline on your machine — no
+account, no telemetry, and no network call at all unless you explicitly configure a cloud LLM provider.
 
 The stack is deliberately minimal: **FastAPI + uvicorn**, one process and one background worker thread,
 **SQLite** (stdlib `sqlite3`, WAL mode, **FTS5** for full-text search) with no ORM, and a plain
@@ -257,6 +259,110 @@ prompt is served from DeepSeek's context cache across all 18 chunks.
 The agent is **opt-in per job** and can be **re-run on any existing transcript** from the Transcript
 screen.
 
+### The summary
+
+Turn a lecture into **a single Markdown document** of study notes: sections in the order the lecture
+covered them, bullet lists, a table when the lecture compares or classifies things, a diagram in a code
+block where the lecture describes a flow, and a closing section for what was left unfinished. It is
+written in the language of the transcript (or the one you choose) and it is what you download: `.md` from
+the Summary tab, or `GET /api/summaries/{id}/export?format=md`.
+
+The model writes the document directly. There is no intermediate structure and no second pass: what you
+read in the tab is exactly what is in the file.
+
+#### How long it is
+
+**The length is decided by the app, not by the model.** The word budget is computed from the transcript
+and stated in the request as a hard limit:
+
+| Style | Share of the transcript | Floor | Ceiling |
+|---|---|---|---|
+| **Study notes** (default) | 15% | 300 words | 2 000 words |
+| Brief | 6% | 150 words | 450 words |
+| Detailed | 25% | 600 words | 3 500 words |
+
+A 90-minute lecture is roughly 11 000 words, so study notes land around 1 700 words — about a 6:1
+compression. The tab shows both numbers (`1712 words of 1686 · 1:6.6`) so you can see at a glance whether
+the budget held.
+
+Three things changed to get there, and the first was the actual cause:
+
+1. **There was no length target at all.** The prompt asked for completeness — "a reader who missed the
+   lecture must not need anything else" — and the output cap was 8 000 tokens, about 6 000 words. The
+   model wrote until it decided it was done. Measured on a real lecture: **6 338 words of notes for a
+   7 000-word transcript, with 7 601 output tokens against an 8 000 cap.** Not a cap set too low — a
+   target never given.
+2. **The request now carries a number**, computed from the real transcript, plus an explicit list of what
+   to leave out (housekeeping, the lecturer's scaffolding, repetitions, and examples that only illustrate
+   a definition already given). Deciding what to drop is stated as the job, because keeping everything is
+   not being thorough.
+3. **The model plans the budget before writing.** It opens with a short `<plan>` block assigning a word
+   count to each section, then writes to it. The block is stripped before the document is stored. The
+   mechanism comes from [Plan-and-Write](https://arxiv.org/abs/2511.01807) (KDD 2025 workshop on prompt
+   optimization), which found a **systematic bias toward over-generation** and got up to 37.6% better
+   length adherence out of explicit planning and word counting without any retraining. Related:
+   [Zero-Shot Strategies for Length-Controllable Summarization](https://aclanthology.org/2025.findings-naacl.34/)
+   (Findings of NAACL 2025), which measures the same overshoot and the model-specific biases behind it.
+
+The budget is an instruction, not a truncation: a document that overshoots is never cut, because cutting
+it would lose its ending. An overshoot past 1.5× the target is written to the log instead, so it is
+visible rather than silent.
+
+#### One call
+
+The whole transcript goes into **a single request**. A 90-minute lecture is roughly 17 000 tokens and
+`deepseek-flash` has a 1M-token window, so there is nothing to split — and splitting cost real quality:
+an earlier version wrote notes part by part and then merged them, which required sending the transcript
+twice (2.5× the cost) and, worse, handed the final call a pile of notes already long enough to act as an
+anchor. The merged document came out **60% over its word budget**, because asking a model to halve what it
+has just written is much harder than asking it to write short in the first place. That path is gone.
+
+The practical limit is now the model's own window: a local model with 32k tokens cannot hold a full
+lecture, so it needs a larger context rather than a different pipeline.
+
+The **Summary** tab follows the job while it runs: the button switches to *Writing…*, a spinner and the
+job's own message appear, the bar advances, and the document loads by itself when it is ready — no page
+refresh. A banner above the tabs does the same for whichever job is running on that transcript, the
+correction agent included. The polling runs only while something is in flight and stops on its own; a
+single call reports no intermediate progress, so the elapsed time next to the percentage is what shows it
+is still working.
+
+#### Cost
+
+For a 90-minute lecture: roughly 16 000 input and 4 000 output tokens, one call. At the published
+`deepseek-flash` rates (off-peak $0.15 / $0.60 per 1M tokens, cache hit $0.003):
+
+| | 1 lecture | 50 lectures |
+|---|---|---|
+| Off-peak | **~$0.004** | **~$0.20** |
+
+About **half a cent per lecture**. Thinking mode is disabled for this task: reasoning tokens are billed as
+output and would add ~60% for no gain when writing notes from a document that is already in the prompt.
+
+#### What it is not
+
+The notes come from a transcript that a speech recogniser produced, and a language model wrote them. They
+are a study aid, not a substitute for the lecture or for the transcript — the **Summary** tab sits next to
+the transcript for a reason. Two things push in the right direction, and both are instructions rather than
+guarantees:
+
+- The prompt forbids adding anything that is not in the transcript, and explicitly forbids turning the
+  lecturer's hedged statements ("probably", "in general") into facts.
+- Course context — name, description, glossary, and the overviews of the previous lectures of the same
+  course — is passed to help interpret references like "as we saw last time", with the explicit
+  instruction that it is not a source of content for *this* lecture.
+
+> An earlier iteration asked the model for JSON with a verbatim quote for every point, checked each quote
+> against the transcript, and flagged the ones it could not find. It was auditable and unpleasant to read:
+> the text filled up with quotations and the argument got lost. What you get now is the readable one. If
+> verifiability is ever needed again, the deterministic matcher is still there in `corrections.py`.
+
+> **Note on model names.** `deepseek-chat` and `deepseek-reasoner` were **retired on 2026-07-24**. The
+> current IDs are `deepseek-flash` and `deepseek-v4-pro`. On startup the app migrates a stored
+> `deepseek-chat` / `deepseek-reasoner` to `deepseek-flash`, but only if the value is still the one it
+> seeded itself — a model you chose yourself is never overwritten.
+
+
 ### Course glossary
 
 Each course has a list of deterministic `find → replace` rules. A rule marked **`auto`** is applied
@@ -276,10 +382,10 @@ persisted in `localStorage`.
 |---|---|---|
 | **Library** | `#/` | All courses with their transcript counts. Create, rename and delete a course. The header search box runs a full-text query across every transcript and links each hit with `#/t/<id>?q=word` so the matching segments are highlighted. |
 | **Course** | `#/p/<id>` | The lectures of one course, with *New lecture* and per-transcript rename/move/delete. This is also where the **Course glossary** is edited, including the `auto` checkbox. |
-| **New lecture** | `#/p/<id>/new` | The two ways to add audio (drag & drop / file picker, or an absolute local path validated live through `/api/media/probe`) plus the full transcription form: model, language, device, compute type, beam size, VAD, word timestamps, initial prompt for course vocabulary, and the optional correction agent with its provider picker. |
+| **New lecture** | `#/p/<id>/new` | The two ways to add audio (drag & drop / file picker, or an absolute local path validated live through `/api/media/probe`) plus the full transcription form: model, language, device, compute type, beam size, VAD, word timestamps, initial prompt for course vocabulary, and the two optional LLM follow-ups — the correction agent and the summary, each with its own provider picker. |
 | **Jobs** | `#/jobs` | Queue and history with progress bar, `x realtime` speed, ETA, and Cancel / Retry / Resume. The header badge shows the running count. |
-| **Transcript** | `#/t/<id>` | The registry entry: editor (one line = one segment, timestamps re-attached on save), **Segments** tab, **Info** tab with revision history, exports, and the agent's proposal review with diff preview and accept/reject. |
-| **Settings** | `#/settings` | Transcription defaults, agent chunk size, flush interval, backups to keep, default provider, disk usage (audio copies / data dir / free space), database backup, *Delete all audio copies*, *Unload models from RAM*, and the LLM provider configuration. |
+| **Transcript** | `#/t/<id>` | The registry entry: editor (one line = one segment, timestamps re-attached on save), **Segments** tab, **Proposals** tab with the agent's review and diff preview, **Summary** tab, and **Info** with revision history and exports. |
+| **Settings** | `#/settings` | Transcription defaults, agent chunk size, flush interval, summary defaults (style, output language, output token cap), backups to keep, default provider, disk usage (audio copies / data dir / free space), database backup, *Delete all audio copies*, *Unload models from RAM*, and the LLM provider configuration. |
 
 ### Transcription options
 
@@ -340,6 +446,7 @@ Everything is mounted under `/api` and documented interactively at `/docs`.
 | **Transcripts** | `GET /api/transcripts` · `GET /api/transcripts/{id}` · `PATCH /api/transcripts/{id}` (title, description, course, text, segments) · `DELETE /api/transcripts/{id}` |
 | **Export** | `GET /api/transcripts/{id}/export?format=txt\|md\|json\|segments` |
 | **Correction agent** | `POST /api/transcripts/{id}/fix` · `GET /api/transcripts/{id}/proposals` · `POST /api/transcripts/{id}/proposals/accept` · `POST /api/transcripts/{id}/proposals/reject` · `POST /api/transcripts/{id}/proposals/preview` · `POST /api/transcripts/{id}/proposals/undo` |
+| **Summaries** | `POST /api/transcripts/{id}/summary` · `GET /api/transcripts/{id}/summaries` · `GET /api/summaries/{id}` · `PATCH /api/summaries/{id}` · `DELETE /api/summaries/{id}` · `GET /api/summaries/{id}/export?format=md\|txt\|json` |
 | **Course glossary** | `GET /api/terms?project_id=` · `POST /api/terms` · `DELETE /api/terms/{id}` |
 | **LLM providers** | `GET /api/providers` · `PATCH /api/providers/{id}` · `POST /api/providers/{id}/test` · `GET /api/providers/{id}/models` (model listing, used for Ollama) |
 | **Settings** | `GET /api/settings` · `PUT /api/settings` |
@@ -354,7 +461,7 @@ Ollama).
 | Provider | Base URL | Default model | API key |
 |---|---|---|---|
 | Ollama (local) | `http://localhost:11434/v1` | `qwen2.5:7b` | not needed |
-| DeepSeek | `https://api.deepseek.com` | `deepseek-chat` | required |
+| DeepSeek | `https://api.deepseek.com` | `deepseek-flash` | required |
 | OpenRouter | `https://openrouter.ai/api/v1` | `deepseek/deepseek-chat-v3.1` | required |
 
 API keys are **encrypted at rest with Fernet**. The master key lives in `data/secret.key` (created on
@@ -420,6 +527,13 @@ Stated plainly, so you can decide before installing:
   default. Exposing it on a network interface hands your data to anyone who can reach the port.
 - **The LLM agent never rewrites the full text, by design.** There is no "full rewrite" mode. Edits are
   bounded to `max_delta_chars = 160` and anything larger is rejected as `too_large`.
+- **A summary is a study aid, not a substitute for the transcript.** Grounding makes it auditable — every
+  point carries a quotable sentence and a real timestamp — but it cannot make it guaranteed faithful.
+  Points whose quote could not be found are flagged rather than removed, and the timestamps are there so
+  you can check any claim in seconds.
+- **Slide decks are not used as context yet.** Only the transcript, the course metadata, the glossary and
+  the overviews of previous lectures of the same course feed the summary. Attaching the PDF of a lecture's
+  slides and aligning it to the transcript is the natural next step, not something the app does today.
 - **Uploads are capped at 4 GB per file**, with a warning above 1 GB. A three-hour lecture is well under
   1 GB, so the cap guards against selecting the wrong file rather than being a real constraint.
 
@@ -448,7 +562,7 @@ The test suite is `pytest`-based and runs against the standard library plus the 
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-119 tests, a few seconds, no GPU, no network and no Whisper model: DB isolation is done by remapping the
+193 tests, a few seconds, no GPU, no network and no Whisper model: DB isolation is done by remapping the
 `data/` paths to a temporary directory, and the LLM provider is faked. What the suite covers:
 
 | File | What it locks down |
@@ -456,10 +570,12 @@ The test suite is `pytest`-based and runs against the standard library plus the 
 | `tests/test_textutil.py` | timestamp parsing (`mm:ss` and `hh:mm:ss`), text ⇄ segments round trip, monotone timestamps when lines are added, Markdown export |
 | `tests/test_resume.py` | `last_transcribed_seconds`, the 2 s resume margin, the English-only model rule |
 | `tests/test_corrections.py` | the edit-plan engine: exact and whitespace-tolerant matching, `ambiguous` / `unmatched` / `noop` / `too_large` / `duplicate` / `conflict`, per-segment targets, idempotency, glossary mode, chunking |
+| `tests/test_summary.py` | the summary: normalisation of the model's answer (a code fence around the whole document, an unexpected JSON object, an empty reply), the **word budget** (ratios, floor and ceiling, that the number reaches the prompt, that the output cap follows it, that the planning block is stripped), the course context reaching the prompt, cost accounting with cache hits split from misses, the whole job, the `/api/summaries` lifecycle, and the `deepseek-chat` → `deepseek-flash` migration |
 | `tests/test_db_api.py` | project/transcript/proposal/term CRUD, FTS5 staying in sync across updates and deletes, startup recovery of stale jobs, and the REST endpoints (including the 422 on an English-only model with a non-English language) |
 | `tests/test_llm_parse.py` | JSON extraction from fenced or prefixed model replies, chunk budgets, API-key encryption round trip |
 | `tests/test_engine_guards.py` | the three engine bugs found on real audio: `batch_size` on the plain `transcribe`, batched inference with a clip range, and the partial file that makes cancel/resume work |
-| `tests/test_web_contract.py` | the frontend: JS syntax (`node --check`), every `byId` having a matching element, and every `/api/...` path the UI calls existing in the OpenAPI schema |
+| `tests/test_markdown_render.py` | the Markdown renderer, executed for real with node: headings, lists and their closing, nested bullets, tables, code blocks kept verbatim, inline formatting, and the two safety properties — model-written HTML is escaped, and no link is ever generated |
+| `tests/test_web_contract.py` | the frontend: JS syntax (`node --check`), every `byId` having a matching element, every `/api/...` path the UI calls existing in the OpenAPI schema — both literal `href`s **and** the `api(...)` wrapper — and every data name a view uses (`settings`, `providers`, `jobs`, …) being one it actually fetched |
 
 Synthetic fixtures are generated by `gen_testdata.py`, which writes "speech-like" audio with the same
 spectral and temporal structure as real speech (formants, syllables, pauses). It is not meant to
@@ -491,12 +607,14 @@ trascrivi/
 │   ├── models.py          LRU cache of up to 2 loaded Whisper models + hardware info
 │   ├── jobs.py            queue worker, cancel, resume, crash recovery
 │   ├── corrections.py     deterministic edit-plan engine
+│   ├── summary.py         lecture → study notes (one call, with a word budget)
 │   ├── llm.py             OpenAI-compatible provider adapter
 │   ├── api.py             all REST routes under /api
 │   └── textutil.py        text ⇄ segments, timestamp parsing, markdown export
 ├── web/                   plain HTML/CSS/JS frontend, served at /
 │   ├── index.html
 │   ├── app.js
+│   ├── markdown.js        Markdown → HTML for the summary (pure, testable with node)
 │   └── style.css
 ├── tests/                 pytest suite
 └── data/                  all runtime state (gitignored) — see "Data layout" above

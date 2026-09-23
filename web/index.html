@@ -1,11 +1,30 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="description" content="Trascrivi — local lecture transcription registry: courses, transcripts and agent-reviewed corrections. Audio never leaves this machine.">
+<meta name="theme-color" content="#0a0b0d" id="metaThemeColor">
+<meta name="author" content="Trascrivi">
+<meta name="robots" content="noindex, nofollow">
 <title>Trascrivi — lecture registry</title>
+
+<!-- Anteprima di condivisione. Un'app locale non finisce sui social, ma il
+     titolo e la descrizione compaiono in ogni anteprima di link (chat, note). -->
+<meta property="og:type" content="website">
+<meta property="og:title" content="Trascrivi — lecture registry">
+<meta property="og:description" content="Courses, transcripts and reviewed corrections. Local only: no telemetry, the audio never leaves this machine.">
+<meta property="og:locale" content="en">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Trascrivi — lecture registry">
+<meta name="twitter:description" content="Courses, transcripts and reviewed corrections. Local only.">
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230a0b0d'/%3E%3Crect x='9' y='9' width='14' height='14' fill='none' stroke='%23ff4a17' stroke-width='2'/%3E%3Cpath d='M16 3.5v5.5M16 23v5.5M3.5 16H9M23 16h5.5' stroke='%23ece9e3' stroke-width='1.4'/%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230a0b0d'/%3E%3Crect x='9' y='9' width='14' height='14' fill='none' stroke='%23ff4a17' stroke-width='2'/%3E%3C/svg%3E">
 <script>
   // Applicato prima del CSS per evitare il lampo di tema sbagliato.
+  // "auto" segue il sistema; il valore salvato può essere light/dark/auto.
   (function () {
     var saved = localStorage.getItem("trascrivi-theme");
     var dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
@@ -13,37 +32,161 @@
   })();
 </script>
 <link rel="stylesheet" href="/style.css">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎓</text></svg>">
 </head>
 <body>
+
+<a class="skip-link" href="#view">Skip to content</a>
+
 <header class="app">
-  <a class="brand" href="#/"><span class="dot"></span>Trascrivi</a>
-  <nav aria-label="Main">
-    <button class="ghost" data-nav="#/">Library</button>
-    <button class="ghost" data-nav="#/jobs">Jobs <span id="navJobs" class="badge hidden">0</span></button>
-    <button class="ghost" data-nav="#/settings">Settings</button>
+  <a class="brand" href="#/">
+    <span class="mark" aria-hidden="true"></span>
+    <span class="wordmark">Trascrivi</span>
+    <span class="brand-kicker">Lecture registry</span>
+  </a>
+
+  <nav aria-label="Primary">
+    <button type="button" class="nav-item" data-nav="#/">Library</button>
+    <button type="button" class="nav-item" data-nav="#/jobs">Jobs<span id="navJobs" class="badge accent hidden">0</span></button>
+    <button type="button" class="nav-item" data-nav="#/settings">Settings</button>
   </nav>
+
   <div class="search">
-    <label class="hidden" for="globalSearch">Search transcripts</label>
-    <input id="globalSearch" type="search" placeholder="Search all transcripts…" autocomplete="off">
+    <label class="sr-only" for="globalSearch">Search all transcripts</label>
+    <svg class="search-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+      <circle cx="7" cy="7" r="4.4"></circle><path d="M10.4 10.4 14 14" stroke-linecap="round"></path>
+    </svg>
+    <input id="globalSearch" type="search" placeholder="Search transcripts…" autocomplete="off" spellcheck="false">
+    <kbd class="search-kbd" aria-hidden="true">/</kbd>
   </div>
-  <button id="themeToggle" class="ghost" title="Toggle light/dark" aria-label="Toggle light/dark theme">🌙</button>
+
+  <!-- Tema: tre scelte (sistema, chiaro, scuro) in una lista, non un
+       interruttore sole/luna che ignora la preferenza di sistema. -->
+  <div class="theme-menu" id="themeMenu" data-open="false">
+    <button id="themeToggle" type="button" class="theme-trigger" aria-haspopup="true"
+            aria-expanded="false" aria-controls="themeList" title="Theme">
+      <span id="themeIcon" aria-hidden="true"></span>
+      <span class="theme-name" id="themeName">Dark</span>
+      <svg class="chev" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4"
+           stroke-linecap="round" aria-hidden="true"><path d="M2.7 4.6 6 7.9l3.3-3.3"></path></svg>
+    </button>
+    <div class="theme-list" id="themeList" role="menu" aria-label="Colour theme" hidden>
+      <button type="button" class="theme-option" role="menuitem" data-theme-choice="auto">
+        <span class="theme-ico" data-ico="auto" aria-hidden="true"></span>
+        <span>System</span>
+        <span class="theme-hint" data-hint="auto"></span>
+      </button>
+      <button type="button" class="theme-option" role="menuitem" data-theme-choice="light">
+        <span class="theme-ico" data-ico="light" aria-hidden="true"></span>
+        <span>Light</span>
+        <span class="theme-hint" data-hint="light"></span>
+      </button>
+      <button type="button" class="theme-option" role="menuitem" data-theme-choice="dark">
+        <span class="theme-ico" data-ico="dark" aria-hidden="true"></span>
+        <span>Dark</span>
+        <span class="theme-hint" data-hint="dark"></span>
+      </button>
+    </div>
+  </div>
 </header>
 
 <main id="view" aria-live="polite"></main>
-<div id="toasts" aria-live="assertive"></div>
+
+<noscript>
+  <div class="stack" style="max-width:640px;margin:0 auto;padding:24px 22px">
+    <div class="card">
+      <h2>JavaScript is required</h2>
+      <p class="muted">Trascrivi is a single-page app: the registry, the job queue and the transcript
+        editor are rendered in the browser. Enable JavaScript for this local address and reload.</p>
+    </div>
+  </div>
+</noscript>
+
+<footer class="app-foot">
+  <span class="foot-mark" aria-hidden="true"></span>
+  <span>Local instance</span>
+  <span class="foot-sep" aria-hidden="true">/</span>
+  <span>No telemetry</span>
+  <span class="foot-sep" aria-hidden="true">/</span>
+  <span>Audio never leaves this machine</span>
+  <span class="foot-spacer"></span>
+  <nav aria-label="Footer">
+    <a href="#/about">About &amp; privacy</a>
+  </nav>
+</footer>
+
+<div id="toasts" role="status" aria-live="polite"></div>
 
 <dialog id="confirmDialog">
   <form method="dialog">
     <h2 id="confirmTitle">Confirm</h2>
     <p id="confirmText"></p>
-    <div class="split" style="justify-content:flex-end">
+    <div class="split">
       <button value="cancel">Cancel</button>
       <button id="confirmOk" class="danger" value="ok">Delete</button>
     </div>
   </form>
 </dialog>
 
+<!-- Rinomina: un dialogo con un campo e il pulsante di conferma che dice cosa
+     fa, invece del prompt() di sistema, che non ha stile né contesto. -->
+<dialog id="promptDialog">
+  <form method="dialog">
+    <h2 id="promptTitle">Rename</h2>
+    <div class="field">
+      <label for="promptInput" id="promptLabel">Name</label>
+      <input id="promptInput" type="text" autocomplete="off" spellcheck="false">
+    </div>
+    <p id="promptError" class="field-error hidden"></p>
+    <div class="split">
+      <button value="cancel" type="submit">Cancel</button>
+      <button id="promptOk" class="primary" value="ok" type="submit">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/markdown.js"></script>
 <script src="/app.js" type="module"></script>
+<script>
+  /* Comportamenti del guscio: voce di navigazione attiva, "/" per cercare,
+     Esc per uscire dalla ricerca. app.js resta l'unico proprietario dei dati. */
+  (function () {
+    var items = Array.prototype.slice.call(document.querySelectorAll("header [data-nav]"));
+    var search = document.getElementById("globalSearch");
+
+    function base(path) { return "/" + (path.split("?")[0].split("/")[1] || ""); }
+
+    function syncNav() {
+      var here = base(location.hash.replace(/^#/, "") || "/");
+      items.forEach(function (item) {
+        var target = base(item.dataset.nav.replace(/^#/, ""));
+        // Le pagine di corso e trascrizione restano dentro "Library".
+        var on = target === here || (target === "/" && (here === "/p" || here === "/t"));
+        item.setAttribute("data-active", on ? "true" : "false");
+        if (on) item.setAttribute("aria-current", "page");
+        else item.removeAttribute("aria-current");
+      });
+    }
+
+    window.addEventListener("hashchange", syncNav);
+    syncNav();
+
+    document.addEventListener("keydown", function (event) {
+      var target = event.target || {};
+      var tag = (target.tagName || "").toLowerCase();
+      var typing = tag === "input" || tag === "textarea" || tag === "select" || target.isContentEditable;
+      // I dialoghi nativi assorbono già Esc e i tasti: non rubiamo "/" mentre
+      // si rinomina un corso.
+      var inDialog = !!document.querySelector("dialog[open]");
+      if (event.key === "/" && !typing && !inDialog && !event.metaKey && !event.ctrlKey && !event.altKey) {
+        event.preventDefault();
+        search.focus();
+        search.select();
+      } else if (event.key === "Escape" && document.activeElement === search) {
+        search.blur();
+      }
+    });
+  })();
+</script>
 </body>
 </html>
+
