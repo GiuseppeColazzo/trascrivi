@@ -107,6 +107,10 @@ def test_view_new_lecture_wires_handlers_without_late_byId_lookups(js):
     assert "onchange:" in code
     assert "fileInput" not in set(re.findall(r'byId\("([^"]+)"\)', code))
     assert "uploadProgress" not in set(re.findall(r'byId\("([^"]+)"\)', code))
+    # Una sola sorgente per volta, selezionata dallo switch.
+    assert 'updateMode("file")' in code
+    assert 'updateMode("path")' in code
+    assert "sourceCard" in code and "pathRow" in code
     # La barra di avanzamento dell'upload deve esistere e contenere il riempimento.
     assert "progressBox" in code and "progressFill" in code
 

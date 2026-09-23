@@ -702,12 +702,19 @@ def patch_provider(provider_id: int, body: ProviderIn) -> dict:
 
 @router.post("/providers/{provider_id}/test")
 def test_provider(provider_id: int, body: dict = Body(default={})) -> dict:
+    """
+    Verifica chiave e modello con una chiamata minima. Non scrive nulla.
+
+    Il modello passato nel body serve solo per il test: se lo salvassimo qui,
+    premere "Test" modificherebbe la configurazione, che non è quello che
+    l'utente si aspetta da un pulsante di prova (si salva con "Save").
+    """
     provider = db.get_provider(provider_id)
     if not provider:
         raise HTTPException(404, "Provider not found")
-    if body.get("model"):
-        db.update_provider(provider_id, model=str(body["model"]))
-        provider = db.get_provider(provider_id) or provider
+    candidate = str(body.get("model") or "").strip()
+    if candidate:
+        provider = {**provider, "model": candidate}
     try:
         return llm.test_provider(provider)
     except Exception as exc:  # noqa: BLE001 - l'errore va mostrato all'utente

@@ -323,8 +323,9 @@ async function viewProject(nav, projectId) {
         el("h1", {}, project.name),
         project.code ? el("span", { class: "badge" }, project.code) : null,
         el("span", { class: "spacer" }),
-        el("button", { class: "primary", onclick: () => { location.hash = `#/p/${projectId}/new`; } }, "＋ New lecture"),
-        el("button", { onclick: editProject }, "Rename")),
+        el("button", { type: "button", class: "primary", onclick: () => { location.hash = `#/p/${projectId}/new`; } }, "+ New lecture"),
+        el("button", { type: "button", onclick: editProject }, "Rename"),
+        el("button", { type: "button", class: "danger", onclick: removeProject }, "Delete course")),
       project.description ? el("p", { class: "muted" }, project.description) : null),
     el("div", { class: "card" },
       el("h2", {}, "Transcripts"),
@@ -346,6 +347,19 @@ async function viewProject(nav, projectId) {
     if (!name) return;
     await api(`/projects/${projectId}`, { method: "PATCH", body: { name } });
     render();
+  }
+
+  async function removeProject() {
+    const n = transcripts.length;
+    const detail = n
+      ? `“${project.name}” and its ${n} transcript${n === 1 ? "" : "s"} will be deleted. This cannot be undone.`
+      : `Delete “${project.name}”? This cannot be undone.`;
+    if (!await confirmDialog("Delete course", detail, "Delete course")) return;
+    try {
+      const res = await api(`/projects/${projectId}`, { method: "DELETE" });
+      toast(`Course deleted (${res.deleted_transcripts} transcript(s), ${res.deleted_sources} audio copy(ies))`, "ok");
+      location.hash = "#/";
+    } catch (err) { toast(err.message, "err"); }
   }
 }
 
@@ -391,15 +405,44 @@ async function viewNewLecture(nav, projectId) {
   const nameInput = el("input", { id: "srcTitle", placeholder: "Lecture title" });
   const descInput = el("input", { id: "srcDesc", placeholder: "Optional description" });
   const pathInput = el("input", { id: "srcPath", placeholder: "C:\\Users\\you\\lectures\\lesson.mp4" });
-  const pathStatus = el("p", { class: "small muted" }, "Paste an absolute path to transcribe the file in place (no copy).");
+  const pathStatus = el("p", { class: "small muted" }, "The file is read where it is: no copy, nothing moved or deleted.");
   const progressFill = el("span");
   const progressBox = el("div", { class: "progress hidden" }, progressFill);
 
+  // Una sola sorgente per volta: sezione "file" oppure sezione "path".
+  const useFileBtn = el("button", { type: "button", class: "tab", "aria-selected": "true", onclick: () => updateMode("file") }, "My computer");
+  const usePathBtn = el("button", { type: "button", class: "tab", "aria-selected": "false", onclick: () => updateMode("path") }, "Path on this machine");
+  const modeBar = el("div", { class: "toolbar", role: "tablist" }, useFileBtn, usePathBtn);
+  const sourceCard = el("div", { class: "card" }, el("h2", {}, "1 - Lecture file"), modeBar);
+
+  const pathRow = el("div", { class: "row hidden" },
+    el("div", { class: "grow" }, pathInput),
+    el("button", { type: "button", onclick: probePath }, "Check & use"));
+
+  function updateMode(mode) {
+    const isFile = mode === "file";
+    useFileBtn.setAttribute("aria-selected", String(isFile));
+    usePathBtn.setAttribute("aria-selected", String(!isFile));
+    drop.classList.toggle("hidden", !isFile);
+    fileStatus.classList.toggle("hidden", !isFile);
+    pathRow.classList.toggle("hidden", isFile);
+    pathStatus.classList.toggle("hidden", isFile);
+    sourceCard.replaceChildren(
+      el("h2", {}, "1 - Lecture file"),
+      modeBar,
+      isFile ? el("div", {}, drop, fileStatus, progressBox) : el("div", {}, pathRow, pathStatus),
+      el("p", { class: "hint" },
+        isFile
+          ? "The file is copied into data/ and removed once the transcription succeeds. Prefer Path to avoid the copy."
+          : "The file stays where it is: it is never copied, moved or deleted."),
+    );
+  }
+
   function setFile(file) {
     pickedFile = file;
-    // L'ultima scelta vince: se prima c'era un path, il file lo sostituisce.
+    // L'ultima scelta vince: un file selezionato sostituisce il path validato.
     source = null;
-    pathStatus.textContent = "Paste an absolute path to transcribe the file in place (no copy).";
+    pathStatus.textContent = "The file is read where it is: no copy, nothing moved or deleted.";
     fileStatus.textContent = `${file.name} - ${fmtBytes(file.size)} - ready to upload (it will be copied into data/sources and removed after the job).`;
     if (!nameInput.value) nameInput.value = file.name.replace(/\.[^.]+$/, "");
   }
@@ -472,17 +515,11 @@ async function viewNewLecture(nav, projectId) {
   const instruction = el("input", { id: "optInstruction", placeholder: "Extra instructions for the agent (optional)" });
 
   const form = el("form", { class: "stack", onsubmit: submit },
-    el("div", { class: "card" }, el("h2", {}, "1 · Lecture file"), drop, fileStatus, progressBox),
-    el("div", { class: "card" }, el("h2", {}, "2 · Or use a path on this machine"),
-      el("div", { class: "row" },
-        el("div", { class: "grow" }, pathInput),
-        el("button", { type: "button", onclick: probePath }, "Check & use")),
-      pathStatus,
-      el("p", { class: "hint" }, "Browsers cannot read local paths for privacy reasons, so the path field is validated by the server. Files used this way are never copied, moved or deleted.")),
-    el("div", { class: "card" }, el("h2", {}, "3 · Metadata"),
+    sourceCard,
+    el("div", { class: "card" }, el("h2", {}, "2 - Metadata"),
       el("div", { class: "field" }, el("label", { for: "srcTitle" }, "Title"), nameInput),
       el("div", { class: "field" }, el("label", { for: "srcDesc" }, "Description (optional)"), descInput)),
-    el("div", { class: "card" }, el("h2", {}, "4 · Transcription options"),
+    el("div", { class: "card" }, el("h2", {}, "3 - Transcription options"),
       el("div", { class: "row" },
         el("div", { class: "grow field" }, el("label", { for: "optModel" }, "Whisper model"), opts.model),
         el("div", { class: "grow field" }, el("label", { for: "optLang" }, "Language (or “auto”)"), opts.language)),
@@ -498,7 +535,7 @@ async function viewNewLecture(nav, projectId) {
         el("label", { class: "check" }, opts.wordTs, el("span", {}, "Word-level timestamps (slower)")),
         el("label", { class: "check" }, opts.noVad, el("span", {}, "Disable VAD silence filtering"))),
       el("p", { class: "hint" }, "Timestamps are always stored per segment: they power resume, the segments tab and the editor.")),
-    el("div", { class: "card" }, el("h2", {}, "5 · Correction agent (optional)"),
+    el("div", { class: "card" }, el("h2", {}, "4 - Correction agent (optional)"),
       providers.length ? el("div", { class: "stack" },
         el("label", { class: "check" }, agentToggle, el("span", {}, "Run the correction agent when the transcription finishes")),
         el("div", { class: "row" },
@@ -510,6 +547,10 @@ async function viewNewLecture(nav, projectId) {
       el("button", { class: "primary", type: "submit" }, "Start transcription"),
       el("span", { class: "muted small" }, terms.filter((t) => t.auto).length ? `${terms.filter((t) => t.auto).length} auto glossary term(s) will be applied` : ""),
     ));
+
+  // Stato iniziale: una sola sorgente visibile (file), l'altra raggiungibile
+  // dallo switch in cima alla card.
+  updateMode("file");
 
   async function submit(event) {
     event.preventDefault();
@@ -992,20 +1033,20 @@ async function viewSettings(nav) {
         p.has_key ? el("span", { class: "badge ok" }, "key stored") : el("span", { class: "badge" }, "no key"),
         el("label", { class: "check", style: "margin:0" }, enabled, el("span", {}, "enabled")),
         el("span", { class: "spacer" }),
-        el("button", { onclick: async () => { status.textContent = "testing…"; status.textContent = JSON.stringify(await api(`/providers/${p.id}/test`, { method: "POST", body: { model: modelInput.value } })); } }, "Test")),
+        el("button", { type: "button", onclick: async () => { status.textContent = "testing…"; status.textContent = JSON.stringify(await api(`/providers/${p.id}/test`, { method: "POST", body: { model: modelInput.value } })); } }, "Test")),
       el("div", { class: "row", style: "margin-top:8px" },
         el("div", { class: "grow field" }, el("label", {}, "Base URL"), urlInput),
         el("div", { class: "grow field" }, el("label", {}, "Model"), modelInput),
         el("div", { class: "grow field" }, el("label", {}, "API key"), keyInput)),
       el("div", { class: "split" },
-        el("button", { onclick: async () => {
+        el("button", { type: "button", onclick: async () => {
           const body = { base_url: urlInput.value, model: modelInput.value, enabled: enabled.checked };
           if (keyInput.value) body.api_key = keyInput.value;
           await api(`/providers/${p.id}`, { method: "PATCH", body });
           toast("Provider saved", "ok");
           render();
         } }, "Save"),
-        el("button", { onclick: async () => {
+        el("button", { type: "button", onclick: async () => {
           const r = await api(`/providers/${p.id}/models`).catch((e) => { toast(e.message, "err"); return null; });
           if (r) status.textContent = r.models.slice(0, 12).join(", ");
         } }, "List models"),
