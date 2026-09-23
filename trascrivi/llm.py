@@ -21,9 +21,10 @@ from . import config
 
 log = logging.getLogger("trascrivi.llm")
 
-# Tetto di output per chunk: le proposte sono piccole, un tetto basso taglia le
-# risposte che degenerano (e i costi).
-MAX_OUTPUT_TOKENS = 4000
+# Tetto di output per chunk. Deve stare alto: i modelli con "reasoning" consumano
+# token di pensiero che non compaiono nel contenuto, e un tetto troppo basso
+# restituisce HTTP 200 con `content` VUOTO (successo apparente, zero risultato).
+MAX_OUTPUT_TOKENS = 8000
 REQUEST_TIMEOUT = 180.0
 
 SYSTEM_PROMPT = """You are a transcript proofreader for university lecture transcripts \
@@ -96,8 +97,15 @@ def decrypt_key(token: str | None) -> str | None:
     try:
         from cryptography.fernet import Fernet
         return Fernet(config.load_or_create_secret()).decrypt(token.encode("ascii")).decode("utf-8")
-    except Exception as exc:  # chiave ruotata o valore corrotto
-        log.warning("impossibile decifrare l'API key: %s", exc)
+    except Exception as exc:
+        # Causa tipica: data/secret.key è stato rigenerato (o il DB è stato
+        # spostato senza la chiave), quindi il valore cifrato non è più
+        # decifrabile. Non c'è modo di recuperarlo: va reinserita la chiave.
+        log.error(
+            "API key non decifrabile (%s): la chiave salvata in data/secret.key non "
+            "corrisponde a quella usata per cifrarla. Reinserisci l'API key del provider.",
+            type(exc).__name__,
+        )
         return None
 
 
@@ -113,6 +121,11 @@ def _client(provider: dict):
 
     key = decrypt_key(provider.get("api_key_enc"))
     name = provider.get("name", "")
+    if provider.get("api_key_enc") and not key:
+        raise RuntimeError(
+            f"The stored API key for '{name}' cannot be decrypted: data/secret.key no longer "
+            f"matches the key used to encrypt it. Re-enter the API key in Settings and save."
+        )
     if not key and name != "ollama":
         raise RuntimeError(f"No API key configured for provider '{name}'.")
     base_url = provider.get("base_url") or ""
@@ -132,7 +145,12 @@ def list_models(provider: dict) -> list[str]:
 
 
 def test_provider(provider: dict) -> dict:
-    """Chiamata minima per validare chiave e modello."""
+    """
+    Chiamata minima per validare chiave, modello e formato della risposta.
+
+    Riporta anche come il modello ha risposto (finish_reason, token usati): è la
+    differenza fra "chiave sbagliata" e "modello che risponde a vuoto".
+    """
     model = provider.get("model") or ""
     if not model:
         return {"ok": False, "error": "No model configured"}
@@ -140,11 +158,21 @@ def test_provider(provider: dict) -> dict:
     resp = client.chat.completions.create(
         model=model,
         messages=[{"role": "user", "content": "Reply with the single word: ok"}],
-        max_tokens=8,
+        max_tokens=64,
         temperature=0,
     )
-    text = (resp.choices[0].message.content or "").strip()
-    return {"ok": True, "model": model, "reply": text[:60]}
+    text, diag = extract_content(resp)
+    return {
+        "ok": bool(text.strip()),
+        "model": model,
+        "reply": text.strip()[:60],
+        "finish_reason": diag.get("finish_reason"),
+        "usage": diag.get("usage"),
+        "error": None if text.strip() else (
+            "The model replied with an empty message"
+            + (f" (finish_reason={diag.get('finish_reason')})" if diag.get("finish_reason") else "")
+        ),
+    }
 
 
 # ── Estrazione dei replacement ───────────────────────────────────────────────
@@ -269,12 +297,49 @@ def ask_for_replacements(provider: dict, transcript_text: str,
         kwargs["response_format"] = {"type": "json_object"}
 
     resp = client.chat.completions.create(**kwargs)
-    raw = (resp.choices[0].message.content or "") if resp.choices else ""
+    raw, diag = extract_content(resp)
     payload = extract_json(raw)
     if payload is None:
-        log.warning("risposta LLM non interpretabile (%d caratteri): %s", len(raw), raw[:200])
-        raise ValueError("The model did not return valid JSON.")
+        # Qui c'è il caso peggiore da distinguere: `content` vuoto con HTTP 200.
+        # Succede con i modelli "reasoning" quando il budget di token viene
+        # consumato dal pensiero, o quando il modello risponde solo in un campo
+        # separato (reasoning_content).
+        hint = ""
+        if not raw:
+            hint = (" The model returned an empty response"
+                    f" (finish_reason={diag.get('finish_reason')!r},"
+                    f" reasoning={diag.get('reasoning_chars', 0)} chars,"
+                    f" usage={diag.get('usage')})."
+                    " If it is a reasoning model, raise the token budget or use a"
+                    " non-reasoning model for this task.")
+        log.warning("risposta LLM non interpretabile (%d caratteri)%s: %s",
+                    len(raw), hint, raw[:300])
+        raise ValueError("The model did not return valid JSON." + hint)
     return _clean_proposals(payload), _clean_glossary(payload)
+
+
+def extract_content(resp) -> tuple[str, dict]:
+    """
+    Estrae il testo dalla risposta e raccoglie la diagnostica utile.
+
+    I modelli "reasoning" (deepseek-reasoner e simili) espongono il pensiero in un
+    campo separato e a volte lasciano `content` vuoto: senza guardare
+    `finish_reason` e `reasoning_content` l'errore sembra un JSON malformato,
+    mentre il problema è il budget di token.
+    """
+    if not getattr(resp, "choices", None):
+        return "", {"finish_reason": None, "reasoning_chars": 0, "usage": None}
+    choice = resp.choices[0]
+    message = getattr(choice, "message", None)
+    content = getattr(message, "content", None) or ""
+    extra = getattr(message, "model_extra", None) or {}
+    reasoning = extra.get("reasoning_content") or extra.get("reasoning") or ""
+    usage = getattr(resp, "usage", None)
+    return content, {
+        "finish_reason": getattr(choice, "finish_reason", None),
+        "reasoning_chars": len(reasoning),
+        "usage": (usage.model_dump() if hasattr(usage, "model_dump") else usage),
+    }
 
 
 def estimate_tokens(text: str) -> int:

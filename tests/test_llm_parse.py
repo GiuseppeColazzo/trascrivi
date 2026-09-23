@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
 from cryptography.fernet import Fernet
 
-from trascrivi import config
+from trascrivi import config, llm
 from trascrivi.llm import (
     _clean_proposals,
     chunk_segments,
@@ -12,6 +13,84 @@ from trascrivi.llm import (
     encrypt_key,
     extract_json,
 )
+
+
+# ── forma della risposta e diagnostica ───────────────────────────────────────
+class _Message:
+    def __init__(self, content: str = "", extra: dict | None = None) -> None:
+        self.content = content
+        self.model_extra = extra or {}
+
+
+class _Choice:
+    def __init__(self, content: str = "", finish: str | None = None,
+                 extra: dict | None = None) -> None:
+        self.message = _Message(content, extra)
+        self.finish_reason = finish
+
+
+class _Usage:
+    def model_dump(self) -> dict:
+        return {"completion_tokens": 4000}
+
+
+class _Response:
+    def __init__(self, choices=(), usage=None) -> None:
+        self.choices = list(choices)
+        self.usage = usage
+
+
+def test_extract_content_reports_finish_reason_and_reasoning():
+    """
+    Regressione: un modello "reasoning" può rispondere HTTP 200 con `content`
+    vuoto e il pensiero in `reasoning_content`. Senza questa diagnostica l'errore
+    appare come "JSON non valido" e nasconde la causa vera (budget di token).
+    """
+    response = _Response([_Choice("", "length", {"reasoning_content": "x" * 120})], _Usage())
+
+    text, diag = llm.extract_content(response)
+
+    assert text == ""
+    assert diag["finish_reason"] == "length"
+    assert diag["reasoning_chars"] == 120
+    assert diag["usage"] == {"completion_tokens": 4000}
+
+
+def test_extract_content_handles_empty_choices():
+    text, diag = llm.extract_content(_Response())
+
+    assert text == ""
+    assert diag["finish_reason"] is None
+
+
+def test_empty_model_reply_says_the_response_was_empty(monkeypatch):
+    """Il messaggio d'errore deve dire che la risposta era vuota, non 'JSON rotto'."""
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return _Response([_Choice("", "length", {})], None)
+
+    fake_client = type("FakeClient", (), {
+        "chat": type("Chat", (), {"completions": FakeCompletions()})(),
+    })()
+    monkeypatch.setattr(llm, "_client", lambda provider: fake_client)
+
+    with pytest.raises(ValueError) as excinfo:
+        llm.ask_for_replacements({"name": "deepseek", "model": "deepseek-flash"}, "text")
+
+    message = str(excinfo.value)
+    assert "empty response" in message
+    assert "finish_reason='length'" in message
+
+
+def test_unreadable_key_is_reported_not_silently_ignored(monkeypatch, tmp_path):
+    """Una chiave non decifrabile deve dare un errore che dice cosa fare."""
+    monkeypatch.setattr(config, "SECRET_KEY_PATH", tmp_path / "secret.key")
+    token = Fernet(Fernet.generate_key()).encrypt(b"sk-test").decode("ascii")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        llm._client({"name": "deepseek", "api_key_enc": token, "base_url": "https://x"})
+
+    assert "cannot be decrypted" in str(excinfo.value)
 
 
 # ── extract_json ─────────────────────────────────────────────────────────────

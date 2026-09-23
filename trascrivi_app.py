@@ -111,12 +111,30 @@ def main(argv: list[str] | None = None) -> None:
     if not args.no_browser:
         open_browser(url)
 
+    # La UI fa polling ogni 1,5 s: i log di accesso di uvicorn diventerebbero
+    # centinaia di righe al minuto e nasconderebbero gli errori veri. Restano i
+    # log dell'applicazione (data/logs/app.log e stderr).
+    log_config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {"default": {"format": "%(levelname)s: %(message)s"}},
+        "handlers": {"default": {"class": "logging.StreamHandler", "formatter": "default"}},
+        "loggers": {
+            "uvicorn": {"handlers": ["default"], "level": "WARNING", "propagate": False},
+            "uvicorn.error": {"handlers": ["default"], "level": "WARNING", "propagate": False},
+            "uvicorn.access": {"handlers": [], "level": "WARNING", "propagate": False},
+            "httpx": {"handlers": [], "level": "WARNING", "propagate": False},
+            "httpx2": {"handlers": [], "level": "WARNING", "propagate": False},
+        },
+    }
+
     if args.dev:
         uvicorn.run("trascrivi.api:create_app", factory=True, host=args.host, port=port,
-                    reload=True, reload_dirs=[str(config.ROOT / "trascrivi")], log_level="info")
+                    reload=True, reload_dirs=[str(config.ROOT / "trascrivi")],
+                    log_level="info", log_config=log_config)
     else:
         uvicorn.run("trascrivi.api:create_app", factory=True, host=args.host, port=port,
-                    log_level="info")
+                    log_level="info", log_config=log_config)
 
 
 if __name__ == "__main__":

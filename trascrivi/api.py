@@ -683,7 +683,35 @@ def delete_term(term_id: int) -> dict:
 # ── Provider LLM ─────────────────────────────────────────────────────────────
 @router.get("/providers")
 def get_providers() -> dict:
-    return {"providers": db.list_providers()}
+    """
+    Elenco dei provider. Non espone mai la chiave, ma dice se è utilizzabile:
+    `key_state` distingue "assente" da "presente ma non decifrabile".
+    """
+    providers = db.list_providers()
+    for p in providers:
+        p["key_state"] = _key_state(p)
+    return {"providers": providers}
+
+
+def _key_state(provider: dict) -> str:
+    if provider.get("name") == "ollama":
+        return "not_required"
+    if not provider.get("has_key"):
+        return "missing"
+    raw = db.get_provider(int(provider["id"])) or {}
+    return "ok" if llm.decrypt_key(raw.get("api_key_enc")) else "unreadable"
+
+
+@router.get("/agent/prompt")
+def agent_prompt() -> dict:
+    """Il system prompt e i parametri con cui l'agente interroga il modello."""
+    return {
+        "system_prompt": llm.SYSTEM_PROMPT,
+        "max_output_tokens": llm.MAX_OUTPUT_TOKENS,
+        "temperature": 0,
+        "timeout_seconds": llm.REQUEST_TIMEOUT,
+        "chunk_chars": config.load_settings().llm_chunk_chars,
+    }
 
 
 @router.patch("/providers/{provider_id}")

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 
-from trascrivi import config, db
+from trascrivi import config, db, llm
 from trascrivi.textutil import segments_to_text
 
 TWO_SEGMENTS = [
@@ -606,3 +606,37 @@ def test_api_providers_never_leak_key_material(client):
     assert stored and "sk-super-secret" not in stored
 
     assert client.patch("/api/providers/9999", json={"api_key": "x"}).status_code == 404
+
+
+def test_api_providers_report_whether_the_key_is_usable(client):
+    """
+    `key_state` distingue "chiave assente" da "chiave presente ma non
+    decifrabile": senza questa informazione l'unico sintomo è un job agente che
+    fallisce con "The model did not return valid JSON".
+    """
+    providers = {p["name"]: p for p in client.get("/api/providers").json()["providers"]}
+    assert providers["ollama"]["key_state"] == "not_required"
+    assert providers["deepseek"]["key_state"] == "missing"
+
+    deepseek_id = providers["deepseek"]["id"]
+    client.patch(f"/api/providers/{deepseek_id}", json={"api_key": "sk-prova"})
+    after = {p["name"]: p for p in client.get("/api/providers").json()["providers"]}
+    assert after["deepseek"]["key_state"] == "ok"
+
+    # Chiave cifrata con un segreto diverso: illeggibile, e va detto.
+    db.update_provider(deepseek_id, api_key_enc=llm.encrypt_key("sk-altro"))
+    from cryptography.fernet import Fernet
+    (config.SECRET_KEY_PATH).write_bytes(Fernet.generate_key())
+    broken = {p["name"]: p for p in client.get("/api/providers").json()["providers"]}
+    assert broken["deepseek"]["key_state"] == "unreadable"
+    assert "api_key_enc" not in client.get("/api/providers").text
+
+
+def test_agent_prompt_endpoint_exposes_the_instructions(client):
+    info = client.get("/api/agent/prompt").json()
+
+    assert "replacements" in info["system_prompt"]
+    assert "glossary" in info["system_prompt"]
+    assert info["temperature"] == 0
+    assert info["max_output_tokens"] >= 4000
+    assert info["chunk_chars"] > 0
