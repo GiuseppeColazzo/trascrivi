@@ -85,6 +85,32 @@ def test_every_api_path_used_by_the_frontend_is_routed(js):
     assert unknown == [], f"chiamate a endpoint inesistenti: {unknown}"
 
 
+def test_view_new_lecture_wires_handlers_without_late_byId_lookups(js):
+    """
+    Regressione: in `viewNewLecture` gli elementi vengono costruiti da `el(...)`
+    **prima** di finire nel documento, quindi un `byId(...)` eseguito in quel
+    momento restituisce null. Era il bug del selettore file: il dialogo si apriva
+    ma l'evento `change` non era agganciato a nessun listener e la selezione
+    veniva persa senza errori visibili (l'optional chaining inghiottiva il null).
+    """
+    start = js.index("async function viewNewLecture")
+    end = js.index("async function viewJobs")
+    body = js[start:end]
+    # Via le righe di solo commento (incluso quello che cita il bug): qui
+    # interessa il codice eseguito. Non si tocca il resto, perché togliere i
+    # commenti in linea romperebbe le stringhe che contengono "//".
+    code = "\n".join(line for line in body.splitlines()
+                     if not line.lstrip().startswith("//"))
+
+    # L'input file deve nascere con il suo handler, non con un byId successivo.
+    assert 'id: "fileInput"' in code
+    assert "onchange:" in code
+    assert "fileInput" not in set(re.findall(r'byId\("([^"]+)"\)', code))
+    assert "uploadProgress" not in set(re.findall(r'byId\("([^"]+)"\)', code))
+    # La barra di avanzamento dell'upload deve esistere e contenere il riempimento.
+    assert "progressBox" in code and "progressFill" in code
+
+
 def test_frontend_js_has_valid_syntax():
     node = shutil.which("node")
     if not node:

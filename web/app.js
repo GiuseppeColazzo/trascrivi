@@ -362,12 +362,23 @@ async function viewNewLecture(nav, projectId) {
   let source = null;   // {id, name, original_path, bytes, stored_path}
   let pickedFile = null;
 
+  // L'input file va costruito con il suo `onchange` già agganciato: finché non è
+  // nel documento `byId("fileInput")` restituisce null e l'evento di selezione
+  // andrebbe perso (era il bug: il dialogo si apriva e non succedeva niente).
+  const fileInput = el("input", {
+    id: "fileInput", type: "file", class: "hidden", accept: "audio/*,video/*",
+    onchange: (e) => { if (e.target.files.length) setFile(e.target.files[0]); },
+  });
   const drop = el("div", { class: "drop" },
     el("p", {}, "Drop a lecture audio/video here"),
-    el("p", { class: "small" }, "or click to choose a file — mp4, mkv, mov, webm, mp3, wav, m4a, flac…"),
-    el("input", { id: "fileInput", type: "file", class: "hidden", accept: "audio/*,video/*" }));
+    el("p", { class: "small" }, "or click to choose a file - mp4, mkv, mov, webm, mp3, wav, m4a, flac..."),
+    fileInput);
 
-  drop.addEventListener("click", () => byId("fileInput").click());
+  drop.addEventListener("click", (e) => {
+    // Un click sull'input non deve riaprire il dialogo due volte.
+    if (e.target === fileInput) return;
+    fileInput.click();
+  });
   drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("over"); });
   drop.addEventListener("dragleave", () => drop.classList.remove("over"));
   drop.addEventListener("drop", (e) => {
@@ -375,45 +386,45 @@ async function viewNewLecture(nav, projectId) {
     drop.classList.remove("over");
     if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
   });
-  byId("fileInput")?.addEventListener("change", (e) => {
-    if (e.target.files.length) setFile(e.target.files[0]);
-  });
-  // Il click va intercettato prima che l'input file apra il dialogo due volte.
-  drop.addEventListener("click", (e) => { if (e.target === byId("fileInput")) e.stopPropagation(); });
 
   const fileStatus = el("p", { class: "small muted" }, "No file selected.");
   const nameInput = el("input", { id: "srcTitle", placeholder: "Lecture title" });
   const descInput = el("input", { id: "srcDesc", placeholder: "Optional description" });
   const pathInput = el("input", { id: "srcPath", placeholder: "C:\\Users\\you\\lectures\\lesson.mp4" });
   const pathStatus = el("p", { class: "small muted" }, "Paste an absolute path to transcribe the file in place (no copy).");
-  const progressBar = el("span");
+  const progressFill = el("span");
+  const progressBox = el("div", { class: "progress hidden" }, progressFill);
 
   function setFile(file) {
     pickedFile = file;
-    fileStatus.textContent = `${file.name} · ${fmtBytes(file.size)} — ready to upload (it will be copied into data/sources and removed after the job).`;
+    // L'ultima scelta vince: se prima c'era un path, il file lo sostituisce.
+    source = null;
+    pathStatus.textContent = "Paste an absolute path to transcribe the file in place (no copy).";
+    fileStatus.textContent = `${file.name} - ${fmtBytes(file.size)} - ready to upload (it will be copied into data/sources and removed after the job).`;
     if (!nameInput.value) nameInput.value = file.name.replace(/\.[^.]+$/, "");
   }
 
   async function probePath() {
     const value = pathInput.value.trim();
     if (!value) return;
-    pathStatus.textContent = "Checking…";
+    pathStatus.textContent = "Checking...";
     try {
       const info = await api(`/media/probe?path=${encodeURIComponent(value)}`);
       if (!info.has_audio) {
-        pathStatus.textContent = `⚠ No audio track in ${info.name}`;
+        pathStatus.textContent = `No audio track in ${info.name}`;
         source = null;
         return;
       }
       const created = await api(`/projects/${projectId}/sources`, { method: "POST", body: { path: value } });
       source = created.source;
       pickedFile = null;
-      pathStatus.textContent = `✓ ${info.name} · ${fmtBytes(info.size)} · ${fmtTime(info.duration)} — will be read in place`;
+      fileStatus.textContent = "No file selected.";
+      pathStatus.textContent = `${info.name} - ${fmtBytes(info.size)} - ${fmtTime(info.duration)} - will be read in place`;
       if (!nameInput.value) nameInput.value = info.name.replace(/\.[^.]+$/, "");
       if (created.duplicate_of) pathStatus.textContent += ` (duplicate of source #${created.duplicate_of})`;
     } catch (err) {
       source = null;
-      pathStatus.textContent = `⚠ ${err.message}`;
+      pathStatus.textContent = `Rejected: ${err.message}`;
     }
   }
   const fmtTime = (s) => (s ? fmtTs(s) : "unknown length");
@@ -426,7 +437,7 @@ async function viewNewLecture(nav, projectId) {
       const xhr = new XMLHttpRequest();
       xhr.open("POST", `/api/projects/${projectId}/upload`);
       xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) progressBar.style.width = `${(e.loaded / e.total) * 100}%`;
+        if (e.lengthComputable) progressFill.style.width = `${(e.loaded / e.total) * 100}%`;
       };
       xhr.onload = () => {
         try {
@@ -461,8 +472,7 @@ async function viewNewLecture(nav, projectId) {
   const instruction = el("input", { id: "optInstruction", placeholder: "Extra instructions for the agent (optional)" });
 
   const form = el("form", { class: "stack", onsubmit: submit },
-    el("div", { class: "card" }, el("h2", {}, "1 · Lecture file"), drop, fileStatus, progressBar,
-      el("div", { class: "progress hidden", id: "uploadProgress" }, progressBar)),
+    el("div", { class: "card" }, el("h2", {}, "1 · Lecture file"), drop, fileStatus, progressBox),
     el("div", { class: "card" }, el("h2", {}, "2 · Or use a path on this machine"),
       el("div", { class: "row" },
         el("div", { class: "grow" }, pathInput),
@@ -505,11 +515,13 @@ async function viewNewLecture(nav, projectId) {
     event.preventDefault();
     const submitBtn = $("button[type=submit]", form);
     submitBtn.disabled = true;
-    submitBtn.textContent = "Working…";
+    submitBtn.textContent = "Working...";
     try {
       if (!source && pickedFile) {
-        $("#uploadProgress", form)?.classList.remove("hidden");
+        progressBox.classList.remove("hidden");
+        fileStatus.textContent = `Uploading ${pickedFile.name}...`;
         await uploadPicked();
+        fileStatus.textContent = `${pickedFile.name} uploaded.`;
       }
       if (!source) throw new Error("Choose a file or a path first.");
       const job = await api("/jobs", {
@@ -527,15 +539,13 @@ async function viewNewLecture(nav, projectId) {
           word_timestamps: opts.wordTs.checked,
           no_vad: opts.noVad.checked,
           initial_prompt: opts.prompt.value,
+          // `run_agent` viene letto dal worker: il job agente nasce quando la
+          // trascrizione esiste, così l'ordine è garantito.
           run_agent: agentToggle.checked,
           provider_id: providerSelect.value ? Number(providerSelect.value) : null,
           instruction: instruction.value,
         },
       });
-      if (agentToggle.checked && providerSelect.value) {
-        // Il job agente viene creato dal worker quando la trascrizione esiste:
-        // qui marchiamo solo l'intenzione, che il backend legge dal payload.
-      }
       toast("Transcription queued", "ok");
       location.hash = `#/jobs?focus=${job.job.id}`;
     } catch (err) {

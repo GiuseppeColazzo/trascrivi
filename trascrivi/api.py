@@ -345,7 +345,10 @@ async def upload_source(project_id: int,
         _unlink(stored)
         raise HTTPException(422, f"No audio track found in {name}")
 
-    original = declared_path or str(stored)
+    # `original_path` resta vuoto quando il browser non ha potuto dichiarare il
+    # percorso: meglio nessuna provenienza che mostrare il path interno con
+    # l'hash, che non dice niente all'utente.
+    original = declared_path or ""
     sid = db.create_source(project_id, original, name, str(stored), size, duration,
                           digest.hexdigest())
     return {"source": db.get_source(sid)}
