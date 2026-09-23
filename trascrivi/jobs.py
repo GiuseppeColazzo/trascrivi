@@ -251,7 +251,7 @@ def run_agent(job_id: int, payload: dict) -> dict:
     if provider is None:
         raise ValueError("LLM provider not configured")
     settings = config.load_settings()
-    budget = int(payload.get("chunk_chars") or settings.llm_chunk_chars or 8000)
+    budget = int(payload.get("chunk_chars") or settings.llm_chunk_chars or llm.chunk_budget())
 
     segments = transcript["segments"] or text_to_segments(transcript["text"])
     if not segments:
@@ -276,18 +276,30 @@ def run_agent(job_id: int, payload: dict) -> dict:
     for i, chunk in enumerate(chunks, start=1):
         if stop_flag.is_set():
             break
-        chunk_text = llm.chunk_text(chunk)
         _mapped, spans = corr.chunk_text_with_map(chunk)
         try:
-            proposals, chunk_glossary = llm.ask_for_replacements(
-                provider, chunk_text, extra_instruction=payload.get("instruction") or ""
+            # `ask_chunk` dimezza lo spezzone se la risposta non ci sta dentro:
+            # un chunk grande fa troncare il JSON delle proposte a metà.
+            proposals, chunk_glossary, _diag, origin = llm.ask_chunk(
+                provider, chunk, extra_instruction=payload.get("instruction") or ""
             )
             for prop in proposals:
-                local = corr.locate_in_spans(_mapped, spans, corr.normalize_for_match(prop["find"]))
+                # La proposta va cercata nel sub-chunk che l'ha generata: dopo una
+                # divisione gli indici del chunk padre non valgono più.
+                sub = origin.get(id(prop)) or chunk
+                sub_text, sub_spans = corr.chunk_text_with_map(sub)
+                local = corr.locate_in_spans(sub_text, sub_spans,
+                                             corr.normalize_for_match(prop["find"]))
+                if local is None and sub is not chunk:
+                    local = corr.locate_in_spans(
+                        _mapped, spans, corr.normalize_for_match(prop["find"]))
                 prop["segment_index"] = local[0] if local else None
-                raw_proposals.append(prop)
+            raw_proposals.extend(proposals)
             if chunk_glossary:
                 glossary.extend(chunk_glossary)
+        except llm.ChunkTooLarge as exc:
+            log.warning("job %s: chunk %d/%d non elaborabile: %s", job_id, i, len(chunks), exc)
+            failures.append(str(exc)[:200])
         except Exception as exc:  # noqa: BLE001 - un chunk rotto non uccide il job
             log.warning("job %s: chunk %d/%d fallito: %s", job_id, i, len(chunks), exc)
             failures.append(str(exc)[:200])
@@ -346,6 +358,8 @@ def _count_occurrences(segments: list[dict], find: str) -> int:
 
 def _validate_flag(segments: list[dict], item: dict) -> str:
     """Quante volte il `find` compare: 0 = inutilizzabile, >1 = ambiguo."""
+    if (item.get("find") or "") == (item.get("replace") or "").strip():
+        return "noop"
     hits = _count_occurrences(segments, item.get("find") or "")
     if not corr.normalize_for_match(item.get("find") or ""):
         return "unmatched"

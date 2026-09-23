@@ -114,6 +114,7 @@ class TermIn(BaseModel):
 class ProviderIn(BaseModel):
     base_url: str | None = None
     model: str | None = None
+    fallback_model: str | None = None
     enabled: bool | None = None
     api_key: str | None = None
 
@@ -705,12 +706,13 @@ def _key_state(provider: dict) -> str:
 @router.get("/agent/prompt")
 def agent_prompt() -> dict:
     """Il system prompt e i parametri con cui l'agente interroga il modello."""
+    settings = config.load_settings()
     return {
         "system_prompt": llm.SYSTEM_PROMPT,
         "max_output_tokens": llm.MAX_OUTPUT_TOKENS,
         "temperature": 0,
         "timeout_seconds": llm.REQUEST_TIMEOUT,
-        "chunk_chars": config.load_settings().llm_chunk_chars,
+        "chunk_chars": settings.llm_chunk_chars,
     }
 
 
@@ -724,8 +726,9 @@ def patch_provider(provider_id: int, body: ProviderIn) -> dict:
         # Stringa vuota = rimuovi la chiave salvata.
         api_key_enc = llm.encrypt_key(body.api_key) if body.api_key else ""
     db.update_provider(provider_id, base_url=body.base_url, model=body.model,
+                       fallback_model=body.fallback_model,
                        enabled=body.enabled, api_key_enc=api_key_enc)
-    return {"providers": db.list_providers()}
+    return {"providers": get_providers()["providers"]}
 
 
 @router.post("/providers/{provider_id}/test")

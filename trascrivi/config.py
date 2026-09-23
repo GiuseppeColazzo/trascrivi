@@ -52,7 +52,7 @@ class Settings:
     default_compute_type: str = "auto"
     default_provider_id: int | None = None
     flush_every: float = 10.0          # secondi di audio tra due flush su disco
-    llm_chunk_chars: int = 8000        # budget caratteri per chunk dell'agente
+    llm_chunk_chars: int = 4000       # budget caratteri per chunk dell'agente
     delete_sources_after_job: bool = True
     backup_keep: int = 5               # numero di backup da conservare
     extra: dict = field(default_factory=dict)

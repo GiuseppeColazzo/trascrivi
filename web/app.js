@@ -1006,7 +1006,7 @@ async function viewSettings(nav) {
       el("div", { class: "stack" }, providers.map((p) => providerRow(p)))),
 
     el("div", { class: "card" }, el("h2", {}, "Correction agent"),
-      el("p", { class: "muted small" }, "The agent never rewrites the transcript: it returns anchored find -> replace edits that you review and accept one by one. These are the exact instructions it receives."),
+      el("p", { class: "muted small" }, "The agent never rewrites the transcript: it returns anchored find -> replace edits that you review and accept one by one. It only proposes words the recogniser heard wrong when the sentence makes the intended word obvious (acronyms, names, technical terms), never style or punctuation preferences. These are the exact instructions it receives."),
       agentPromptBox()),
 
     el("div", { class: "card" }, el("h2", {}, "Storage"),
@@ -1028,24 +1028,25 @@ async function viewSettings(nav) {
 
   function agentPromptBox() {
     const box = el("div", { class: "stack" });
+    const badges = el("div", { class: "split small" });
+    const prompt = el("pre", { class: "export" }, "loading...");
+    box.append(badges, el("details", { class: "adv" },
+      el("summary", {}, "System prompt"), prompt));
     api("/agent/prompt").then((info) => {
-      box.append(
-        el("div", { class: "split small" },
-          el("span", { class: "badge" }, `max output: ${info.max_output_tokens} tokens`),
-          el("span", { class: "badge" }, `temperature: ${info.temperature}`),
-          el("span", { class: "badge" }, `chunk: ${info.chunk_chars} chars`),
-          el("span", { class: "badge" }, `timeout: ${Math.round(info.timeout_seconds)}s`)),
-        el("details", { class: "adv" },
-          el("summary", {}, "System prompt"),
-          el("pre", { class: "export" }, info.system_prompt)),
-      );
-    }).catch(() => box.append(el("p", { class: "muted small" }, "Could not load the prompt.")));
+      prompt.textContent = info.system_prompt;
+      badges.replaceChildren(
+        el("span", { class: "badge" }, `max output: ${info.max_output_tokens} tokens`),
+        el("span", { class: "badge" }, `temperature: ${info.temperature}`),
+        el("span", { class: "badge" }, `chunk: ${info.chunk_chars} chars`),
+        el("span", { class: "badge" }, `timeout: ${Math.round(info.timeout_seconds)}s`));
+    }).catch(() => { prompt.textContent = "Could not load the prompt."; });
     return box;
   }
 
   function providerRow(p) {
     const keyInput = el("input", { type: "password", placeholder: p.has_key ? "•••••• configured" : "API key", autocomplete: "off" });
     const modelInput = el("input", { value: p.model || "", placeholder: "model id" });
+    const fallbackInput = el("input", { value: p.fallback_model || "", placeholder: "fallback model (optional)" });
     const urlInput = el("input", { value: p.base_url, placeholder: "base url" });
     const enabled = el("input", { type: "checkbox" });
     enabled.checked = !!p.enabled;
@@ -1055,6 +1056,7 @@ async function viewSettings(nav) {
       : p.has_key
         ? el("span", { class: "badge ok" }, "key stored")
         : el("span", { class: "badge" }, "no key");
+    const isReasoning = /reason|think|r1|o[1-4]\b/i.test(p.model || "");
     return el("div", { class: "card" },
       el("div", { class: "split" },
         el("h3", { style: "margin:0" }, p.name),
@@ -1066,13 +1068,22 @@ async function viewSettings(nav) {
         ? el("p", { class: "small", style: "color:var(--danger)" },
             "The saved key can no longer be decrypted (data/secret.key changed). Paste the key again and press Save.")
         : null,
+      isReasoning
+        ? el("p", { class: "small", style: "color:var(--warn)" },
+            "This looks like a reasoning model. It may spend the whole token budget thinking and return nothing: the agent would then fall back to the fallback model below.")
+        : null,
       el("div", { class: "row", style: "margin-top:8px" },
         el("div", { class: "grow field" }, el("label", {}, "Base URL"), urlInput),
         el("div", { class: "grow field" }, el("label", {}, "Model"), modelInput),
         el("div", { class: "grow field" }, el("label", {}, "API key"), keyInput)),
+      el("div", { class: "field" },
+        el("label", {}, "Fallback model"),
+        fallbackInput,
+        el("p", { class: "hint" }, "Used once, per chunk, when the main model returns no text at all (typical of reasoning models that exhaust the token budget).")),
       el("div", { class: "split" },
         el("button", { type: "button", onclick: async () => {
-          const body = { base_url: urlInput.value, model: modelInput.value, enabled: enabled.checked };
+          const body = { base_url: urlInput.value, model: modelInput.value,
+                         fallback_model: fallbackInput.value, enabled: enabled.checked };
           if (keyInput.value) body.api_key = keyInput.value;
           await api(`/providers/${p.id}`, { method: "PATCH", body });
           toast("Provider saved", "ok");

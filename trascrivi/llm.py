@@ -21,34 +21,52 @@ from . import config
 
 log = logging.getLogger("trascrivi.llm")
 
-# Tetto di output per chunk. Deve stare alto: i modelli con "reasoning" consumano
-# token di pensiero che non compaiono nel contenuto, e un tetto troppo basso
-# restituisce HTTP 200 con `content` VUOTO (successo apparente, zero risultato).
+# Il "thinking mode" di DeepSeek è attivo di default con effort `high`: su un
+# compito di estrazione come il nostro brucia il budget in ragionamento e può
+# restituire `content` vuoto. Con `reasoning_effort="none"` il modello risponde
+# diretto (e `temperature` torna ad avere effetto: in thinking mode è ignorata).
+# Vedi https://api-docs.deepseek.com/guides/thinking_mode/
+NO_THINKING = {"reasoning_effort": "none"}
+THINKING_OFF_BODY = {"thinking": {"type": "disabled"}}
+# Provider a cui mandiamo `reasoning_effort` senza doverlo scoprire a errori.
+REASONING_EFFORT_PROVIDERS = {"deepseek"}
+# Tetto di output per chunk. Non è il budget di ragionamento: con il thinking
+# disattivato serve solo a produrre il JSON delle proposte.
 MAX_OUTPUT_TOKENS = 8000
 REQUEST_TIMEOUT = 180.0
 
-SYSTEM_PROMPT = """You are a transcript proofreader for university lecture transcripts \
-produced by automatic speech recognition (Whisper).
+SYSTEM_PROMPT = """You are a transcript proofreader for university lecture transcripts produced by speech recognition (Whisper).
 
 Return ONLY a JSON object, no prose, no markdown fences:
-{"replacements": [{"find": "...", "replace": "...", "reason": "...", "kind": "term|asr_error|punctuation|grammar|name|formatting", "confidence": 0.0}], "glossary": [{"term": "...", "meaning": "..."}]}
+{"replacements": [{"find": "...", "replace": "...", "reason": "...", "kind": "term|asr_error|name", "confidence": 0.0}], "glossary": [{"term": "...", "meaning": "..."}]}
+
+Your job is ONLY to fix words the recogniser HEARD WRONG when the intended word is unmistakable from the sentence. Nothing else.
+
+For every candidate ask yourself: "would a human typing this transcript while listening have written something different?" If the answer is no, do not propose it.
+
+NEVER propose:
+- wording you merely prefer, rephrasing, or style changes;
+- spelling variants, hyphenation, British vs American spelling;
+- capitalisation of ordinary words, or of acronyms already understood;
+- punctuation-only changes, unless the missing punctuation makes a sentence unreadable;
+- removing or changing filler words, repetitions, hesitations, or spoken grammar;
+- anything whose meaning is already clear.
+
+DO propose, only when unambiguous:
+- "term": an acronym or technical term the recogniser spelled out or mangled ("s g d" -> "SGD", "pie torch" -> "PyTorch", "COGO" -> "CO2");
+- "name": a proper noun or title clearly wrong given the context ("Mecca" -> "Meta" in a lawsuit about a tech company);
+- "asr_error": a string that is not a word in this context and whose replacement the sentence makes obvious ("four people" -> "poor people", "gave back" -> "give-back").
 
 Rules for "find":
-- Copy it VERBATIM from the transcript, including punctuation. Maximum 80 characters.
-- It must occur exactly once in the text you are given. If a phrase appears twice, skip it.
-- Never rewrite or rephrase whole sentences: only fix what is objectively wrong.
+- Copy it VERBATIM from the transcript. Maximum 80 characters.
+- It must occur exactly once in the text you are given. If it appears twice, skip it.
+- Never put a timestamp inside "find".
 Rules for "replace":
-- Minimum edit that fixes the problem. Keep the speaker's meaning, style and wording.
-- Never translate, never summarise, never add content, keep the same spelling variant.
-What to fix, in order of importance:
-1. "term": ASR mishearings of technical terms, acronyms, proper nouns, formulas (e.g. "pie torch" -> "PyTorch").
-2. "asr_error": obvious mis-recognitions that change meaning.
-3. "name": names of people, tools, papers, places.
-4. "punctuation": missing sentence boundaries, run-on sentences, wrong capitalisation of proper nouns.
-5. "grammar": agreement and typos that came from the recogniser.
-Do NOT change: filler words, spoken repetition, discourse markers, informal register.
-If there is nothing worth fixing, return {"replacements": []}.
-"glossary" is optional: at most 5 entries, only for terms a student would look up."""
+- The smallest edit that fixes the recognition error. Every other word stays identical.
+- Never add or remove information, never translate, never reorder words.
+
+Be strict. Most chunks contain only a handful of real recognition errors; returning very few items, or none at all, is the correct answer for clean audio.
+At most 15 items in "replacements", 12 words per "reason". "glossary" is optional and at most 3 entries."""
 
 
 # ── Chunking ─────────────────────────────────────────────────────────────────
@@ -168,10 +186,7 @@ def test_provider(provider: dict) -> dict:
         "reply": text.strip()[:60],
         "finish_reason": diag.get("finish_reason"),
         "usage": diag.get("usage"),
-        "error": None if text.strip() else (
-            "The model replied with an empty message"
-            + (f" (finish_reason={diag.get('finish_reason')})" if diag.get("finish_reason") else "")
-        ),
+        "error": None if text.strip() else _error_detail(diag),
     }
 
 
@@ -234,6 +249,11 @@ def _clean_proposals(payload: dict) -> list[dict]:
         replace = str(raw.get("replace") or "")
         if not find:
             continue
+        # Il modello a volte restituisce `replace` identico a `find` (misurato:
+        # 217 su 563 su una lezione reale). Non è una correzione: va scartata
+        # qui, altrimenti riempie la review di voci inutili.
+        if find == replace.strip():
+            continue
         conf = raw.get("confidence")
         try:
             conf = float(conf) if conf is not None else None
@@ -261,18 +281,120 @@ def _clean_glossary(payload: dict) -> list[dict]:
     return out[:10]
 
 
+# Budget caratteri per chiamata. Il JSON delle proposte è la voce che cresce:
+# su una lezione reale il modello trova decine di correzioni per chunk, e con
+# chunk troppo grandi il JSON supera il tetto di token e non si chiude mai
+# (`finish_reason="length"`). Misurato: 40 segmenti (~12k caratteri) → 92 proposte
+# in 16k caratteri, al limite; 60 segmenti → il JSON non si chiude. 4000 caratteri
+# restano larghi e la qualità dello spezzone non ne soffre.
+def chunk_budget() -> int:
+    return int(config.load_settings().llm_chunk_chars or 4000)
+
+
 def ask_for_replacements(provider: dict, transcript_text: str,
                          extra_instruction: str = "") -> tuple[list[dict], list[dict]]:
-    """
-    Una chiamata al modello su un chunk. Restituisce (proposte, glossario).
+    """Un chunk -> (proposte, glossario), con ripiego sul modello non-reasoning."""
+    proposals, glossary, _diag = ask_with_fallback(provider, transcript_text, extra_instruction)
+    return proposals, glossary
 
-    `temperature=0` perché non vogliamo creatività: vogliamo sostituzioni
-    verificabili. Il testo arriva con i timestamp per non perdere il contesto
-    del parlato.
+
+def ask_with_fallback(provider: dict, transcript_text: str, extra_instruction: str = "",
+                      max_tokens: int | None = None) -> tuple[list[dict], list[dict], dict]:
     """
-    model = provider.get("model") or ""
+    Prova il modello configurato; se spende tutto in ragionamento, riprova.
+
+    Un modello "reasoning" può consumare l'intero budget di token senza scrivere
+    nulla nel contenuto (finish_reason="length", reasoning_tokens == completion).
+    In quel caso alzare il budget non serve: se ne mangia altri. Si riprova una
+    sola volta con `fallback_model`, che per DeepSeek è `deepseek-chat`
+    (non-reasoning): stessa qualità su questo compito, una frazione del costo.
+    """
+    model = (provider.get("model") or "").strip()
     if not model:
         raise RuntimeError(f"No model configured for provider '{provider.get('name')}'.")
+
+    candidates = [model]
+    fallback = (provider.get("fallback_model") or "").strip()
+    if fallback and fallback != model:
+        candidates.append(fallback)
+
+    budget = int(max_tokens or MAX_OUTPUT_TOKENS)
+    diagnostics: list[dict] = []
+    for index, candidate in enumerate(candidates):
+        try:
+            content, diag = _chat_once(provider, candidate, transcript_text,
+                                       extra_instruction, budget)
+        except Exception as exc:  # rete, 429, modello inesistente…
+            diagnostics.append({"model": candidate, "error": f"{type(exc).__name__}: {exc}"[:200]})
+            if index + 1 < len(candidates):
+                log.warning("modello %s fallito (%s): provo il ripiego %s",
+                            candidate, type(exc).__name__, candidates[index + 1])
+                continue
+            raise
+
+        diagnostics.append({"model": candidate, **diag})
+        payload = extract_json(content)
+        if payload is not None:
+            if index:
+                log.info("chunk risolto dal modello di ripiego %s", candidate)
+            return _clean_proposals(payload), _clean_glossary(payload), diagnostics[-1]
+
+        if content:
+            log.warning("risposta di %s non interpretabile (%d caratteri): %s",
+                        candidate, len(content), content[:200])
+        if index + 1 < len(candidates):
+            log.warning(
+                "modello %s non ha prodotto JSON utilizzabile (finish_reason=%s, "
+                "reasoning=%s caratteri, %s token di ragionamento): riprovo con %s",
+                candidate, diag.get("finish_reason"), diag.get("reasoning_chars"),
+                diag.get("reasoning_tokens"), candidates[index + 1],
+            )
+
+    detail = _error_detail(diagnostics[-1])
+    log.warning("risposta LLM non interpretabile su tutti i modelli disponibili: %s", detail)
+    raise ValueError(f"No usable JSON from the configured models. {detail}")
+
+
+# Eccezione dedicata: il chunk era troppo grande per una singola risposta. Chi
+# chiama può spezzarlo e riprovare invece di perdere il lavoro.
+class ChunkTooLarge(ValueError):
+    pass
+
+
+def ask_chunk(provider: dict, chunk: list[dict], extra_instruction: str = "",
+              depth: int = 0) -> tuple[list[dict], list[dict], dict, dict[int, list[dict]]]:
+    """
+    Chiede le correzioni per un chunk, spezzandolo se la risposta non ci sta.
+
+    Un chunk grande produce più proposte di quante ne entrino in una risposta:
+    il JSON viene tagliato a metà e non è recuperabile. Invece di perdere lo
+    spezzone lo si dimezza e si ricomincia, fino a un limite di ricorsione.
+    Restituisce (proposte, glossario, diagnostica, {id(proposta): sub-chunk}),
+    così chi chiama mappa ogni proposta sul testo che l'ha generata davvero.
+    """
+    text = chunk_text(chunk)
+    try:
+        proposals, glossary, diag = ask_with_fallback(provider, text, extra_instruction)
+        return proposals, glossary, diag, {id(p): chunk for p in proposals}
+    except ValueError as exc:
+        if "did not return valid JSON" not in str(exc) and "No usable JSON" not in str(exc):
+            raise
+        if len(chunk) <= 2 or depth >= 4:
+            raise ChunkTooLarge(
+                f"The transcript chunk could not be processed even after splitting "
+                f"({len(chunk)} segments left). {_error_detail({'finish_reason': 'length'})}"
+            ) from exc
+        middle = len(chunk) // 2
+        log.warning("chunk di %d segmenti troppo grande per una risposta: lo divido in due", len(chunk))
+        first = ask_chunk(provider, chunk[:middle], extra_instruction, depth + 1)
+        second = ask_chunk(provider, chunk[middle:], extra_instruction, depth + 1)
+        merged_map = {**first[3], **second[3]}
+        return (first[0] + second[0], first[1] + second[1], first[2], merged_map)
+
+
+def _chat_once(provider: dict, model: str, transcript_text: str,
+               extra_instruction: str, max_tokens: int) -> tuple[str, dict]:
+    """Una singola chiamata: restituisce (contenuto, diagnostica)."""
     client = _client(provider)
     user = (
         "Transcript chunk (each line starts with [mm:ss]; the timestamps are NOT part "
@@ -289,33 +411,63 @@ def ask_for_replacements(provider: dict, transcript_text: str,
             {"role": "user", "content": user},
         ],
         "temperature": 0,
-        "max_tokens": MAX_OUTPUT_TOKENS,
+        "max_tokens": max_tokens,
     }
-    # Ollama e i provider OpenAI-compatibili accettano `response_format`, ma con
-    # sfumature diverse: lo usiamo solo dove è sicuro.
-    if provider.get("name") == "ollama":
+    # `response_format` non è supportato allo stesso modo da tutti i provider:
+    # lo usiamo dove è sicuro, perché costringe il modello a produrre JSON.
+    name = provider.get("name")
+    if name in ("ollama", "deepseek"):
         kwargs["response_format"] = {"type": "json_object"}
+    reasoning_requested = name in REASONING_EFFORT_PROVIDERS
 
-    resp = client.chat.completions.create(**kwargs)
-    raw, diag = extract_content(resp)
-    payload = extract_json(raw)
-    if payload is None:
-        # Qui c'è il caso peggiore da distinguere: `content` vuoto con HTTP 200.
-        # Succede con i modelli "reasoning" quando il budget di token viene
-        # consumato dal pensiero, o quando il modello risponde solo in un campo
-        # separato (reasoning_content).
-        hint = ""
-        if not raw:
-            hint = (" The model returned an empty response"
-                    f" (finish_reason={diag.get('finish_reason')!r},"
-                    f" reasoning={diag.get('reasoning_chars', 0)} chars,"
-                    f" usage={diag.get('usage')})."
-                    " If it is a reasoning model, raise the token budget or use a"
-                    " non-reasoning model for this task.")
-        log.warning("risposta LLM non interpretabile (%d caratteri)%s: %s",
-                    len(raw), hint, raw[:300])
-        raise ValueError("The model did not return valid JSON." + hint)
-    return _clean_proposals(payload), _clean_glossary(payload)
+    if reasoning_requested:
+        kwargs.update(NO_THINKING)
+        if name == "deepseek":
+            # Forma esplicita accettata da DeepSeek, oltre a `reasoning_effort`.
+            kwargs["extra_body"] = dict(THINKING_OFF_BODY)
+
+    try:
+        resp = client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        # Provider che non conoscono `reasoning_effort`: si riprova senza, invece
+        # di far fallire il job per un parametro opzionale.
+        if reasoning_requested and _is_unknown_parameter(exc):
+            log.info("il provider %s non accetta reasoning_effort: riprovo senza", name)
+            kwargs.pop("reasoning_effort", None)
+            kwargs.pop("extra_body", None)
+            resp = client.chat.completions.create(**kwargs)
+        else:
+            raise
+
+    content, diag = extract_content(resp)
+    return content, dict(diag)
+
+
+def _is_unknown_parameter(exc: Exception) -> bool:
+    """True se il provider ha rifiutato un parametro che non conosce."""
+    text = str(exc).lower()
+    return any(marker in text for marker in
+               ("reasoning_effort", "thinking", "unknown", "unrecognized",
+                "unsupported", "invalid_request_error", "extra_forbidden"))
+
+
+def _error_detail(diag: dict) -> str:
+    """Spiega in una riga cosa è andato storto, per la UI."""
+    if diag.get("error"):
+        return f"The model call failed: {diag['error']}."
+    if diag.get("reasoning_tokens"):
+        return (
+            f"The model spent the whole {diag.get('completion_tokens')}-token budget on "
+            f"internal reasoning and returned no text (finish_reason="
+            f"{diag.get('finish_reason')!r}). Use a non-reasoning model such as "
+            f"'deepseek-chat' for this task."
+        )
+    if diag.get("finish_reason") == "length":
+        return (f"The response was cut off at the token limit "
+                f"(finish_reason='length'): raise the budget or shorten the chunk.")
+    if not diag.get("content_chars"):
+        return "The model returned an empty response."
+    return "The model did not return valid JSON."
 
 
 def extract_content(resp) -> tuple[str, dict]:
@@ -328,17 +480,27 @@ def extract_content(resp) -> tuple[str, dict]:
     mentre il problema è il budget di token.
     """
     if not getattr(resp, "choices", None):
-        return "", {"finish_reason": None, "reasoning_chars": 0, "usage": None}
+        return "", {"finish_reason": None, "reasoning_chars": 0, "reasoning_tokens": None,
+                    "completion_tokens": None, "content_chars": 0, "usage": None}
     choice = resp.choices[0]
     message = getattr(choice, "message", None)
     content = getattr(message, "content", None) or ""
+    # DeepSeek espone `reasoning_content` come campo del messaggio; l'SDK non lo
+    # tipizza, quindi lo cerchiamo sia come attributo sia in `model_extra`.
     extra = getattr(message, "model_extra", None) or {}
-    reasoning = extra.get("reasoning_content") or extra.get("reasoning") or ""
+    reasoning = (getattr(message, "reasoning_content", None)
+                 or extra.get("reasoning_content") or extra.get("reasoning") or "")
     usage = getattr(resp, "usage", None)
+    dumped = usage.model_dump() if hasattr(usage, "model_dump") else usage
+    details = (dumped or {}).get("completion_tokens_details") or {} if isinstance(dumped, dict) else {}
     return content, {
         "finish_reason": getattr(choice, "finish_reason", None),
         "reasoning_chars": len(reasoning),
-        "usage": (usage.model_dump() if hasattr(usage, "model_dump") else usage),
+        # `reasoning_tokens` è la prova che il budget è finito nel pensiero.
+        "reasoning_tokens": details.get("reasoning_tokens"),
+        "completion_tokens": (dumped or {}).get("completion_tokens") if isinstance(dumped, dict) else None,
+        "content_chars": len(content),
+        "usage": dumped,
     }
 
 

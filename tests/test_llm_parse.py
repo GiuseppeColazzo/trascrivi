@@ -63,11 +63,11 @@ def test_extract_content_handles_empty_choices():
     assert diag["finish_reason"] is None
 
 
-def test_empty_model_reply_says_the_response_was_empty(monkeypatch):
-    """Il messaggio d'errore deve dire che la risposta era vuota, non 'JSON rotto'."""
+def test_empty_model_reply_explains_the_token_limit(monkeypatch):
+    """Il messaggio deve spiegare il taglio al limite di token, non 'JSON rotto'."""
     class FakeCompletions:
         def create(self, **kwargs):
-            return _Response([_Choice("", "length", {})], None)
+            return _Response([_Choice("", "length", {})], _Usage())
 
     fake_client = type("FakeClient", (), {
         "chat": type("Chat", (), {"completions": FakeCompletions()})(),
@@ -78,8 +78,19 @@ def test_empty_model_reply_says_the_response_was_empty(monkeypatch):
         llm.ask_for_replacements({"name": "deepseek", "model": "deepseek-flash"}, "text")
 
     message = str(excinfo.value)
-    assert "empty response" in message
+    assert "cut off at the token limit" in message
     assert "finish_reason='length'" in message
+
+
+def test_reasoning_exhaustion_suggests_a_non_reasoning_model(monkeypatch):
+    """Se i token sono finiti nel ragionamento, il messaggio deve dirlo."""
+    diag = {"finish_reason": "length", "reasoning_tokens": 8000,
+            "completion_tokens": 8000, "content_chars": 0}
+
+    detail = llm._error_detail(diag)
+
+    assert "internal reasoning" in detail
+    assert "deepseek-chat" in detail
 
 
 def test_unreadable_key_is_reported_not_silently_ignored(monkeypatch, tmp_path):
@@ -193,6 +204,22 @@ def test_clean_proposals_drops_invalid_entries_and_normalizes_fields():
 def test_clean_proposals_without_replacements_key():
     assert _clean_proposals({}) == []
     assert _clean_proposals({"replacements": None}) == []
+
+
+def test_clean_proposals_drops_noop_replacements():
+    """
+    Il modello restituisce a volte `replace` identico a `find` (misurato: 217 su
+    563 su una lezione reale): non è una correzione e non deve arrivare in review.
+    """
+    payload = {"replacements": [
+        {"find": "since the new birth age", "replace": "since the new birth age"},
+        {"find": "spazio in coda", "replace": "spazio in coda "},
+        {"find": "human country", "replace": "humanity"},
+    ]}
+
+    out = _clean_proposals(payload)
+
+    assert [p["find"] for p in out] == ["human country"]
 
 
 # ── chiavi cifrate ───────────────────────────────────────────────────────────

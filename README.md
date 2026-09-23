@@ -181,9 +181,30 @@ Why it is built that way:
 - **Every proposal is individually acceptable or rejectable.** You see find → replace with the reason
   and confidence, preview a line-by-line diff, accept all, reject all, or apply only the ones you select.
 
-Prompting is **chunked at ~8000 characters** (`llm_chunk_chars` in Settings) with **one segment of
+Prompting is **chunked at ~4000 characters** (`llm_chunk_chars` in Settings) with **one segment of
 overlap** between consecutive chunks so a correction spanning a boundary is still visible, and
 `temperature=0` because we want substitution, not creativity.
+
+#### What the agent is allowed to change
+
+The system prompt is deliberately restrictive, because a permissive one produces noise rather than
+corrections. The model is told its **only** job is to fix words the recogniser heard wrong when the
+intended word is unmistakable from the sentence, and it is told explicitly never to propose
+rephrasing, style changes, spelling variants, capitalisation, or punctuation-only edits. Its test for
+every candidate is: *"would a human typing this transcript while listening have written something
+different?"*
+
+Measured on the same 30-segment chunk, the restrictive prompt returned **7 edits in 3.2 s** against
+**30 edits in 8.8 s** for a permissive one, and the 30 were mostly style preferences. The 7 are the
+kind of thing you actually want:
+
+| Recogniser output | Correction | Why it is decidable |
+|---|---|---|
+| `four people if the Aligno have access to Oveni` | `poor people …` | "four people if" is not a phrase |
+| `the lawsuit between Mecca and other people` | `… Meta …` | a lawsuit about a tech company |
+| `COGO changes decline` | `CO2 changes climate` | domain vocabulary |
+| `gave back` | `give-back` | noun, not a verb, in this sentence |
+| `environmental research of knowledge` | `environmental erosion of knowledge` | collocation |
 
 #### Proposal flags
 
@@ -196,9 +217,32 @@ was able to anchor.
 | `ambiguous` | `find` occurs more than once. The app refuses to guess and asks you to pick the segment from a dropdown. |
 | `unmatched` | The `find` text was not found verbatim in the transcript. |
 | `conflict` | Applying this edit would overlap an edit already claimed by another proposal. |
-| `noop` | `find` and `replace` are identical, so the edit would change nothing. |
+| `noop` | `find` and `replace` are identical (the model does this: 217 of 563 proposals on one real lecture) — discarded before it reaches the review list. |
 | `too_large` | The edit rewrites more than `max_delta_chars = 160` characters. This is what stops a model from rewriting whole sentences. |
 | `duplicate` | The same `find → replace` pair was already proposed. |
+
+If a chunk is still too big to fit in one answer (the JSON gets cut off mid-object), the agent
+**halves that chunk and retries**, down to a floor of two segments, instead of losing the section.
+
+#### Cost of a lecture
+
+Measured on a real 88-minute lecture (203 segments, 65 756 characters → 18 chunks, 47 s of wall clock):
+
+| | Tokens |
+|---|---|
+| Input | 27 558 (23 936 cached, 3 622 fresh) |
+| Output | 12 018 (all of it text: thinking is disabled) |
+
+At the published `deepseek-flash` rates ([api-docs.deepseek.com](https://api-docs.deepseek.com/quick_start/pricing),
+USD per 1M tokens; cache hit is 50× cheaper than a cache miss):
+
+| Rate | 1 lecture | 10 lectures |
+|---|---|---|
+| Off-peak ($0.003 hit / $0.15 miss / $0.60 output) | **$0.008** | **$0.08** |
+| Peak ($0.006 hit / $0.30 miss / $1.20 output) | $0.016 | $0.16 |
+
+Output dominates the bill (~78%), which is exactly why the restrictive prompt pays off twice: fewer
+proposals mean less to read *and* less to pay for.
 
 The agent is **opt-in per job** and can be **re-run on any existing transcript** from the Transcript
 screen.

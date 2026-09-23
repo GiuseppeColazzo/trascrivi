@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS providers (
   name         TEXT NOT NULL UNIQUE,
   base_url     TEXT NOT NULL,
   model        TEXT DEFAULT '',
+  fallback_model TEXT DEFAULT '',
   api_key_enc  TEXT,
   enabled      INTEGER NOT NULL DEFAULT 1,
   extra        TEXT DEFAULT '{}',
@@ -166,9 +167,9 @@ END;
 """
 
 PROVIDER_DEFAULTS = [
-    ("ollama", "http://localhost:11434/v1", "qwen2.5:7b"),
-    ("deepseek", "https://api.deepseek.com", "deepseek-chat"),
-    ("openrouter", "https://openrouter.ai/api/v1", "deepseek/deepseek-chat-v3.1"),
+    ("ollama", "http://localhost:11434/v1", "qwen2.5:7b", ""),
+    ("deepseek", "https://api.deepseek.com", "deepseek-chat", "deepseek-chat"),
+    ("openrouter", "https://openrouter.ai/api/v1", "deepseek/deepseek-chat-v3.1", ""),
 ]
 
 
@@ -194,12 +195,19 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         _migrate(conn)
         ts = now()
-        for name, base_url, model in PROVIDER_DEFAULTS:
+        for name, base_url, model, fallback in PROVIDER_DEFAULTS:
             conn.execute(
-                "INSERT OR IGNORE INTO providers(name, base_url, model, enabled, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (name, base_url, model, 1 if name == "ollama" else 0, ts),
+                "INSERT OR IGNORE INTO providers(name, base_url, model, fallback_model, "
+                "enabled, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (name, base_url, model, fallback, 1 if name == "ollama" else 0, ts),
             )
+        # Il modello di ripiego serve solo dove un modello "reasoning" può
+        # esaurire il budget senza produrre output: se la colonna è vuota lo
+        # completiamo, senza toccare una scelta esplicita dell'utente.
+        conn.execute(
+            "UPDATE providers SET fallback_model = 'deepseek-chat' "
+            "WHERE name = 'deepseek' AND (fallback_model IS NULL OR fallback_model = '')"
+        )
         conn.commit()
 
 
@@ -209,6 +217,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "jobs": [("output_path", "TEXT")],
         "proposals": [("segment_index", "INTEGER"), ("context", "TEXT DEFAULT ''")],
         "transcripts": [("source_ref", "TEXT")],
+        "providers": [("fallback_model", "TEXT DEFAULT ''")],
     }
     for table, columns in wanted.items():
         existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -646,7 +655,7 @@ def delete_term(term_id: int) -> None:
 # ── Provider LLM ─────────────────────────────────────────────────────────────
 def list_providers() -> list[dict]:
     """Non espone mai la chiave: solo `has_key`."""
-    out = rows("SELECT id, name, base_url, model, enabled, extra, updated_at, "
+    out = rows("SELECT id, name, base_url, model, fallback_model, enabled, extra, updated_at, "
                "api_key_enc IS NOT NULL AS has_key FROM providers ORDER BY id")
     for p in out:
         p["has_key"] = bool(p["has_key"])
@@ -663,7 +672,8 @@ def get_provider_by_name(name: str) -> dict | None:
 
 
 def update_provider(provider_id: int, base_url: str | None = None,
-                    model: str | None = None, enabled: bool | None = None,
+                    model: str | None = None, fallback_model: str | None = None,
+                    enabled: bool | None = None,
                     api_key_enc: str | None = None, extra: dict | None = None) -> None:
     sets: list[str] = []
     params: list[Any] = []
@@ -673,6 +683,9 @@ def update_provider(provider_id: int, base_url: str | None = None,
     if model is not None:
         sets.append("model = ?")
         params.append(model)
+    if fallback_model is not None:
+        sets.append("fallback_model = ?")
+        params.append(fallback_model)
     if enabled is not None:
         sets.append("enabled = ?")
         params.append(1 if enabled else 0)
