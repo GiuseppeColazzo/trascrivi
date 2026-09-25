@@ -179,3 +179,54 @@ def test_resume_falls_back_to_zero_without_timestamps(tmp_path):
 
     assert engine.last_transcribed_seconds(out) == 0.0
     assert engine.resume_offset(out, True) == 0.0
+
+
+# ── Precisione non supportata dal device ─────────────────────────────────────
+# `--compute-type float16` con `--device cpu` non e' "solo lento": ctranslate2
+# solleva ValueError e il processo muore con un traceback. Su una macchina senza
+# CUDA (Mac, Linux senza GPU) e' la prima cosa che prova chi copia un comando
+# pensato per la GPU.
+def _cpu_only(monkeypatch, supported):
+    monkeypatch.setattr(engine, "cuda_device_count", lambda: 0)
+    monkeypatch.setattr(engine, "supported_compute_types", lambda device: set(supported))
+
+
+def test_unsupported_compute_type_is_downgraded_instead_of_crashing(monkeypatch):
+    _cpu_only(monkeypatch, {"float32", "int8", "int8_float32"})
+
+    cfg = engine.resolve_runtime("cpu", "float16", None, "small.en")
+
+    assert cfg.device == "cpu"
+    assert cfg.compute_type == "int8"
+    assert any("float16" in note for note in cfg.notes)
+
+
+def test_unsupported_compute_type_is_downgraded_after_cuda_fallback(monkeypatch):
+    """Chiedere cuda+float16 su una macchina senza CUDA: si finisce su CPU/int8."""
+    _cpu_only(monkeypatch, {"float32", "int8"})
+
+    cfg = engine.resolve_runtime("cuda", "float16", None, "distil-large-v3")
+
+    assert cfg.device == "cpu"
+    assert cfg.compute_type == "int8"
+    assert any("non disponibile" in note for note in cfg.notes)
+
+
+def test_supported_compute_type_is_left_alone(monkeypatch):
+    _cpu_only(monkeypatch, {"float32", "int8"})
+
+    cfg = engine.resolve_runtime("cpu", "float32", None, "small.en")
+
+    assert cfg.compute_type == "float32"
+    assert cfg.notes == []
+
+
+def test_compute_type_survives_when_the_backend_cannot_be_queried(monkeypatch):
+    """Se ctranslate2 non risponde non si inventa nulla: si passa quel che c'e'."""
+    monkeypatch.setattr(engine, "cuda_device_count", lambda: 1)
+    monkeypatch.setattr(engine, "supported_compute_types", lambda device: None)
+
+    cfg = engine.resolve_runtime("cuda", "bfloat16", None, "large-v3")
+
+    assert cfg.compute_type == "bfloat16"
+    assert cfg.notes == []

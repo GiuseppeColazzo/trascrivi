@@ -194,6 +194,10 @@ DEFAULT_LANGUAGE = "en"
 # Soglia VRAM sotto la quale non si usa il modello large.
 LARGE_MODEL_MIN_VRAM_GB = 4.0
 
+# Compute type di ripiego quando `auto` non basta: e' la stessa scelta che fa
+# `resolve_runtime` per quel device.
+DEFAULT_COMPUTE_TYPE = {"cuda": "float16", "cpu": "int8"}
+
 # Marcatore dei WAV temporanei prodotti dalle versioni precedenti dello script.
 # Viene usato solo per ignorare se ne trovi ancora in giro.
 TEMP_MARKER = ".trascrivi_tmp.wav"
@@ -278,6 +282,21 @@ def cuda_gpu_name(device_index: int = 0) -> str | None:
     return None
 
 
+def supported_compute_types(device: str) -> set[str] | None:
+    """
+    Tipo di calcolo accettati dal backend su quel device, o None se non si sa.
+
+    Non e' un test hardware: ctranslate2 risponde per il backend scelto (su CPU
+    ad esempio `float16` non c'e'). La usiamo per non passare a `WhisperModel`
+    una precisione che lo farebbe sollevare ValueError.
+    """
+    try:
+        import ctranslate2
+        return set(ctranslate2.get_supported_compute_types(device))
+    except Exception:
+        return None
+
+
 @dataclass
 class RuntimeConfig:
     """Configurazione risolta di device / compute_type / batch."""
@@ -312,13 +331,25 @@ def resolve_runtime(
             device = "cpu"
 
     # ── Compute type ─────────────────────────────────────────────────────────
+    # Un tipo scelto per la GPU (`float16`, `int8_float16`) su CPU non e' "solo
+    # lento": ctranslate2 solleva ValueError e il job muore. Succede appena il
+    # device viene declassato a CPU (Mac, macchina senza CUDA) o quando l'utente
+    # sceglie la precisione dal form senza cambiare device. Si ricade sul default
+    # del device invece di far fallire tutto per un parametro opzionale.
+    supported = supported_compute_types(device)
     if requested_compute == "auto":
-        if device == "cuda":
-            compute_type = "float16"          # tensor core, ~2x vs float32
-        else:
-            compute_type = "int8"             # quantizzazione,~2-4x vs float32
+        compute_type = DEFAULT_COMPUTE_TYPE.get(device, "float32")
     else:
         compute_type = requested_compute
+
+    if supported and compute_type not in supported:
+        fallback = DEFAULT_COMPUTE_TYPE.get(device, "float32")
+        if fallback not in supported:
+            fallback = "float32" if "float32" in supported else sorted(supported)[0]
+        notes.append(
+            f"compute type '{compute_type}' non supportato su {device}: uso '{fallback}'."
+        )
+        compute_type = fallback
 
     # ── Batch size ───────────────────────────────────────────────────────────
     if requested_batch is not None:
@@ -762,7 +793,8 @@ Modelli consigliati per lezioni in inglese (veloci, accuratezza ~large-v3):
     parser.add_argument("--compute-type", choices=["auto", "int8", "int8_float16",
                                                    "float16", "float32", "bfloat16"],
                         default="auto",
-                        help="Precisione calcolo (default: auto = float16 su GPU, int8 su CPU)")
+                        help="Precisione calcolo (default: auto = float16 su GPU, int8 su CPU). "
+                             "Un tipo non supportato dal device scelto viene sostituito")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Segmenti decodificati in parallelo (default: automatico "
                              "in base alla VRAM). 1 = disattiva il batching")
@@ -1031,7 +1063,14 @@ def main(argv: list[str] | None = None) -> None:
     wall = time.time() - t_batch_start
     errori = [r for r in results if r[5] is not None]
     ok = [r for r in results if r[5] is None]
-    audio_tot = sum(r[2] for r in ok)
+    # Con --benchmark si elabora solo un estratto: contare la durata intera del
+    # file gonfia gli "x realtime" del riepilogo (72x su un file da 73 minuti di
+    # cui sono stati elaborati 60 secondi), e il riepilogo e' esattamente cio' che
+    # README_CPU.md dice di guardare per scegliere il modello.
+    def _processed(seconds: float) -> float:
+        return min(seconds, float(args.benchmark)) if args.benchmark else seconds
+
+    audio_tot = sum(_processed(r[2]) for r in ok)
     infer_tot = sum(r[4] for r in ok)
 
     # ── Riepilogo ────────────────────────────────────────────────────────────
