@@ -79,7 +79,7 @@ STYLES = ("study", "brief", "detailed")
 # una media più alta.
 TOPIC_SOURCE_WORDS = 1200
 TOPIC_SECTIONS_MIN, TOPIC_SECTIONS_MAX = 5, 12
-RESERVED_SECTIONS = 2
+RESERVED_SECTIONS = 1
 LEAD_WORDS, BULLET_WORDS = 25, 22
 STYLE_BULLETS = {"brief": 2, "study": 4, "detailed": 7}
 
@@ -105,7 +105,7 @@ RULES
 5. One layer of depth per concept, not a story. For each concept: what it is, then why or how in one or two sentences. Keep the reasoning that connects the concepts; drop the narrative that leads up to it.
 6. At most one example per concept, and only when the concept stays abstract without it. If three cases make the same point, keep the one that carries it and drop the others. A named case the lecturer dwells on — a technology, a lawsuit, a company, an experiment — is content, not colour: keep it in one bullet.
 7. Prefer lists and short paragraphs to long blocks of prose. Bold the term being defined, not whole sentences.
-8. Use a Markdown table whenever the lecture compares things, lists options, or classifies items by attributes — and for the terms of the lecture with their definition, where the lecture defined enough of them.
+8. Use a Markdown table whenever the lecture compares things, lists options, or classifies items by attributes.
 9. Use a diagram in a fenced code block only where the lecture describes a process, a flow or an architecture that is clearer as a picture. Two or three in a whole lecture at most.
 10. Keep the lecturer's technical terms, acronyms and symbols exactly as they were said. Do not expand an acronym they did not expand, and do not rename anything.
 11. Keep their uncertainty. "probably", "I think", "in general", "it seems" must not become statements of fact.
@@ -158,7 +158,6 @@ STEP 2 - write the notes after the plan, starting at the `#` title. Every name i
 HOW TO HIT THE LENGTH
 - exactly {sections} `##` sections in total, and the count includes all three kinds:
   - {topic_sections} sections on the topics of the lecture, in the order it covered them;
-  - one section holding the table of the terms of the lecture with their definition. This one is not optional and it is not a topic section: every lecture names at least a handful of terms, and this table is the part a reader scans before an exam. It holds a table, not bullets — one row per term, as many rows as the lecture defined;
   - one last section, if the lecture deferred anything, for what was promised or left unresolved. This one holds only the deferral: the last topic of the lecture belongs to its own section above, not here;
 - every title is different: two sections that would carry the same title are one section;
 - each topic section: one opening line saying what the topic is (at most {lead_words} words), then {bullets_per_section} bullets. Never more than {bullets_per_section}, never fewer than {bullets_per_section} — a section that cannot fill them is not a section;
