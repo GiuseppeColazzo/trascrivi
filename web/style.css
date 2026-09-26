@@ -1728,7 +1728,7 @@ main { flex: 1 1 auto; width: 100%; }
    contenuta, titoli con gerarchia chiara, tabelle e schemi che non escono dal
    riquadro. */
 .md {
-  max-width: 74ch;
+  margin-top: 14px;
   font-size: 14px;
   line-height: 1.72;
   text-wrap: pretty;

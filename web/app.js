@@ -1694,13 +1694,12 @@ async function viewTranscript(nav, params, transcriptId, token) {
       s.edited ? "edited" : null,
     ].filter(Boolean).join(" · ");
 
+    // Niente "Download .md" qui: il documento è la card sotto il titolo e il
+    // comando è già nella testata della card. La prosa usa tutta la larghezza.
     setChildren(summaryHost,
       el("div", { class: "card" },
-        el("div", { class: "split" },
-          el("div", { class: "grow" },
-            el("h2", {}, s.title || "Summary"),
-            el("p", { class: "muted small tabnum" }, meta)),
-          el("a", { class: "btn", href: `/api/summaries/${s.id}/export?format=md` }, "Download .md")),
+        el("h2", {}, s.title || "Summary"),
+        el("p", { class: "muted small tabnum" }, meta),
         el("div", { class: "md", html: renderMarkdown(s.markdown || "") })));
   }
 
