@@ -136,6 +136,21 @@ const ROUTES = {
     default_compute_type: "auto", default_provider_id: 1, flush_every: 10, llm_chunk_chars: 8000, backup_keep: 5 },
     disk: { sources_bytes: 4.2e9, sources_files: 6, data_bytes: 4.6e9, free_bytes: 180e9 } },
   "/jobs": { jobs, queue: 1 },
+  "/costs": {
+    rates: { cache_hit: 0.003, cache_miss: 0.15, output: 0.6 },
+    note: "Estimated at DeepSeek off-peak list prices: for another provider this is an order of magnitude, not an invoice.",
+    months: ["2026-09", "2026-08"],
+    projects: [
+      { id: 1, name: "Distributed systems", code: "DS-2025" },
+      { id: 2, name: "Signal processing", code: "" },
+      { id: 3, name: "Numerical analysis", code: "NA" },
+    ],
+    cells: [
+      { project_id: 1, month: "2026-09", kind: "llm_summary", cost_usd: 0.32, tokens: 120000, n_jobs: 2 },
+      { project_id: 1, month: "2026-09", kind: "llm_fix", cost_usd: 0.19, tokens: 21000, n_jobs: 1 },
+      { project_id: 2, month: "2026-08", kind: "llm_summary", cost_usd: 0.10, tokens: 40000, n_jobs: 1 },
+    ],
+  },
   "/search": { results: [{ id: 7, title: "Week 3 — Kalman filters", project_name: "Distributed systems", snippet: "the [[Kalman]] filter" }] },
   "/agent/prompt": { system_prompt: "You correct transcription errors.", max_output_tokens: 2000, temperature: 0.1, chunk_chars: 8000, timeout_seconds: 120 },
   "/media/probe": { name: "week5.mp4", size: 1.2e9, duration: 3600, has_audio: true },
@@ -204,6 +219,7 @@ const routes = [
   ["#/p/1", ["Distributed systems", "Course glossary", "Transcripts"]],
   ["#/p/1/new", ["New lecture", "Lecture file", "Start transcription"]],
   ["#/jobs", ["Jobs", "Running", "ffmpeg exited with code 1", "All jobs"]],
+  ["#/costs", ["LLM costs", "Distributed systems", "All months", "Corrections only", "Cache miss"]],
   ["#/t/7", ["Week 3 — Kalman filters", "Kalman", "Segments"]],
   ["#/settings", ["Settings", "Storage", "Correction agent"]],
   ["#/about", ["About & privacy", "correction agent", "Keyboard"]],
@@ -231,6 +247,37 @@ for (const [hash, needles] of routes) {
   assert("no error panel", !text.includes("did not go through"), text.slice(0, 200));
   assert("no startup failure", !text.includes("Could not start"), text.slice(0, 200));
 }
+
+/* Filtri della vista costi: i due menu ricalcolano i totali e le righe per
+   corso. Qui si verifica la somma, non la presenza di una scritta, perché è
+   l'unica cosa che può sbagliare in silenzio. */
+location.hash = "#/costs";
+await doc.dispatch("hashchange");
+await settle();
+const costTable = () => doc.getElementById("view").querySelectorAll(".costs-table")[0] || null;
+const costText = () => (costTable() ? costTable().textContent : "");
+const costRows = () => (costTable() ? costTable().querySelectorAll("tbody tr").length : 0);
+// Il valore di un `<select>` in un browser è una proprietà, non un attributo:
+// il test deve fare la stessa cosa che fa l'utente scegliendo una voce.
+const costFilter = (id, value) => {
+  const sel = doc.getElementById(id);
+  sel.value = value;
+  sel.dispatch("change");
+};
+assert("costs: two courses listed", costRows() === 2, costText());
+assert("costs: unfiltered total sums both months", costText().includes("$0.5100"), costText());
+costFilter("costKind", "llm_fix");
+assert("costs: corrections only", costText().includes("$0.1900") && !costText().includes("$0.1000"),
+  costText());
+costFilter("costKind", "all");
+costFilter("costMonth", "2026-08");
+assert("costs: a month leaves only its course", costRows() === 1, costText());
+assert("costs: the total follows the month", costText().includes("$0.1000") && !costText().includes("$0.5100"),
+  costText());
+// "All months" deve valere come nessun filtro: è il valore che il browser
+// riporta per un'opzione senza `value`, e non deve combaciare con un mese vero.
+costFilter("costMonth", "all");
+assert("costs: back to all months", costRows() === 2, costText());
 
 /* Color sanitisation: a project with a junk colour must not leak into a style. */
 location.hash = "#/";

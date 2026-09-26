@@ -271,6 +271,10 @@ def run_agent(job_id: int, payload: dict) -> dict:
     raw_proposals: list[dict] = []
     glossary: list[dict] = []
     failures: list[str] = []
+    # Il costo delle correzioni non era registrato da nessuna parte: si accumula
+    # qui, chunk per chunk, e `_run_job` lo salva sul job. `miss` è il primo
+    # pezzo del prompt, che è sempre a prezzo pieno.
+    usage = {"prompt": 0, "completion": 0, "hit": 0, "miss": 0}
     t0 = time.time()
 
     for i, chunk in enumerate(chunks, start=1):
@@ -280,9 +284,10 @@ def run_agent(job_id: int, payload: dict) -> dict:
         try:
             # `ask_chunk` dimezza lo spezzone se la risposta non ci sta dentro:
             # un chunk grande fa troncare il JSON delle proposte a metà.
-            proposals, chunk_glossary, _diag, origin = llm.ask_chunk(
+            proposals, chunk_glossary, chunk_diag, origin = llm.ask_chunk(
                 provider, chunk, extra_instruction=payload.get("instruction") or ""
             )
+            llm.add_usage(usage, chunk_diag)
             for prop in proposals:
                 # La proposta va cercata nel sub-chunk che l'ha generata: dopo una
                 # divisione gli indici del chunk padre non valgono più.
@@ -341,6 +346,7 @@ def run_agent(job_id: int, payload: dict) -> dict:
         "failures": failures,
         "cancelled": stop_flag.is_set(),
         "message": message,
+        "usage": usage,
     }
 
 
@@ -490,6 +496,7 @@ def run_summary(job_id: int, payload: dict) -> dict:
         source_words=result["source_words"], tokens_in=result["tokens_in"],
         tokens_out=result["tokens_out"], cache_hit=result["cache_hit"],
         cost_usd=result["cost_usd"], elapsed_s=result["elapsed_s"],
+        truncated=bool(result.get("truncated")),
     )
     db.add_revision(transcript_id, "summary", 0,
                     f"{result['style']} summary: {result['words']} words "
@@ -554,6 +561,11 @@ def _run_job(job: dict) -> None:
             message=result.get("message") or _message_for(kind, result),
             speed=result.get("speed"),
             eta_seconds=None,
+            # Il costo delle chiamate LLM vive sul job che le ha fatte: è l'unico
+            # punto in cui si sa quanto è costata *quella* esecuzione, anche se il
+            # job muore prima di salvare il riassunto. `usage_counts` restituisce
+            # chiavi già pronte (tokens_in/tokens_out/cache_hit/cost_usd).
+            **llm.usage_counts(result.get("usage") or {}),
         )
         if kind == "transcribe" and not cancelled:
             _finish_transcribe_cleanup(job, payload)

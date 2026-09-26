@@ -67,6 +67,12 @@ CREATE TABLE IF NOT EXISTS jobs (
   eta_seconds   REAL,
   message       TEXT,
   error         TEXT,
+  -- Costo stimato delle chiamate LLM di questo job (0 = nessuna chiamata a
+  -- pagamento, oppure job vecchio, precedente alla colonna: vedi `_migrate`).
+  tokens_in     INTEGER DEFAULT 0,
+  tokens_out    INTEGER DEFAULT 0,
+  cache_hit     INTEGER DEFAULT 0,
+  cost_usd      REAL DEFAULT 0,
   output_path   TEXT,
   created_at    REAL NOT NULL,
   started_at    REAL,
@@ -143,6 +149,9 @@ CREATE TABLE IF NOT EXISTS summaries (
   cost_usd      REAL DEFAULT 0,
   elapsed_s     REAL DEFAULT 0,
   edited        INTEGER NOT NULL DEFAULT 0,
+  -- Il modello ha esaurito il tetto di output: il documento c'è ma è tagliato,
+  -- e va detto a schermo invece di consegnarlo come se fosse completo.
+  truncated     INTEGER NOT NULL DEFAULT 0,
   created_at    REAL NOT NULL,
   updated_at    REAL NOT NULL
 );
@@ -256,7 +265,15 @@ def init_db() -> None:
 def _migrate(conn: sqlite3.Connection) -> None:
     """Aggiunge le colonne introdotte dopo la prima release, se mancano."""
     wanted = {
-        "jobs": [("output_path", "TEXT")],
+        # Il costo delle chiamate LLM si registra sul job che le ha fatte: prima
+        # esisteva solo su `summaries`, quindi le correzioni non erano
+        # contabilizzabili. I job già passati restano a zero — la diagnostica non
+        # è stata salvata — e la vista costi lo dice invece di fingere uno zero.
+        "jobs": [("output_path", "TEXT"),
+                 ("tokens_in", "INTEGER DEFAULT 0"),
+                 ("tokens_out", "INTEGER DEFAULT 0"),
+                 ("cache_hit", "INTEGER DEFAULT 0"),
+                 ("cost_usd", "REAL DEFAULT 0")],
         "proposals": [("segment_index", "INTEGER"), ("context", "TEXT DEFAULT ''")],
         "transcripts": [("source_ref", "TEXT")],
         "providers": [("fallback_model", "TEXT DEFAULT ''")],
@@ -267,7 +284,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # perché `CREATE TABLE IF NOT EXISTS` non tocca una tabella esistente.
         "summaries": [("n_words", "INTEGER DEFAULT 0"),
                       ("target_words", "INTEGER DEFAULT 0"),
-                      ("source_words", "INTEGER DEFAULT 0")],
+                      ("source_words", "INTEGER DEFAULT 0"),
+                      ("truncated", "INTEGER NOT NULL DEFAULT 0")],
     }
     for table, columns in wanted.items():
         existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -453,7 +471,7 @@ def _dir_size(path: Path) -> int:
 # ── Jobs ─────────────────────────────────────────────────────────────────────
 JOB_FIELDS = {"payload", "status", "progress", "audio_seconds", "total_seconds", "speed",
               "eta_seconds", "message", "error", "output_path", "transcript_id",
-              "started_at", "finished_at"}
+              "started_at", "finished_at", "tokens_in", "tokens_out", "cache_hit", "cost_usd"}
 
 
 def create_job(kind: str, payload: dict, project_id: int | None = None,
@@ -487,6 +505,70 @@ def update_job(job_id: int, **fields) -> None:
 
 def next_queued_job() -> dict | None:
     return row("SELECT * FROM jobs WHERE status = 'queued' ORDER BY id ASC LIMIT 1")
+
+
+# ── Costi delle chiamate LLM ─────────────────────────────────────────────────
+# Due sorgenti, una per tipo di lavoro, e non è una duplicazione: i riassunti
+# hanno una riga propria in `summaries` (con provider e modello, perché più
+# versioni convivono), le correzioni esistono solo come job. Si restituiscono
+# celle già raggruppate — corso, mese, tipo — perché è il minimo che serve a
+# filtrare per mese e per tipo senza tornare sul database a ogni cambio di menu.
+COST_CELLS_SQL = """
+SELECT project_id, month, kind,
+       SUM(cost_usd) AS cost_usd, SUM(tokens) AS tokens, SUM(n_jobs) AS n_jobs
+FROM (
+    SELECT j.project_id AS project_id,
+           strftime('%Y-%m', j.finished_at, 'unixepoch', 'localtime') AS month,
+           j.kind AS kind,
+           SUM(j.cost_usd) AS cost_usd,
+           SUM(j.tokens_in + j.tokens_out + j.cache_hit) AS tokens,
+           COUNT(*) AS n_jobs
+    FROM jobs j
+    WHERE j.kind IN ('llm_summary', 'llm_fix')
+      AND j.finished_at IS NOT NULL
+    GROUP BY j.project_id, month, j.kind
+
+    UNION ALL
+
+    -- I riassunti che nessun job con costo copre: quelli scritti prima che il
+    -- costo si registrasse anche sui job, e quelli il cui job è stato registrato
+    -- senza costo. Senza questo ramo la vista mostra zero su un'istanza che ha
+    -- già speso. Il confronto è riga per riga, non per cella: un riassunto
+    -- coperto non deve far scartare il suo vicino non coperto.
+    SELECT t.project_id AS project_id,
+           strftime('%Y-%m', s.created_at, 'unixepoch', 'localtime') AS month,
+           'llm_summary' AS kind,
+           SUM(s.cost_usd) AS cost_usd,
+           SUM(s.tokens_in + s.tokens_out + s.cache_hit) AS tokens,
+           COUNT(*) AS n_jobs
+    FROM summaries s
+    JOIN transcripts t ON t.id = s.transcript_id
+    WHERE NOT EXISTS (
+          SELECT 1 FROM jobs j
+          WHERE j.kind = 'llm_summary' AND j.transcript_id = s.transcript_id
+            AND j.tokens_in + j.tokens_out + j.cache_hit > 0
+            AND strftime('%Y-%m', j.finished_at, 'unixepoch', 'localtime')
+                = strftime('%Y-%m', s.created_at, 'unixepoch', 'localtime')
+      )
+    GROUP BY t.project_id, month
+)
+GROUP BY project_id, month, kind
+"""
+
+
+def llm_cost_cells() -> list[dict]:
+    """
+    Costo per (corso, mese, tipo di lavoro) e i nomi dei corsi.
+
+    Una cella per combinazione: il filtro per mese e per tipo è una somma su
+    queste righe, quindi la UI lo fa senza rifare la query.
+    """
+    cells = rows(COST_CELLS_SQL)
+    names = {p["id"]: p for p in rows("SELECT id, name, code FROM projects")}
+    return {
+        "cells": cells,
+        "projects": sorted(names.values(), key=lambda p: (p["name"] or "").lower()),
+    }
 
 
 def mark_interrupted_jobs() -> int:
@@ -680,17 +762,17 @@ def create_summary(transcript_id: int, *, job_id: int | None = None, style: str 
                    n_words: int = 0, target_words: int = 0,
                    source_words: int = 0, tokens_in: int = 0,
                    tokens_out: int = 0, cache_hit: int = 0, cost_usd: float = 0.0,
-                   elapsed_s: float = 0.0) -> int:
+                   elapsed_s: float = 0.0, truncated: bool = False) -> int:
     ts = now()
     return execute(
         """INSERT INTO summaries(transcript_id, job_id, style, language, provider, model,
                                  title, overview, markdown, n_words, target_words,
                                  source_words, tokens_in, tokens_out, cache_hit, cost_usd,
-                                 elapsed_s, edited, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+                                 elapsed_s, edited, truncated, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
         (transcript_id, job_id, style, language, provider, model, title, overview,
          markdown, n_words, target_words, source_words, tokens_in, tokens_out,
-         cache_hit, cost_usd, elapsed_s, ts, ts),
+         cache_hit, cost_usd, elapsed_s, 1 if truncated else 0, ts, ts),
     )
 
 
@@ -703,8 +785,8 @@ def list_summaries(transcript_id: int, limit: int = 50) -> list[dict]:
     return rows(
         "SELECT id, transcript_id, job_id, style, language, provider, model, title, overview, "
         "n_words, target_words, source_words, tokens_in, tokens_out, cost_usd, "
-        "elapsed_s, edited, created_at, updated_at FROM summaries WHERE transcript_id = ? "
-        "ORDER BY created_at DESC LIMIT ?",
+        "elapsed_s, edited, truncated, created_at, updated_at FROM summaries "
+        "WHERE transcript_id = ? ORDER BY created_at DESC LIMIT ?",
         (transcript_id, limit),
     )
 

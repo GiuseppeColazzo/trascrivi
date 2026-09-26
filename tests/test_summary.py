@@ -68,8 +68,8 @@ class _Choice:
 
 
 class _Response:
-    def __init__(self, content, usage=None):
-        self.choices = [_Choice(content)]
+    def __init__(self, content, usage=None, finish_reason="stop"):
+        self.choices = [_Choice(content, finish_reason)]
         self.usage = usage or _Usage()
 
 
@@ -77,10 +77,14 @@ class _Completions:
     def __init__(self, replies):
         self.replies = list(replies)
         self.calls: list[dict] = []
+        # Impostato da un test per simulare una risposta tagliata dal tetto di
+        # token: è il caso in cui il documento è incompleto e va segnalato.
+        self.truncate = False
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        return _Response(self.replies.pop(0) if len(self.replies) > 1 else self.replies[0])
+        reply = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+        return _Response(reply, finish_reason="length" if self.truncate else "stop")
 
 
 def fake_provider(monkeypatch, replies, *, name="deepseek", model="deepseek-flash"):
@@ -267,6 +271,27 @@ def test_summarize_returns_the_document(monkeypatch, transcript_row, settings):
     sent = calls.calls[0]["messages"][1]["content"]
     assert "The battery of your phone is the constraint" in sent
     assert "[00:06]" not in sent
+
+
+def test_a_document_cut_off_by_the_token_cap_is_flagged(monkeypatch, transcript_row, settings):
+    """
+    Un documento tagliato dal tetto di output è già stato pagato e il testo che
+    c'è è valido, quindi non si butta via: si segnala. Consegnarlo come se fosse
+    finito è l'unico esito davvero sbagliato.
+    """
+    provider, completions = fake_provider(monkeypatch, [DOCUMENT])
+    completions.truncate = True   # la prossima risposta finisce per tetto
+
+    result = sm.summarize(provider, transcript_row, settings)
+
+    assert result["truncated"] is True
+    assert result["words"] > 0, "il testo parziale resta, non si scarta"
+
+
+def test_a_complete_document_is_not_flagged(monkeypatch, transcript_row, settings):
+    provider, _calls = fake_provider(monkeypatch, [DOCUMENT])
+
+    assert sm.summarize(provider, transcript_row, settings)["truncated"] is False
 
 
 def test_the_prompt_carries_the_word_budget(monkeypatch, transcript_row, settings):

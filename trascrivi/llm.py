@@ -557,3 +557,63 @@ def token_usage(diag: dict) -> dict:
     miss = usage.get("prompt_cache_miss_tokens")
     miss = int(miss) if miss is not None else max(0, prompt - hit)
     return {"prompt": prompt, "completion": completion, "hit": hit, "miss": miss}
+
+
+# Tariffe DeepSeek `deepseek-flash` in USD per 1M token, listino letto il
+# 2026-09-23. Fuori picco = 50% esatto del picco; qui si usa la fascia off-peak
+# perché è quella in cui cade quasi tutto l'orario europeo. È una STIMA: il
+# costo vero è quello che fattura il provider, e per modelli diversi da
+# `deepseek-flash` questo listino è quello sbagliato.
+DEEPSEEK_RATES = {
+    "cache_hit": 0.003,
+    "cache_miss": 0.15,
+    "output": 0.60,
+}
+
+
+def estimate_cost(usage: dict) -> float | None:
+    """
+    Costo stimato in USD alle tariffe DeepSeek off-peak.
+
+    `usage` è la forma di `token_usage`. Restituisce `None` quando il provider non
+    ha riportato alcun token: uno zero direbbe "è stato gratis", che è
+    un'affermazione diversa da "non lo so" — e su una vista costi la differenza
+    conta.
+    """
+    if not any(usage.get(k) for k in ("prompt", "completion", "hit", "miss")):
+        return None
+    return round(
+        usage.get("hit", 0) * DEEPSEEK_RATES["cache_hit"] / 1e6
+        + usage.get("miss", 0) * DEEPSEEK_RATES["cache_miss"] / 1e6
+        + usage.get("completion", 0) * DEEPSEEK_RATES["output"] / 1e6,
+        6,
+    )
+
+
+def add_usage(total: dict, diag: dict) -> None:
+    """
+    Somma i token di una chiamata al totale di un job.
+
+    Un job fa più chiamate (una per chunk di trascrizione, più i riassunti degli
+    spezzoni): il totale si costruisce accumulando, non leggendo l'ultima.
+    """
+    counts = token_usage(diag or {})
+    for key in ("prompt", "completion", "hit", "miss"):
+        total[key] += counts[key]
+
+
+def usage_counts(usage: dict) -> dict:
+    """
+    I campi di costo da salvare, a partire dall'usage cumulato di un job.
+
+    Le chiavi sono già quelle delle colonne di `jobs`/`summaries`, così chi
+    salva non deve rimappare niente. `cost_usd` è 0 quando il provider non
+    riporta i token: chi legge distingue "non lo so" da "zero" guardando se i
+    token ci sono (`tokens_in + tokens_out + cache_hit == 0`).
+    """
+    return {
+        "tokens_in": usage.get("prompt", 0),
+        "tokens_out": usage.get("completion", 0),
+        "cache_hit": usage.get("hit", 0),
+        "cost_usd": estimate_cost(usage) or 0.0,
+    }

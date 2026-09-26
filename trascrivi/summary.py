@@ -36,15 +36,9 @@ from . import config, db, llm
 
 log = logging.getLogger("trascrivi.summary")
 
-# Tariffe DeepSeek `deepseek-flash` in USD per 1M token, listino letto il
-# 2026-09-23. Fuori picco = 50% esatto del picco; qui si usa la fascia off-peak
-# perché è quella in cui cade quasi tutto l'orario europeo. È una STIMA: il
-# costo vero è quello che fattura il provider.
-DEEPSEEK_RATES = {
-    "cache_hit": 0.003,
-    "cache_miss": 0.15,
-    "output": 0.60,
-}
+# La stima del costo sta in `llm` perché serve anche all'agente di correzione:
+# vive accanto alle tariffe e a `token_usage`, che è la sua unica dipendenza.
+estimate_cost = llm.estimate_cost
 
 STYLES = ("study", "brief", "detailed")
 
@@ -127,16 +121,6 @@ USER_PROMPT = """{style_hint}
 
 
 # ── Utility ──────────────────────────────────────────────────────────────────
-def estimate_cost(usage: dict) -> float:
-    """Costo stimato in USD alle tariffe DeepSeek off-peak."""
-    return round(
-        usage.get("hit", 0) * DEEPSEEK_RATES["cache_hit"] / 1e6
-        + usage.get("miss", 0) * DEEPSEEK_RATES["cache_miss"] / 1e6
-        + usage.get("completion", 0) * DEEPSEEK_RATES["output"] / 1e6,
-        6,
-    )
-
-
 def target_words(source_words: int, style: str) -> int:
     """
     Quante parole deve avere il riassunto, dato quanto è lunga la trascrizione.
@@ -384,7 +368,7 @@ def summarize(provider: dict, transcript: dict, settings: "config.Settings", *,
         on_progress(0.15, f"asking {provider.get('model')} for ~{words_wanted} words")
     user = USER_PROMPT.format(transcript=_plain_text(segments), **common)
     markdown, diag = _ask(provider, system, user, cap)
-    _add_usage(usage, diag)
+    llm.add_usage(usage, diag)
 
     markdown = strip_plan(markdown)
     if len(markdown) < MIN_DOCUMENT_CHARS:
@@ -392,6 +376,15 @@ def summarize(provider: dict, transcript: dict, settings: "config.Settings", *,
             f"The model returned no usable document ({len(markdown)} characters). "
             f"{llm._error_detail(diag)}"
         )
+    if diag.get("finish_reason") == "length":
+        # Il tetto ha tagliato il documento: il costo è già stato pagato e il
+        # testo che c'è è valido, quindi non si butta via niente. Ma il taglio
+        # deve arrivare all'utente, altrimenti consegniamo metà documento come se
+        # fosse finito (il caso concreto è lo stile `detailed`: l'obiettivo di
+        # parole è tarato sul tetto di output, e su una lezione lunga ci arriva).
+        truncated = True
+    else:
+        truncated = False
 
     written = word_count(markdown)
     # Un superamento netto non si corregge troncando (si perderebbe la coda del
@@ -417,15 +410,13 @@ def summarize(provider: dict, transcript: dict, settings: "config.Settings", *,
         "tokens_in": usage["prompt"],
         "tokens_out": usage["completion"],
         "cache_hit": usage["hit"],
-        "cost_usd": estimate_cost(usage),
+        "cost_usd": estimate_cost(usage) or 0.0,
         "elapsed_s": round(time.time() - t0, 1),
+        "truncated": truncated,
+        # L'usage cumulato resta disponibile per chi salva il job: `jobs._run_job`
+        # ci ricava i campi di costo con lo stesso `llm.usage_counts` dell'agente.
+        "usage": usage,
     }
-
-
-def _add_usage(total: dict, diag: dict) -> None:
-    counts = llm.token_usage(diag)
-    for key in ("prompt", "completion", "hit", "miss"):
-        total[key] += counts[key]
 
 
 def _overview(markdown: str, limit: int = 400) -> str:

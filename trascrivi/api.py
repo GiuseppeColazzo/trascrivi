@@ -259,6 +259,32 @@ def search(q: str = Query(min_length=1), project_id: int | None = None,
     return {"results": db.search_transcripts(q, project_id, limit)}
 
 
+# ── Costi ────────────────────────────────────────────────────────────────────
+@router.get("/costs")
+def costs() -> dict:
+    """
+    Costo stimato delle chiamate LLM, come celle (corso, mese, tipo).
+
+    Non si restituiscono i totali: il filtro per mese e per tipo si fa nella UI
+    sommando queste righe, che sono poche centinaia al massimo, e così cambiare
+    un menu non costa un giro sul server.
+
+    Le tariffe sono quelle DeepSeek off-peak (`llm.DEEPSEEK_RATES`), quindi per
+    un provider diverso il numero è un ordine di grandezza, non una fattura: la
+    risposta porta con sé l'avvertenza, così la UI non deve inventarsela.
+    """
+    data = db.llm_cost_cells()
+    months = sorted({c["month"] for c in data["cells"] if c["month"]}, reverse=True)
+    return {
+        "cells": data["cells"],
+        "projects": data["projects"],
+        "months": months,
+        "rates": dict(llm.DEEPSEEK_RATES),
+        "note": ("Estimated at DeepSeek off-peak list prices: for another provider this is "
+                 "an order of magnitude, not an invoice."),
+    }
+
+
 # ── Progetti ─────────────────────────────────────────────────────────────────
 @router.get("/projects")
 def get_projects() -> dict:

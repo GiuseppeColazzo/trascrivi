@@ -114,6 +114,12 @@ const fmtDate = (ts) => ts ? new Date(ts * 1000).toLocaleString([], {
   day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit",
 }) : "—";
 
+/* Costi in dollari: sotto il dollaro servono quattro decimali, altrimenti una
+   correzione da $0.003 si legge "$0.00" — cioè zero, che è un'altra cosa.
+   `null` non è zero: è un costo che nessuno ha registrato. */
+const fmtUsd = (n) => (n === null || n === undefined) ? "—"
+  : `$${Number(n).toFixed(Math.abs(n) < 1 ? 4 : 2)}`;
+
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => (
   { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
 ));
@@ -285,6 +291,7 @@ const routes = [
   [/^\/p\/(\d+)\/new\/?$/, viewNewLecture],
   [/^\/jobs\/?$/, viewJobs],
   [/^\/t\/(\d+)\/?$/, viewTranscript],
+  [/^\/costs\/?$/, viewCosts],
   [/^\/settings\/?$/, viewSettings],
   [/^\/about\/?$/, viewAbout],
 ];
@@ -298,6 +305,7 @@ const ROUTE_TITLES = [
   [/^\/p\/\d+\/?$/, "Course"],
   [/^\/jobs\/?$/, "Jobs"],
   [/^\/t\/\d+\/?$/, "Transcript"],
+  [/^\/costs\/?$/, "Costs"],
   [/^\/settings\/?$/, "Settings"],
   [/^\/about\/?$/, "About & privacy"],
 ];
@@ -1700,6 +1708,10 @@ async function viewTranscript(nav, params, transcriptId, token) {
       el("div", { class: "card" },
         el("h2", {}, s.title || "Summary"),
         el("p", { class: "muted small tabnum" }, meta),
+        // Il modello ha finito i token a metà frase: il documento c'è, ma non è
+        // completo, e dirlo è l'unico modo perché non venga preso per finito.
+        s.truncated ? notice("warn", "The model ran out of output tokens: these notes stop "
+          + "early. Regenerate them with a shorter style, or raise the output cap in Settings.") : null,
         el("div", { class: "md", html: renderMarkdown(s.markdown || "") })));
   }
 
@@ -2123,8 +2135,195 @@ async function viewSettings(nav, params, token) {
 }
 
 /* ============================================================================
-   Informazioni e privacy
+   Costi
    ========================================================================== */
+async function viewCosts(nav, params, token) {
+  const data = await api("/costs");
+  const { cells, projects, months, note } = data;
+  const names = new Map(projects.map((p) => [p.id, p]));
+
+  // Il filtro è locale di proposito: le celle sono poche centinaia e cambiare
+  // un menu non deve costare un giro sul server. Ogni somma passa da un
+  // arrotondamento: sei decimali di costo sommati in floating point producono
+  // code come 0.30000000000000004, che a schermo sono già invisibili ma
+  // rendono inutile qualunque confronto.
+  const round = (n) => Math.round(n * 1e6) / 1e6;
+  const sumFor = (list, key) => round(list.reduce((t, c) => t + (c[key] || 0), 0));
+
+  // Il valore del menu va letto dalla *proprietà*, non dall'attributo: quando
+  // l'utente sceglie un'opzione il browser aggiorna `select.value`, mentre
+  // l'attributo `value` resta quello scritto nel markup. Leggere l'attributo
+  // significa leggere per sempre la scelta iniziale — il filtro sembrava non
+  // fare niente. Si ripiega sull'opzione selezionata per un DOM che non
+  // implementa la proprietà.
+  const choice = (node) => {
+    if (typeof node.value === "string" && node.value) return node.value;
+    const selected = [...node.children].find((o) => o.hasAttribute("selected"));
+    return (selected && selected.getAttribute("value")) || "";
+  };
+
+  function markChoice(node) {
+    const current = choice(node);
+    [...node.children].forEach((o) => {
+      if (o.getAttribute("value") === current) o.setAttribute("selected", "selected");
+      else o.removeAttribute("selected");
+    });
+  }
+
+  function filtered() {
+    const monthValue = choice(month);
+    const kindValue = choice(kind);
+    return cells.filter((c) => (!monthValue || monthValue === "all" || c.month === monthValue)
+      && (!kindValue || kindValue === "all" || c.kind === kindValue));
+  }
+
+  function aggregate() {
+    const list = filtered();
+    const byCourse = new Map();
+    for (const c of list) {
+      const row = byCourse.get(c.project_id)
+        || { project_id: c.project_id, total: 0, summary: 0, fix: 0, tokens: 0, jobs: 0 };
+      const cost = c.cost_usd || 0;
+      row.total = round(row.total + cost);
+      if (c.kind === "llm_summary") row.summary = round(row.summary + cost);
+      else row.fix = round(row.fix + cost);
+      row.tokens += c.tokens || 0;
+      row.jobs += c.n_jobs || 0;
+      byCourse.set(c.project_id, row);
+    }
+    return { byCourse: [...byCourse.values()].filter((r) => r.total > 0),
+      total: sumFor(list, "cost_usd"),
+      summary: sumFor(list.filter((c) => c.kind === "llm_summary"), "cost_usd"),
+      fix: sumFor(list.filter((c) => c.kind === "llm_fix"), "cost_usd"),
+      tokens: list.reduce((t, c) => t + (c.tokens || 0), 0),
+      jobs: list.reduce((t, c) => t + (c.n_jobs || 0), 0) };
+  }
+
+  const monthLabel = (m) => new Date(`${m}-01T00:00:00`).toLocaleDateString([], {
+    month: "short", year: "numeric" });
+
+  const month = el("select", { id: "costMonth", "aria-label": "Filter by month" },
+    [el("option", { value: "all" }, "All months")].concat(
+      months.map((m) => el("option", { value: m }, monthLabel(m)))));
+  // Ogni opzione ha un `value` esplicito, compresa "tutti": un `<option>` senza
+  // `value` viene identificato dal browser con il suo *testo*, quindi un'etichetta
+  // tradotta romperebbe in silenzio il confronto con il filtro.
+  const kind = el("select", { id: "costKind", "aria-label": "Filter by kind of work" },
+    el("option", { value: "all" }, "Summaries and corrections"),
+    el("option", { value: "llm_summary" }, "Summaries only"),
+    el("option", { value: "llm_fix" }, "Corrections only"));
+
+  const stats = el("div", { class: "stat-bar" });
+  const tableHost = el("div", {});
+  // Chiesto una volta per disegno: se cambia un menu, cambia il filtro dei
+  // riassunti per tipo (che decide anche le colonne).
+  const summaryOnly = () => {
+    const kindValue = choice(kind);
+    return !!kindValue && kindValue !== "all";
+  };
+
+  function renderStats(agg) {
+    const stat = (k, v, cls = "") => el("div", { class: `stat ${cls}` },
+      el("span", { class: "stat-k" }, k), el("span", { class: "stat-n" }, v));
+    stats.replaceChildren(
+      stat("Total", fmtUsd(agg.total), "is-accent"),
+      stat("Summaries", fmtUsd(agg.summary)),
+      stat("Corrections", fmtUsd(agg.fix)),
+      stat("Tokens", Math.round(agg.tokens).toLocaleString()),
+      stat("Jobs", String(agg.jobs)));
+  }
+
+  function renderTable(agg) {
+    // Le barre sono relative al corso più caro: dice a colpo d'occhio dove sono
+    // finiti i soldi, senza aggiungere una libreria di grafici.
+    const peak = Math.max(...agg.byCourse.map((r) => r.total), 0);
+    const bar = (v) => el("span", { class: "cost-bar" },
+      el("span", { class: "cost-bar-fill", style: peak ? `width:${(v / peak) * 100}%` : "width:0" }));
+
+    const heads = summaryOnly()
+      ? [el("th", {}, "Course"), el("th", { class: "right" }, "Cost"),
+          el("th", { class: "right" }, "Jobs")]
+      : [el("th", {}, "Course"), el("th", { class: "right" }, "Total"),
+          el("th", { class: "right" }, "Summaries"), el("th", { class: "right" }, "Corrections"),
+          el("th", { class: "right" }, "Jobs")];
+    const rows = [...agg.byCourse].sort((a, b) => b.total - a.total).map((r) => {
+      const project = names.get(r.project_id) || {};
+      const title = el("td", {},
+        el("a", { href: `#/p/${r.project_id}` }, project.name || `#${r.project_id}`),
+        project.code ? el("span", { class: "muted small" }, ` · ${project.code}`) : null);
+      const jobs = el("td", { class: "tabnum right" }, String(r.jobs));
+      return summaryOnly()
+        ? el("tr", {}, title,
+            el("td", {}, el("div", { class: "cost-cell" },
+              bar(r.total), el("span", { class: "tabnum" }, fmtUsd(r.total)))),
+            jobs)
+        : el("tr", {}, title,
+            el("td", {}, el("div", { class: "cost-cell" },
+              bar(r.total), el("span", { class: "tabnum" }, fmtUsd(r.total)))),
+            el("td", { class: "tabnum right muted" }, fmtUsd(r.summary)),
+            el("td", { class: "tabnum right muted" }, fmtUsd(r.fix)),
+            jobs);
+    });
+
+    tableHost.replaceChildren(rows.length
+      ? el("table", { class: "costs-table" }, el("thead", {}, el("tr", {}, heads)),
+          el("tbody", {}, rows))
+      : el("div", { class: "empty" },
+          el("p", { class: "empty-kicker" }, "Nothing in this filter"),
+          el("p", {}, "No summary or correction was run in this month. ",
+            "Pick another month, or go back to all months.")));
+  }
+
+  function refreshViews() {
+    markChoice(month);
+    markChoice(kind);
+    const agg = aggregate();
+    renderStats(agg);
+    renderTable(agg);
+  }
+  month.addEventListener("change", refreshViews);
+  kind.addEventListener("change", refreshViews);
+  // Il primo disegno va fatto prima del guard di `isCurrent`: il guard decide
+  // solo se attaccare il risultato alla pagina, non se calcolarlo.
+  refreshViews();
+
+  if (!isCurrent(token)) return;
+  nav.replaceChildren(el("div", { class: "stack" },
+    el("div", { class: "card" },
+      el("div", { class: "split hero" },
+        el("div", { class: "grow" },
+          el("p", { class: "empty-kicker" }, "Ledger"),
+          el("h1", {}, "LLM costs"),
+          el("p", { class: "muted small hero-note" },
+            "Whisper runs on this machine and costs nothing. What has a price is the ",
+            "optional work done by a model: summaries and the correction agent. ",
+            "Every call is recorded on the job that made it, at the time it was made.")),
+        el("div", { class: "actions" },
+          el("button", { onclick: () => render() }, "Refresh")))),
+    stats,
+    el("div", { class: "card" },
+      el("div", { class: "split" },
+        el("div", { class: "field", style: "min-width:190px;margin:0" },
+          el("label", { for: "costMonth" }, "Period"), month),
+        el("div", { class: "field", style: "min-width:230px;margin:0" },
+          el("label", { for: "costKind" }, "Work"), kind),
+        el("span", { class: "spacer" }),
+        el("span", { class: "muted small" }, "Totals follow the two menus.")),
+      tableHost),
+    el("div", { class: "card" },
+      el("h2", {}, "How these numbers are made"),
+      el("p", { class: "muted prose" },
+        note, " A job that died halfway still appears under its course: its tokens ",
+        "were spent all the same."),
+      el("table", { class: "details-table" }, el("tbody", {},
+        el("tr", {}, el("th", {}, "Cache hit (per 1M)"), el("td", {}, `$${data.rates.cache_hit}`)),
+        el("tr", {}, el("th", {}, "Cache miss (per 1M)"), el("td", {}, `$${data.rates.cache_miss}`)),
+        el("tr", {}, el("th", {}, "Output (per 1M)"), el("td", {}, `$${data.rates.output}`)))),
+      el("p", { class: "hint" },
+        "Local models cost nothing at the provider, but they still report tokens: ",
+        "the numbers are real even when the price is not."))));
+}
+
 async function viewAbout(nav, params, token) {
   // Lo stato del server è già esposto da /health: mostrarlo qui evita di
   // mandare l'utente a cercare la versione nei log.
