@@ -42,74 +42,128 @@ estimate_cost = llm.estimate_cost
 
 STYLES = ("study", "brief", "detailed")
 
-# Quanto deve essere lungo il riassunto, in proporzione alla trascrizione.
+# Quanto deve essere lungo il riassunto.
 #
 # Il numero va dato esplicito. Senza, il modello scrive finché decide di aver
 # finito, e il risultato è lungo quanto la lezione: misurato su una lezione reale,
 # 6338 parole di note su 7000 parole di trascrizione, con 7601 token di output su
 # un tetto di 8000. Non era un tetto troppo basso, era l'assenza di un obiettivo.
 #
-# I modelli sovra-generano in modo sistematico (Plan-and-Write, KDD 2025,
-# arXiv:2511.01807: "systematic bias toward over-generation"), quindi il rapporto
-# va tenuto basso e il limite va ripetuto come vincolo, non come suggerimento.
-STYLE_SHAPE = {
-    "brief":    {"ratio": 0.06, "floor": 150, "cap": 450},
-    "study":    {"ratio": 0.15, "floor": 300, "cap": 2000},
-    "detailed": {"ratio": 0.25, "floor": 600, "cap": 3500},
-}
+# Ma un budget in PAROLE non basta, ed è la parte che non funzionava: il modello
+# non sa contare le parole. Sugli 11 riassunti in `data/trascrivi.db` veniva
+# superato di ~1.37x in modo sistematico e identico nei due stili (study
+# 1.11-1.60x, brief 1.21-1.52x), come ci si aspetta da modelli addestrati a
+# sovra-generare (Plan-and-Write, KDD 2025, arXiv:2511.01807). Sa contare sezioni
+# e bullet, quindi il budget si esprime come struttura:
+#
+#     argomenti = parole sorgente / 1200        (5..12)
+#     sezioni   = argomenti + 2                 (tabella termini + sospeso)
+#     sezione   = riga di apertura (25 parole) + bullet x 22 parole
+#     obiettivo = sezioni x parole per sezione
+#
+# Il numero che cresce con la trascrizione è quello degli ARGOMENTI: una lezione
+# da 1h30 ne ha una decina distinti, qualunque sia lo stile. Le due sezioni di
+# servizio si AGGIUNGONO. Ricavarle sottraendole dal totale toglieva un argomento
+# a ogni lezione — con 10 argomenti ne restavano 9 — ed è così che sparivano
+# Mokyr e il blocco sulla corrente alternata. I tre stili diventano un solo
+# parametro: `STYLE_BULLETS`, cioè 69 / 113 / 179 parole per sezione.
+#
+# I vecchi `ratio`/`floor`/`cap` non erano solo tarati male: il tetto scattava
+# prima del rapporto (brief a 7500 parole sorgente, study a 13300), quindi ogni
+# lezione reale — 11 200-21 700 parole — produceva un brief da ~620 parole e uno
+# study da ~2500 qualunque fosse la sua lunghezza.
+#
+# La lunghezza resta un bersaglio, non una garanzia: sul codice attuale lo scarto
+# misurato va da 0.76x a 1.66x del budget (mediana ~1.05x), con qualche run che
+# sfora ancora del 50%. Il vecchio prompt aveva la stessa dispersione, attorno a
+# una media più alta.
+TOPIC_SOURCE_WORDS = 1200
+TOPIC_SECTIONS_MIN, TOPIC_SECTIONS_MAX = 5, 12
+RESERVED_SECTIONS = 2
+LEAD_WORDS, BULLET_WORDS = 25, 22
+STYLE_BULLETS = {"brief": 2, "study": 4, "detailed": 7}
+
+# Il piano non si vede — `strip_plan` lo toglie dal documento — ma si paga, ed è
+# l'unico pezzo di output che non finisce in mano al lettore. Senza un margine per
+# lui il modello scrive il piano e si fa tagliare le note a metà: misurato con il
+# piano a due liste (elenco dei nomi + sezioni), note troncate a 8 sezioni su 11,
+# ~1500 parole di piano su un tetto di 2877 token. Il limite di righe nel prompt lo
+# tiene piccolo; questo margine evita che una sua crescita si mangi il documento.
+PLAN_TOKENS = 1200
 
 SYSTEM_PROMPT = """You write study notes from university lecture transcripts, in Markdown.
 
 The transcript comes from automatic speech recognition: expect recognition errors, false starts, repetitions and missing punctuation. Read through them.
 
-A summary is a selection, not a transcript. Deciding what to leave out is the job; keeping everything is not being thorough, it is failing the task.
+A summary is a selection, not a transcript. Deciding what to leave out is the job; keeping everything is not being thorough, it is failing the task. Cutting too deep is the other way to fail: a concept the lecturer named and you dropped is a hole the reader walks into while revising.
 
 RULES
 1. Use only what the transcript says. You have no other knowledge of the subject: never add facts, definitions, examples or numbers that are not in the transcript, even if you are sure they are correct.
 2. Write the notes in {language_name}.
-3. Stay inside the word budget given in the request. Going over it is a failure, not a detail to fix later.
-4. Cover the topics that carry the lecture, in the order they were given. Every section must earn its place: if one would only repeat another, merge it or drop it.
-5. Prefer lists and short paragraphs to long blocks of prose. Bold the term being defined, not whole sentences.
-6. Use a Markdown table whenever the lecture compares things, lists options, or classifies items by attributes.
-7. Use a diagram in a fenced code block only where the lecture describes a process, a flow or an architecture that is clearer as a picture. Two or three in a whole lecture at most.
-8. Keep the lecturer's technical terms, acronyms and symbols exactly as they were said. Do not expand an acronym they did not expand, and do not rename anything.
-9. Keep their uncertainty. "probably", "I think", "in general", "it seems" must not become statements of fact.
+3. Stay inside the budget given in the request. Going over it is a failure, not a detail to fix later.
+4. Name everything the lecturer named. Every theory, author, term, distinction, model, mechanism, case or process that the lecture gives a name to must appear in the notes, with one line saying what it is. Completeness is counted in names, not in words: a reader who cannot find a name they heard in the lecture stops trusting the notes.
+5. One layer of depth per concept, not a story. For each concept: what it is, then why or how in one or two sentences. Keep the reasoning that connects the concepts; drop the narrative that leads up to it.
+6. At most one example per concept, and only when the concept stays abstract without it. If three cases make the same point, keep the one that carries it and drop the others. A named case the lecturer dwells on — a technology, a lawsuit, a company, an experiment — is content, not colour: keep it in one bullet.
+7. Prefer lists and short paragraphs to long blocks of prose. Bold the term being defined, not whole sentences.
+8. Use a Markdown table whenever the lecture compares things, lists options, or classifies items by attributes — and for the terms of the lecture with their definition, where the lecture defined enough of them.
+9. Use a diagram in a fenced code block only where the lecture describes a process, a flow or an architecture that is clearer as a picture. Two or three in a whole lecture at most.
+10. Keep the lecturer's technical terms, acronyms and symbols exactly as they were said. Do not expand an acronym they did not expand, and do not rename anything.
+11. Keep their uncertainty. "probably", "I think", "in general", "it seems" must not become statements of fact.
 
 ALWAYS LEAVE OUT
 - housekeeping and logistics: timetables, breaks, exam dates, recordings, who sits where, administrative remarks;
+- anything about the course rather than its subject: grading, exam rules, project work, attendance, the colleague who teaches a module, where the slides are. Rule 4 is about what the lecture teaches, not about how the course is run — however much of the hour the lecturer spends on it;
 - the lecturer's scaffolding: "we will see this later", "for now this is qualitative", "let me repeat that", "as I was saying";
 - repetition: the same concept stated three times is one bullet, not three;
-- examples that only illustrate a definition already given. Keep an example only when the concept does not survive without it;
-- the texture of spoken language: digressions, asides, jokes, audience questions that lead nowhere.
+- the second and third example of a point already made;
+- the texture of spoken language: digressions, asides, jokes, audience questions that lead nowhere;
+- people who appear only as colour — the student who asked, the colleague who mentioned something, the company in an aside — unless the lecture uses them to make a technical point.
 
 Write no preamble, no closing remarks, and no commentary about the transcript itself."""
 
 STYLE_HINT = {
-    "study": ("Write study notes: the concepts, the definitions, the results and the reasoning that "
-              "connects them, at a level of detail that lets someone revise the lecture."),
-    "brief": ("Write a short summary: the essential ideas only, one section per main topic, a few "
-              "bullets each. Keep the definitions, drop the detail and the examples."),
+    "study": ("Write study notes for revision: every concept the lecture names, each one explained "
+              "in a line or two, with the reasoning that connects them. Assume the reader has "
+              "followed the lecture once and wants to go back over it quickly."),
+    # Il brief non dice più "drop the detail and the examples": era la frase che
+    # faceva perdere interi argomenti (sulla Lezione 1 il brief copriva 21 dei 32
+    # elementi nominati, contro i 32 del nuovo stile `study`). Meno bullet, non
+    # meno concetti.
+    "brief": ("Write a short summary: every concept the lecture names, one line each, with no "
+              "elaboration and no examples. The reader wants the map, not the territory."),
     "detailed": ("Write thorough notes: for each concept keep the argument, the numbers and the "
                  "caveats. Detail means more precision per point, not more points."),
 }
 
 BUDGET_BLOCK = """The transcript is about {source_words} words long.
-Your notes must be about {target_words} words, and MUST NOT be longer than {target_words} words. The budget is a hard limit.
+Write {sections} sections, {target_words} words in total: no fewer than {min_words} and no more than {max_words}. Both ends are a limit. Falling short means you dropped concepts; going over means you kept detail that does not earn its place.
 
 Work in two steps.
 
-STEP 1 - inside <plan> tags, choose your sections and give each one a word budget. One line per section, the numbers adding up to about {target_words}. Keep it under 10 lines. This block is not part of the notes and will be removed.
+STEP 1 - inside <plan> tags, work in two lists.
 
-STEP 2 - write the notes after the plan, starting at the `#` title, staying inside your budget.
+First the names: every theory, author, term, case, model, mechanism and process this lecture gives a name to, one per line. This is the completeness checklist, and it is judged on names, not on words.
+
+Then the sections: one line each, saying which names from that list the section will carry. Exactly {sections} sections, and no name left unassigned. If a name has nowhere to go, it means two topics were merged that should be separate — split them rather than dropping the name. Keep the whole block under 25 lines: the plan is removed before delivery, but it is paid for, and a plan that runs long eats the notes.
 
 <plan>
-...
+NAMES
+- ...
+SECTIONS
+1. Section title - {bullets_per_section} bullets - names: ...
 </plan>
 
-SHAPE OF THE DOCUMENT
-- one `##` section per topic, in the order the lecture covered them;
-- a table of the technical terms with their definition, where the lecture defined enough of them;
-- a final `##` section, titled in {language_name}, for what the lecturer left unfinished or promised for later. Drop it entirely if there is nothing to put in it.
+STEP 2 - write the notes after the plan, starting at the `#` title. Every name in your checklist must appear in the notes.
+
+HOW TO HIT THE LENGTH
+- exactly {sections} `##` sections in total, and the count includes all three kinds:
+  - {topic_sections} sections on the topics of the lecture, in the order it covered them;
+  - one section holding the table of the terms of the lecture with their definition. This one is not optional and it is not a topic section: every lecture names at least a handful of terms, and this table is the part a reader scans before an exam. It holds a table, not bullets — one row per term, as many rows as the lecture defined;
+  - one last section, if the lecture deferred anything, for what was promised or left unresolved. This one holds only the deferral: the last topic of the lecture belongs to its own section above, not here;
+- every title is different: two sections that would carry the same title are one section;
+- each topic section: one opening line saying what the topic is (at most {lead_words} words), then {bullets_per_section} bullets. Never more than {bullets_per_section}, never fewer than {bullets_per_section} — a section that cannot fill them is not a section;
+- one bullet carries one idea and at most {bullet_words} words: count them. A bullet that needs a second sentence is two bullets, not a longer bullet. Several names that belong together can share one bullet;
+- if a section runs long, merge bullets; never drop a named concept to save words. If the whole document runs long, the detail to cut is the example, never the concept.
 """
 
 USER_PROMPT = """{style_hint}
@@ -121,16 +175,38 @@ USER_PROMPT = """{style_hint}
 
 
 # ── Utility ──────────────────────────────────────────────────────────────────
-def target_words(source_words: int, style: str) -> int:
+def shape(source_words: int, style: str) -> dict:
     """
-    Quante parole deve avere il riassunto, dato quanto è lunga la trascrizione.
+    Sezioni, bullet e parole: il budget che finisce nel prompt.
 
-    Il rapporto dipende dallo stile e il risultato è limitato da una soglia
-    minima e da un tetto: sotto il minimo non è un riassunto, sopra il tetto non
-    è più consultabile durante lo studio.
+    Le sezioni di argomento crescono con la trascrizione; tabella dei termini e
+    "cosa resta in sospeso" sono due sezioni in più, prenotate. Senza prenotarle
+    il modello le sacrifica quando il budget stringe — misurato: la tabella c'è
+    con 9 sezioni e sparisce con 11, a parità di prompt.
     """
-    shape = STYLE_SHAPE.get(style, STYLE_SHAPE["study"])
-    return max(shape["floor"], min(shape["cap"], round(source_words * shape["ratio"])))
+    topics = max(TOPIC_SECTIONS_MIN,
+                 min(TOPIC_SECTIONS_MAX, round(source_words / TOPIC_SOURCE_WORDS)))
+    sections = topics + RESERVED_SECTIONS
+    bullets = STYLE_BULLETS.get(style, STYLE_BULLETS["study"])
+    per_section = LEAD_WORDS + bullets * BULLET_WORDS
+    target = sections * per_section
+    return {
+        "sections": sections,
+        "topic_sections": topics,
+        "bullets_per_section": bullets,
+        "lead_words": LEAD_WORDS,
+        "bullet_words": BULLET_WORDS,
+        "target_words": target,
+        # L'intervallo è stretto di proposito: è quello che il modello ha
+        # rispettato, mentre un "about N words" veniva superato di un terzo.
+        "min_words": round(target * 0.85),
+        "max_words": round(target * 1.15),
+    }
+
+
+def target_words(source_words: int, style: str) -> int:
+    """Quante parole deve avere il riassunto, data la lunghezza della trascrizione."""
+    return shape(source_words, style)["target_words"]
 
 
 def source_word_count(segments: list[dict], text: str = "") -> int:
@@ -341,15 +417,19 @@ def summarize(provider: dict, transcript: dict, settings: "config.Settings", *,
     # si calcola dalla trascrizione vera, non si lascia decidere al modello.
     words_in_source = source_word_count(segments, text)
     words_wanted = target_words(words_in_source, style)
+    # `shape` porta anche `target_words`, min e max: il budget del prompt e la
+    # lunghezza attesa escono dalla stessa funzione, quindi non possono divergere.
+    shape_for_prompt = shape(words_in_source, style)
+    language_name = _language_name(language)
     common = {
         "style_hint": STYLE_HINT[style],
         "context_block": context,
-        "language_name": _language_name(language),
+        "language_name": language_name,
         "source_words": words_in_source,
         "target_words": words_wanted,
         "budget_block": BUDGET_BLOCK.format(source_words=words_in_source,
-                                            target_words=words_wanted,
-                                            language_name=_language_name(language)),
+                                            language_name=language_name,
+                                            **shape_for_prompt),
     }
     if instructions:
         common["style_hint"] += f"\n\nAdditional instructions from the student:\n{instructions}"
@@ -361,7 +441,12 @@ def summarize(provider: dict, transcript: dict, settings: "config.Settings", *,
     # invita a superarlo: 8000 token sono ~6000 parole, ed è esattamente la
     # lunghezza che il modello raggiungeva quando non aveva un numero.
     # Si tiene comunque un margine ampio per non troncare a metà frase.
-    cap = min(int(settings.summary_max_tokens or 8000), words_wanted * 3 + 600)
+    #
+    # Il piano va pagato ma non si vede: `strip_plan` lo toglie dal documento, e
+    # senza un margine per lui il modello scrive il piano e si fa tagliare le note
+    # a metà. Vedi `PLAN_TOKENS`.
+    cap = min(int(settings.summary_max_tokens or 8000),
+              words_wanted * 3 + 600 + PLAN_TOKENS)
     t0 = time.time()
 
     if on_progress:

@@ -158,20 +158,70 @@ def test_target_words_scales_with_the_transcript():
     """
     Il numero va dato esplicito. Senza, il modello scrive finché decide di aver
     finito: misurato su una lezione reale, 6338 parole di note su 7000 parole di
-    trascrizione. Qui si blocca il rapporto, che è la leva sulla lunghezza.
+    trascrizione.
+
+    Il totale non viene da un rapporto sulle parole — il modello non le sa contare,
+    e un budget in parole veniva superato di ~1.37x — ma dal numero di sezioni, che
+    cresce con la trascrizione, moltiplicato per le parole di una sezione.
     """
-    # Sotto il tetto vale il rapporto: 6% / 15% / 25%.
-    assert sm.target_words(5_000, "brief") == 300
-    assert sm.target_words(10_000, "study") == 1500
-    assert sm.target_words(10_000, "detailed") == 2500
+    def sezioni(parole):
+        argomenti = max(sm.TOPIC_SECTIONS_MIN,
+                        min(sm.TOPIC_SECTIONS_MAX, round(parole / sm.TOPIC_SOURCE_WORDS)))
+        return argomenti + sm.RESERVED_SECTIONS
+
+    per_sezione = sm.LEAD_WORDS + sm.STYLE_BULLETS["study"] * sm.BULLET_WORDS
+
+    # La scala è lineare nelle sezioni, non nelle parole.
+    assert sm.target_words(11_000, "study") == sezioni(11_000) * per_sezione
+    assert sm.target_words(22_000, "study") == sezioni(22_000) * per_sezione
+    assert sm.target_words(22_000, "study") > sm.target_words(11_000, "study")
 
 
 def test_target_words_has_a_floor_and_a_ceiling():
-    """Sotto il minimo non è un riassunto, sopra il tetto non è consultabile."""
-    assert sm.target_words(50, "brief") == 150          # minimo
-    assert sm.target_words(10_000, "brief") == 450      # tetto
-    assert sm.target_words(1_000_000, "study") == 2000  # tetto
+    """Sotto il minimo non è un riassunto, sopra il tetto non è più consultabile."""
+    minimo = (sm.TOPIC_SECTIONS_MIN + sm.RESERVED_SECTIONS) * (
+        sm.LEAD_WORDS + sm.STYLE_BULLETS["brief"] * sm.BULLET_WORDS)
+    massimo = (sm.TOPIC_SECTIONS_MAX + sm.RESERVED_SECTIONS) * (
+        sm.LEAD_WORDS + sm.STYLE_BULLETS["study"] * sm.BULLET_WORDS)
+
+    assert sm.target_words(50, "brief") == minimo
+    assert sm.target_words(1_000_000, "study") == massimo
     assert sm.target_words(10_000, "sconosciuto") == sm.target_words(10_000, "study")
+
+
+def test_the_reserved_sections_are_added_not_subtracted():
+    """
+    Regressione: le sezioni di argomento venivano calcolate sul totale e poi ne
+    venivano tolte due per tabella e "sospeso". Una lezione con dieci argomenti ne
+    otteneva nove, ed è così che sparivano Mokyr e il dibattito sulle origini della
+    rivoluzione industriale.
+    """
+    shape = sm.shape(12_000, "study")
+
+    assert shape["topic_sections"] == round(12_000 / sm.TOPIC_SOURCE_WORDS)
+    assert shape["sections"] == shape["topic_sections"] + sm.RESERVED_SECTIONS
+
+
+def test_the_three_styles_are_a_scale_not_a_ratio():
+    """
+    I vecchi ratio/cap rendevano brief e study due lunghezze costanti: il tetto
+    scattava prima del rapporto, quindi una lezione da 21 700 parole produceva un
+    brief da 450 parole come una da 11 200. Ora la scala è nei bullet per sezione e
+    la lunghezza segue la trascrizione in tutti e tre gli stili.
+    """
+    breve, medio, lungo = (sm.target_words(12_000, s) for s in ("brief", "study", "detailed"))
+
+    assert breve < medio < lungo
+    # Via di mezzo: il default sta fra il cheat-sheet e le note lunghe, non al
+    # livello di nessuno dei due.
+    assert 1.5 < medio / breve < 2.5
+    assert 1.5 < lungo / medio < 2.5
+    # E il brief non è più costante: sotto il vecchio tetto a 450 parole la
+    # lezione da 21 658 parole ne produceva 620, esattamente come una da 11 239.
+    breve_lungo = sm.target_words(21_658, "brief")
+    breve_corto = sm.target_words(11_239, "brief")
+    assert breve_lungo > breve_corto
+    assert breve_lungo > 1.2 * breve_corto
 
 
 def test_a_long_lecture_is_compressed_not_transcribed():
@@ -294,21 +344,31 @@ def test_a_complete_document_is_not_flagged(monkeypatch, transcript_row, setting
     assert sm.summarize(provider, transcript_row, settings)["truncated"] is False
 
 
-def test_the_prompt_carries_the_word_budget(monkeypatch, transcript_row, settings):
+def test_the_prompt_carries_the_budget_as_a_structure(monkeypatch, transcript_row, settings):
     """
     Il budget deve arrivare al modello come numero, calcolato sulla trascrizione
     vera: è l'unica leva che ha sulla lunghezza del risultato.
+
+    E deve arrivare come *struttura* — sezioni e bullet — non solo come totale in
+    parole: il totale in parole da solo veniva superato di ~1.37x.
     """
     _provider, calls = fake_provider(monkeypatch, [DOCUMENT])
     source = sm.source_word_count(transcript_row["segments"])
     wanted = sm.target_words(source, "study")
+    shape = sm.shape(source, "study")
 
     sm.summarize({"name": "deepseek", "model": "deepseek-flash"}, transcript_row, settings)
 
     sent = calls.calls[0]["messages"][1]["content"]
-    assert f"about {wanted} words" in sent
-    assert f"MUST NOT be longer than {wanted} words" in sent
+    assert f"{shape['sections']} sections, {wanted} words in total" in sent
+    assert f"no fewer than {shape['min_words']}" in sent
+    assert f"no more than {shape['max_words']}" in sent
     assert f"about {source} words long" in sent
+    assert f"never fewer than {shape['bullets_per_section']}" in sent
+    assert f"at most {shape['bullet_words']} words" in sent
+    # La tabella dei termini è una sezione prenotata, non un extra facoltativo:
+    # senza prenotazione il modello la sacrifica quando il budget stringe.
+    assert "table of the terms of the lecture" in sent
     # Il blocco di pianificazione è chiesto esplicitamente.
     assert "<plan>" in sent
 
@@ -343,6 +403,9 @@ def test_the_output_cap_follows_the_budget(monkeypatch, transcript_row, settings
 
     assert calls.calls[0]["max_tokens"] < 8000
     assert calls.calls[0]["max_tokens"] >= wanted * 2   # margine per non troncare
+    # Il margine include il piano, che si paga ma non finisce nel documento:
+    # senza, il modello scrive il piano e si fa tagliare le note a metà.
+    assert calls.calls[0]["max_tokens"] >= wanted * 3 + 600 + sm.PLAN_TOKENS
 
 
 def test_the_stated_budget_follows_the_style(monkeypatch, transcript_row, settings):
@@ -353,7 +416,11 @@ def test_the_stated_budget_follows_the_style(monkeypatch, transcript_row, settin
                  style="brief")
 
     sent = calls.calls[0]["messages"][1]["content"]
-    assert f"about {sm.target_words(source, 'brief')} words" in sent
+    shape = sm.shape(source, "brief")
+    assert f"{shape['sections']} sections, {shape['target_words']} words in total" in sent
+    # Il brief chiede meno bullet per sezione dello study.
+    assert f"never fewer than {sm.STYLE_BULLETS['brief']}" in sent
+    assert sm.STYLE_BULLETS["brief"] < sm.STYLE_BULLETS["study"]
 
 
 def test_summarize_strips_the_planning_block(monkeypatch, transcript_row, settings):
