@@ -9,8 +9,26 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
 /* I modelli sono definiti dal backend (trascrivi_audio.MODELS): la UI non li
-   duplica a mano, li carica in init(). */
+   duplica a mano, li carica da `/api/models`. La promessa resta in memoria: se
+   la prima chiamata fallisce — succede quando la pagina si carica mentre il
+   server sta ancora partendo — la vista che ne ha bisogno la ritenta, invece di
+   disegnare un menu vuoto che manda il job con `model=""`. */
 const MODELS = [];
+let modelsPromise = null;
+
+function loadModels() {
+  if (!modelsPromise) {
+    modelsPromise = api("/models").then((res) => {
+      MODELS.splice(0, MODELS.length, ...(Array.isArray(res?.models) ? res.models : []));
+      return MODELS;
+    });
+    // Il rifiuto va marcato come gestito (altrimenti è un unhandled rejection) e
+    // poi dimenticato: il prossimo chiamante deve ritentare, non ricevere di
+    // nuovo lo stesso errore.
+    modelsPromise.catch(() => { modelsPromise = null; });
+  }
+  return modelsPromise;
+}
 
 /* ── API ─────────────────────────────────────────────────────────────────── */
 async function api(path, options = {}) {
@@ -815,6 +833,12 @@ async function viewNewLecture(nav, params, projectId, token) {
   const providers = health.providers;
   setDocTitle(`New lecture · ${project.name}`);
 
+  /* Il menu dei modelli deve avere delle voci: un <select> vuoto invia il job con
+     `model=""` e il server risponde "Unsupported model: ". Se l'avvio non le ha
+     caricate (o è fallito), qui si ritenta. */
+  const modelNames = await loadModels().catch(() => MODELS);
+  const noModels = modelNames.length === 0;
+
   let source = null;   // {id, name, original_path, bytes, stored_path}
   let pickedFile = null;
 
@@ -962,7 +986,10 @@ async function viewNewLecture(nav, params, projectId, token) {
   }
 
   const opts = {
-    model: el("select", { id: "optModel" }, MODELS.map((m) => el("option", { value: m, selected: m === settings.default_model ? "selected" : null }, m))),
+    // Un `<select>` senza opzioni non è un menu: `noModels` lo dice all'utente e
+    // `submit()` si ferma prima di mandare un modello vuoto al server.
+    model: el("select", { id: "optModel", "aria-invalid": noModels ? "true" : null },
+      modelNames.map((m) => el("option", { value: m, selected: m === settings.default_model ? "selected" : null }, m))),
     language: el("input", { id: "optLang", value: settings.default_language || "en" }),
     device: el("select", { id: "optDevice" },
       ["auto", "cuda", "cpu"].map((d) => el("option", { value: d, selected: d === (settings.default_device || "auto") ? "selected" : null }, d))),
@@ -988,6 +1015,13 @@ async function viewNewLecture(nav, params, projectId, token) {
   const summaryInstruction = el("input", { id: "optSummaryInstruction", placeholder: "e.g. focus on the formulas (optional)" });
   const autoTerms = terms.filter((t) => t.auto);
   const submitNote = el("span", { class: "muted small" });
+  /* Il perché di un menu vuoto va detto dove serve — accanto al menu — e non
+     solo nel toast al momento dell'invio. */
+  const modelNotice = noModels
+    ? el("p", { class: "notice err" },
+        "The server did not return the model list (/api/models): there is no Whisper model to run. ",
+        "Reload the page; if it stays empty, restart the server.")
+    : null;
 
   const form = el("form", { class: "stack", onsubmit: submit },
     sourceCard,
@@ -998,6 +1032,7 @@ async function viewNewLecture(nav, params, projectId, token) {
       el("div", { class: "row" },
         el("div", { class: "grow field" }, el("label", { for: "optModel" }, "Whisper model"), opts.model),
         el("div", { class: "grow field" }, el("label", { for: "optLang" }, "Language (or “auto”)"), opts.language)),
+      modelNotice,
       el("div", { class: "row" },
         el("div", { class: "grow field" }, el("label", { for: "optDevice" }, "Device"), opts.device),
         el("div", { class: "grow field" }, el("label", { for: "optCompute" }, "Compute type"), opts.compute),
@@ -1052,6 +1087,7 @@ async function viewNewLecture(nav, params, projectId, token) {
     const bits = [];
     if (!source && pickedFile) bits.push("the file is uploaded first");
     if (!source && !pickedFile) bits.push("choose a file or a path to start");
+    if (noModels) bits.push("no Whisper model from the server: reload the page");
     if (autoTerms.length) bits.push(`${autoTerms.length} auto glossary term(s) applied on creation`);
     submitNote.textContent = bits.join(" · ");
   }
@@ -1075,6 +1111,14 @@ async function viewNewLecture(nav, params, projectId, token) {
       return;
     }
     nameInput.removeAttribute("aria-invalid");
+    /* Senza modello il server risponde 422 "Unsupported model: " e l'utente non
+       capisce cosa manca: meglio fermarsi qui, dicendolo. */
+    if (!opts.model.value) {
+      setStatus(fileStatus, "err", "No Whisper model to run: the server did not return the model list. Reload the page.");
+      fileStatus.classList.remove("hidden");
+      opts.model.focus();
+      return;
+    }
 
     submitBtn.disabled = true;
     submitBtn.textContent = "Queuing…";
@@ -2384,12 +2428,15 @@ async function viewAbout(nav, params, token) {
 async function init() {
   initTheme();
 
-  const health = await api("/health").catch(() => null);
-  if (health?.hardware) {
-    // I modelli sono definiti dal backend: la UI non li duplica a mano.
-    const res = await api("/models");
-    MODELS.push(...res.models);
-  }
+  // La navigazione si aggancia prima delle chiamate di rete: se l'utente cambia
+  // hash mentre la prima richiesta è in volo, il render non va perso.
+  window.addEventListener("hashchange", render);
+
+  /* L'elenco dei modelli non passa più da `/api/health`: un health fallito (o
+     lento) lasciava `MODELS` vuoto per tutta la vita della scheda, e il menu
+     "Whisper model" restava senza voci. Qui l'errore è solo un warning, la
+     vista "New lecture" ritenta con `loadModels()`. */
+  await loadModels().catch((err) => console.warn("elenco modelli non disponibile:", err));
 
   const globalSearch = $("#globalSearch");
   globalSearch.addEventListener("keydown", (e) => {
@@ -2403,7 +2450,6 @@ async function init() {
   });
   $$("header [data-nav]").forEach((b) => b.addEventListener("click", () => { location.hash = b.dataset.nav; }));
 
-  window.addEventListener("hashchange", render);
   await render();
   refreshJobBadge();
   setInterval(refreshJobBadge, 5000);

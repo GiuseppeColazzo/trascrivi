@@ -75,10 +75,32 @@ def _banner(url: str) -> None:
               .encode("ascii", "replace").decode("ascii"))
 
 
-def open_browser(url: str, delay: float = 1.2) -> None:
-    """Apre il browser senza bloccare l'avvio del server."""
+def wait_for_api(port: int, host: str = "127.0.0.1", timeout: float = 120.0,
+                 interval: float = 0.2) -> bool:
+    """
+    Aspetta che la porta accetti connessioni.
+
+    Il primo import dell'app (ctranslate2, torch, faster-whisper) dura qualche
+    secondo e uvicorn apre la porta solo dopo: un'attesa fissa di 1.2s faceva
+    caricare la pagina mentre l'API non rispondeva ancora, e la scheda restava
+    con l'elenco dei modelli vuoto (il frontend lo carica all'avvio).
+    """
+    probe = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(interval)
+            if s.connect_ex((probe, port)) == 0:
+                return True
+        time.sleep(interval)
+    return False
+
+
+def open_browser(url: str, port: int, host: str = "127.0.0.1") -> None:
+    """Apre il browser appena il server risponde, senza bloccare l'avvio."""
     def _open() -> None:
-        time.sleep(delay)
+        if not wait_for_api(port, host):
+            log.warning("il server non risponde: apro comunque il browser su %s", url)
         try:
             webbrowser.open(url)
         except Exception as exc:  # noqa: BLE001 - l'apertura del browser è un extra
@@ -109,7 +131,7 @@ def main(argv: list[str] | None = None) -> None:
     log.info("Trascrivi in ascolto su %s", url)
     _banner(url)
     if not args.no_browser:
-        open_browser(url)
+        open_browser(url, port, args.host)
 
     # La UI fa polling ogni 1,5 s: i log di accesso di uvicorn diventerebbero
     # centinaia di righe al minuto e nasconderebbero gli errori veri. Restano i

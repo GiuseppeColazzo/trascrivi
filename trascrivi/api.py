@@ -1013,6 +1013,24 @@ def create_app() -> FastAPI:
     def _value_error(_request, exc: ValueError):
         return JSONResponse({"detail": str(exc)}, status_code=422)
 
+    @app.middleware("http")
+    async def _fresh_assets(request, call_next):
+        """
+        Niente cache stantia nella SPA.
+
+        Le risposte `/api` sono dati vivi: `no-store` evita che il browser ne
+        riusi una copia. HTML/JS/CSS restano cacheabili ma con `no-cache`, cioè
+        con rivalidazione via ETag: un `app.js` modificato arriva subito, mentre
+        un file invariato costa un 304.
+        """
+        response = await call_next(request)
+        path = request.url.path
+        if path.startswith("/api"):
+            response.headers["Cache-Control"] = "no-store"
+        elif path == "/" or path.endswith((".html", ".js", ".css")):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     if config.WEB.exists():
         app.mount("/", StaticFiles(directory=str(config.WEB), html=True), name="web")
     return app

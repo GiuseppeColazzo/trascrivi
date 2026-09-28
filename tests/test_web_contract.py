@@ -381,6 +381,33 @@ def test_the_transcript_view_polls_running_jobs_and_stops_cleanly(js):
     assert "loadSummaries()" in tick, "il documento pronto deve comparire da solo"
 
 
+def test_the_model_list_does_not_depend_on_the_first_health_call(js):
+    """
+    Regressione: l'elenco dei modelli si caricava una volta sola in `init()`,
+    dentro `if (health?.hardware)`, con l'errore inghiottito da
+    `.catch(() => null)`. Se la prima `/api/health` non rispondeva — succede
+    quando la pagina si carica mentre il server sta ancora importando
+    torch/ctranslate2 — `MODELS` restava vuoto per tutta la vita della scheda:
+    il menu "Whisper model" senza voci e il job inviato con `model=""`, cioè il
+    422 `Unsupported model: ` senza indizi su cosa mancasse.
+
+    Qui si blocca la dipendenza: l'elenco si carica da `/api/models` e la vista
+    che disegna il menu se lo procura da sé.
+    """
+    assert "function loadModels(" in js
+    assert 'api("/models")' in js
+    # L'avvio non deve più condizionare i modelli all'health.
+    init = _function_body(js, "init")
+    assert "loadModels()" in init
+    assert "health?.hardware" not in init
+
+    view = _function_body(js, "viewNewLecture")
+    assert "loadModels()" in view, "la vista deve procurarsi l'elenco da sé"
+    assert "MODELS.map(" not in view, "il menu non deve leggere la globale: può essere vuota"
+    # ...e un menu vuoto non deve poter arrivare al POST del job.
+    assert "if (!opts.model.value)" in view
+
+
 def test_stylesheet_defines_both_themes():
     css = (config.WEB / "style.css").read_text(encoding="utf-8")
     assert ":root" in css
