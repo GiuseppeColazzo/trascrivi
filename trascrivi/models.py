@@ -122,6 +122,27 @@ def supported_formats() -> list[str]:
     return sorted(SUPPORTED_FORMATS)
 
 
+def english_only_models() -> list[str]:
+    """Modelli che funzionano solo in inglese (`distil-*`, `*.en`)."""
+    return [m for m in MODELS if is_english_only(m)]
+
+
+def languages() -> list[str]:
+    """
+    Codici lingua accettati dal motore, in ordine alfabetico.
+
+    È la tabella interna del tokenizer di faster-whisper (ISO 639-1, 100 voci):
+    è l'unica disponibile nella libreria, e serve alla UI per popolare il menu
+    della lingua senza inventarsi un elenco. Se un domani cambiasse nome, il
+    menu resta con i due codici che contano davvero invece di rompersi.
+    """
+    try:
+        from faster_whisper.tokenizer import _LANGUAGE_CODES
+    except ImportError:  # pragma: no cover - dipende dalla versione della libreria
+        return ["en", "it"]
+    return list(_LANGUAGE_CODES)
+
+
 def resolve_options(model: str, language: str, device: str,
                     compute_type: str) -> tuple[str, list[str]]:
     """
@@ -151,5 +172,6 @@ def resolve_options(model: str, language: str, device: str,
 # `probe_media` è ri-esportata: l'API la usa per validare un path prima del job.
 __all__ = [
     "get_model", "loaded_models", "unload_all", "hardware_info",
-    "supported_formats", "resolve_options", "probe_media", "MODELS", "MAX_CACHED",
+    "supported_formats", "english_only_models", "languages",
+    "resolve_options", "probe_media", "MODELS", "MAX_CACHED",
 ]

@@ -14,12 +14,21 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
    server sta ancora partendo — la vista che ne ha bisogno la ritenta, invece di
    disegnare un menu vuoto che manda il job con `model=""`. */
 const MODELS = [];
+/* Cosa sanno fare i modelli, sempre dal backend: `ENGLISH_ONLY` sono quelli che
+   il motore rifiuta con una lingua diversa dall'inglese, `LANGUAGES` i codici
+   ISO che accetta. La UI non li elenca a mano. */
+const ENGLISH_ONLY = new Set();
+const LANGUAGES = [];
 let modelsPromise = null;
 
 function loadModels() {
   if (!modelsPromise) {
     modelsPromise = api("/models").then((res) => {
       MODELS.splice(0, MODELS.length, ...(Array.isArray(res?.models) ? res.models : []));
+      ENGLISH_ONLY.clear();
+      (Array.isArray(res?.english_only) ? res.english_only : []).forEach((m) => ENGLISH_ONLY.add(m));
+      LANGUAGES.splice(0, LANGUAGES.length,
+        ...(Array.isArray(res?.languages) && res.languages.length ? res.languages : ["en", "it"]));
       return MODELS;
     });
     // Il rifiuto va marcato come gestito (altrimenti è un unhandled rejection) e
@@ -526,6 +535,173 @@ function popupMenu(label, items, { align = "right" } = {}) {
   return wrap;
 }
 
+/* ── Menu con bandiere (modello e lingua) ────────────────────────────────── */
+/* `<select>` non può contenere immagini — le sue voci sono solo testo — e su
+   Windows le emoji-bandiera non esistono (🇮🇹 si legge "IT"): per mostrare
+   davvero le bandiere il menu è fatto in casa. Stesso schema di `popupMenu`:
+   trigger + lista, un solo menu aperto per volta, chiusura al click fuori, Esc
+   e frecce. Il valore si legge con `.value`, come da un `<select>`. */
+const FLAGS = {
+  it: `<rect width="21" height="15" fill="#fff"></rect>
+       <rect width="7" height="15" fill="#009246"></rect>
+       <rect x="14" width="7" height="15" fill="#ce2b37"></rect>`,
+  /* Metà bandiera britannica e metà americana, ognuna compressa in mezza
+     larghezza: è l'inglese dei due paesi che lo parlano. */
+  en: `<rect width="10.5" height="15" fill="#012169"></rect>
+       <path d="M0 0 10.5 15M10.5 0 0 15" stroke="#fff" stroke-width="3"></path>
+       <path d="M0 0 10.5 15M10.5 0 0 15" stroke="#c8102e" stroke-width="1.5"></path>
+       <path d="M5.25 0v15M0 7.5h10.5" stroke="#fff" stroke-width="4.6"></path>
+       <path d="M5.25 0v15M0 7.5h10.5" stroke="#c8102e" stroke-width="2.4"></path>
+       <rect x="10.5" width="10.5" height="15" fill="#fff"></rect>
+       <g fill="#b22234">
+         <rect x="10.5" y="0" width="10.5" height="1.16"></rect>
+         <rect x="10.5" y="2.31" width="10.5" height="1.16"></rect>
+         <rect x="10.5" y="4.62" width="10.5" height="1.16"></rect>
+         <rect x="10.5" y="6.92" width="10.5" height="1.16"></rect>
+         <rect x="10.5" y="9.23" width="10.5" height="1.16"></rect>
+         <rect x="10.5" y="11.54" width="10.5" height="1.16"></rect>
+         <rect x="10.5" y="13.85" width="10.5" height="1.16"></rect>
+       </g>
+       <rect x="10.5" width="5.2" height="8.1" fill="#3c3b6e"></rect>
+       <rect x="10.2" width="0.6" height="15" fill="#fff" opacity="0.8"></rect>`,
+  /* Per "un centinaio di lingue" non esiste una bandiera: il mappamondo. */
+  globe: `<circle cx="10.5" cy="7.5" r="6.1" fill="none" stroke="currentColor" stroke-width="1.3"></circle>
+          <ellipse cx="10.5" cy="7.5" rx="2.7" ry="6.1" fill="none" stroke="currentColor" stroke-width="1.05"></ellipse>
+          <path d="M4.6 5.5h11.8M4.6 9.5h11.8" fill="none" stroke="currentColor" stroke-width="1.05"></path>`,
+};
+
+const flagIcon = (kind) => {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 21 15");
+  svg.setAttribute("class", "fs-flag");
+  svg.setAttribute("aria-hidden", "true");
+  svg.innerHTML = FLAGS[kind] || FLAGS.globe;
+  return svg;
+};
+
+function flagSelect({ id, options, value, invalid = false }) {
+  let current = value || (options[0] ? options[0].value : "");
+  // Un valore fuori lista (una lingua scritta a mano in passato) non deve
+  // sparire: si aggiunge in cima con il suo codice.
+  if (current && !options.some((o) => o.value === current)) {
+    options = [{ value: current, label: String(current).toUpperCase() }, ...options];
+  }
+
+  const labelOf = (opt) => el("span", { class: "fs-label" }, opt.label);
+  const iconsOf = (opt) => el("span", { class: "fs-icons" },
+    (opt.flags || []).map(flagIcon),
+    opt.chip ? el("span", { class: "fs-chip" }, opt.chip) : null);
+
+  const trigger = el("button", {
+    type: "button", id, class: "fs-trigger", "aria-haspopup": "true",
+    "aria-expanded": "false", "aria-invalid": invalid ? "true" : null,
+  });
+  const list = el("div", { class: "fs-menu", role: "menu", hidden: "hidden" });
+  const wrap = el("div", { class: "fs", "data-open": "false" }, trigger, list);
+  const rows = new Map();
+
+  const paint = () => {
+    const opt = options.find((o) => o.value === current) || options[0];
+    setChildren(trigger, labelOf(opt), iconsOf(opt), icon("chevron", "fs-caret"));
+    if (opt.hint) trigger.setAttribute("title", opt.hint);
+    else trigger.removeAttribute("title");
+  };
+
+  const close = () => {
+    list.hidden = true;
+    wrap.dataset.open = "false";
+    trigger.setAttribute("aria-expanded", "false");
+  };
+
+  const choose = (next) => {
+    current = next;
+    rows.forEach((btn, key) => btn.setAttribute("aria-checked", String(key === current)));
+    paint();
+    close();
+    trigger.focus();
+  };
+
+  options.forEach((opt) => {
+    if (opt.group) { list.append(el("div", { class: "fs-group" }, opt.group)); return; }
+    const btn = el("button", {
+      type: "button", role: "menuitemradio", class: "fs-item", title: opt.hint || null,
+      "aria-checked": String(opt.value === current),
+      onclick: () => choose(opt.value),
+    }, labelOf(opt), iconsOf(opt));
+    rows.set(opt.value, btn);
+    list.append(btn);
+  });
+
+  const open = (step) => {
+    // Un solo menu aperto per volta, come per `popupMenu`.
+    $$(".fs[data-open='true'], .menu[data-open='true'], .theme-menu[data-open='true']")
+      .forEach((other) => { if (other !== wrap) $("button", other)?.click(); });
+    list.hidden = false;
+    wrap.dataset.open = "true";
+    trigger.setAttribute("aria-expanded", "true");
+    const buttons = [...rows.values()];
+    if (!buttons.length) return;
+    const checked = rows.get(current);
+    (step < 0 && !checked ? buttons[buttons.length - 1] : checked || buttons[0]).focus();
+  };
+
+  trigger.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (list.hidden) open(1); else close();
+  });
+
+  wrap.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { close(); trigger.focus(); return; }
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    e.preventDefault();
+    const buttons = [...rows.values()];
+    if (!buttons.length) return;
+    if (list.hidden) { open(e.key === "ArrowDown" ? 1 : -1); return; }
+    const step = e.key === "ArrowDown" ? 1 : -1;
+    const at = buttons.indexOf(document.activeElement);
+    buttons[(at + step + buttons.length) % buttons.length].focus();
+  });
+
+  const onDocClick = (e) => { if (!list.hidden && !wrap.contains(e.target)) close(); };
+  document.addEventListener("click", onDocClick);
+  // Un listener su document per ogni menu: senza registrarsi qui, ogni
+  // navigazione ne lascia uno dietro.
+  onViewTeardown(() => document.removeEventListener("click", onDocClick));
+
+  paint();
+  return {
+    el: wrap,
+    get value() { return current; },
+    focus: () => trigger.focus(),
+  };
+}
+
+/* Le lingue di un modello in una riga: solo-inglese → mezza bandiera
+   britannica/americana; multilingue → mappamondo, Italia e Inghilterra (tutti i
+   modelli conoscono l'inglese). I fatti arrivano da `/api/models`. */
+function modelOptions(names, englishOnly) {
+  const onlyEn = new Set(englishOnly || []);
+  return names.map((name) => (onlyEn.has(name)
+    ? { value: name, label: name, flags: ["en"], hint: `${name}: English only` }
+    : { value: name, label: name, flags: ["globe", "it", "en"],
+        hint: `${name}: multilingual, Italian included` }));
+}
+
+/* Il menu della lingua: i tre casi di tutti i giorni con la bandiera, poi tutti
+   i codici che il motore accetta — una lingua non deve sparire solo perché non
+   ha una bandiera disegnata. */
+function languageOptions(codes) {
+  const rest = (codes && codes.length ? codes : ["en", "it"])
+    .filter((code) => code !== "en" && code !== "it");
+  return [
+    { value: "auto", label: "Auto (detect)", flags: ["globe"], hint: "The model detects the language" },
+    { value: "en", label: "English", flags: ["en"], hint: "English" },
+    { value: "it", label: "Italiano", flags: ["it"], hint: "Italiano" },
+    { group: "All languages (ISO code)" },
+    ...rest.map((code) => ({ value: code, label: code.toUpperCase() })),
+  ];
+}
+
 const EXPORTS = [
   { format: "txt", label: "Plain text", meta: ".txt" },
   { format: "md", label: "Markdown", meta: ".md" },
@@ -986,11 +1162,12 @@ async function viewNewLecture(nav, params, projectId, token) {
   }
 
   const opts = {
-    // Un `<select>` senza opzioni non è un menu: `noModels` lo dice all'utente e
+    // Un menu senza voci non è un menu: `noModels` lo dice all'utente e
     // `submit()` si ferma prima di mandare un modello vuoto al server.
-    model: el("select", { id: "optModel", "aria-invalid": noModels ? "true" : null },
-      modelNames.map((m) => el("option", { value: m, selected: m === settings.default_model ? "selected" : null }, m))),
-    language: el("input", { id: "optLang", value: settings.default_language || "en" }),
+    model: flagSelect({ id: "optModel", invalid: noModels,
+      options: modelOptions(modelNames, ENGLISH_ONLY), value: settings.default_model }),
+    language: flagSelect({ id: "optLang",
+      options: languageOptions(LANGUAGES), value: settings.default_language || "en" }),
     device: el("select", { id: "optDevice" },
       ["auto", "cuda", "cpu"].map((d) => el("option", { value: d, selected: d === (settings.default_device || "auto") ? "selected" : null }, d))),
     compute: el("select", { id: "optCompute" },
@@ -1030,8 +1207,8 @@ async function viewNewLecture(nav, params, projectId, token) {
       el("div", { class: "field" }, el("label", { for: "srcDesc" }, "Description (optional)"), descInput)),
     el("div", { class: "card" }, el("h2", {}, "3 - Transcription options"),
       el("div", { class: "row" },
-        el("div", { class: "grow field" }, el("label", { for: "optModel" }, "Whisper model"), opts.model),
-        el("div", { class: "grow field" }, el("label", { for: "optLang" }, "Language (or “auto”)"), opts.language)),
+        el("div", { class: "grow field" }, el("label", { for: "optModel" }, "Whisper model"), opts.model.el),
+        el("div", { class: "grow field" }, el("label", { for: "optLang" }, "Language"), opts.language.el)),
       modelNotice,
       el("div", { class: "row" },
         el("div", { class: "grow field" }, el("label", { for: "optDevice" }, "Device"), opts.device),
@@ -1984,9 +2161,23 @@ function highlight(text, query) {
    Impostazioni
    ========================================================================== */
 async function viewSettings(nav, params, token) {
-  const [{ settings, disk }, { providers }, { models, cached }] = await Promise.all([
+  const [{ settings, disk }, { providers }, modelsRes] = await Promise.all([
     api("/settings"), api("/providers"), api("/models"),
   ]);
+  const modelNames = modelsRes.models || [];
+  const cached = modelsRes.cached || [];
+
+  /* Stessi menu della pagina "New lecture": le bandiere dicono cosa sa fare
+     ogni modello, e il valore si legge dal componente (non da byId: il nodo è
+     un bottone, non un <select>). */
+  const modelPick = flagSelect({
+    id: "sModel", options: modelOptions(modelNames, modelsRes.english_only),
+    value: settings.default_model,
+  });
+  const langPick = flagSelect({
+    id: "sLang", options: languageOptions(modelsRes.languages),
+    value: settings.default_language,
+  });
 
   const field = (label, id, value, type = "text") => el("div", { class: "field" },
     el("label", { for: id }, label), el("input", { id, type, value: value ?? "" }));
@@ -1995,8 +2186,8 @@ async function viewSettings(nav, params, token) {
     e.preventDefault();
     try {
       await api("/settings", { method: "PUT", body: {
-        default_model: byId("sModel").value,
-        default_language: byId("sLang").value,
+        default_model: modelPick.value,
+        default_language: langPick.value,
         default_device: byId("sDevice").value,
         default_compute_type: byId("sCompute").value,
         default_provider_id: Number(byId("sProvider").value) || null,
@@ -2012,10 +2203,8 @@ async function viewSettings(nav, params, token) {
   } },
     el("div", { class: "card" }, el("h2", {}, "Transcription defaults"),
       el("div", { class: "row" },
-        el("div", { class: "grow field" }, el("label", { for: "sModel" }, "Model"),
-          el("select", { id: "sModel" }, models.map((m) => el("option", { value: m, selected: m === settings.default_model ? "selected" : null }, m)))),
-        el("div", { class: "grow field" }, el("label", { for: "sLang" }, "Language"),
-          el("input", { id: "sLang", value: settings.default_language }))),
+        el("div", { class: "grow field" }, el("label", { for: "sModel" }, "Model"), modelPick.el),
+        el("div", { class: "grow field" }, el("label", { for: "sLang" }, "Language"), langPick.el)),
       el("div", { class: "row" },
         el("div", { class: "grow field" }, el("label", { for: "sDevice" }, "Device"),
           el("select", { id: "sDevice" }, ["auto", "cuda", "cpu"].map((d) => el("option", { value: d, selected: d === settings.default_device ? "selected" : null }, d)))),

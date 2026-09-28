@@ -904,6 +904,114 @@ button.tab[aria-selected="true"] {
 }
 .menu-list .menu-sep { height: 1px; background: var(--line-soft); margin: 5px 4px; }
 
+/* ── 8c. Menu a tendina con bandiere (modello, lingua) ──────────────────── */
+/* Un `<select>` non può contenere immagini e su Windows le emoji-bandiera non
+   esistono: qui il menu è fatto in casa, con lo stesso vestito di un campo. Le
+   bandiere stanno a destra, allineate da `margin-left: auto`. */
+.fs { position: relative; }
+
+.fs-trigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 36px;
+  padding: 8px 11px;
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+  text-align: left;
+  justify-content: flex-start;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.fs-trigger:hover:not(:disabled) { border-color: var(--line-2); background: var(--surface-2); }
+.fs[data-open="true"] .fs-trigger,
+.fs-trigger:focus-visible {
+  border-color: var(--accent);
+  background: var(--surface-3);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  outline: none;
+}
+.fs-trigger[aria-invalid="true"] { border-color: var(--danger); }
+
+.fs-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fs-icons { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; }
+.fs-flag {
+  width: 20px;
+  height: 14px;
+  flex: 0 0 auto;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px var(--line-2);
+}
+.fs-caret { width: 10px; height: 10px; flex: 0 0 auto; color: var(--text-3); }
+.fs-chip {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  color: var(--text-2);
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+}
+
+.fs-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: var(--z-menu, 50);
+  max-height: 286px;
+  overflow-y: auto;
+  padding: 5px;
+  background: var(--surface);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-card);
+  box-shadow: var(--elev-2);
+  animation: menuIn 160ms var(--ease) both;
+}
+.fs-menu[hidden] { display: none; }
+
+.fs-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 0 9px;
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+  justify-content: flex-start;
+  text-align: left;
+  color: var(--text-2);
+  background: transparent;
+  border-color: transparent;
+}
+.fs-item:hover:not(:disabled),
+.fs-item:focus-visible {
+  color: var(--text);
+  background: var(--surface-2);
+  border-color: transparent;
+  outline: none;
+}
+.fs-item[aria-checked="true"] { color: var(--text); background: var(--accent-soft); }
+
+.fs-group {
+  padding: 8px 9px 4px;
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
 /* ── 9. Moduli ──────────────────────────────────────────────────────────── */
 label {
   display: block;

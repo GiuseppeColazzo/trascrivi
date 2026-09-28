@@ -408,6 +408,65 @@ def test_the_model_list_does_not_depend_on_the_first_health_call(js):
     assert "if (!opts.model.value)" in view
 
 
+def test_the_model_and_language_menus_show_flags_from_the_backend(js):
+    """
+    I due menu (modello e lingua) mostrano le bandiere: solo-inglese → mezza
+    bandiera britannica/americana, multilingue → mappamondo, Italia e
+    Inghilterra; la lingua ha auto, English e Italiano in cima.
+
+    I fatti arrivano da `/api/models` (`english_only`, `languages`): la UI non
+    se li inventa. E il controllo non può tornare a un `<select>` nativo: le sue
+    voci sono solo testo, quindi non possono contenere un'immagine — e su
+    Windows le emoji-bandiera non esistono (🇮🇹 si legge "IT"), per questo il
+    menu è fatto in casa.
+    """
+    assert "function flagSelect(" in js
+    assert "english_only" in js and "languages" in js
+
+    flags = js[js.index("const FLAGS = {"):]
+    flags = flags[:flags.index("\n};")]
+    for kind in ("it:", "en:", "globe:"):
+        assert kind in flags, f"manca la bandiera {kind}"
+
+    assert "function modelOptions(" in js and "function languageOptions(" in js
+    assert '"auto"' in js and '"it"' in js and '"en"' in js
+
+    view = _function_body(js, "viewNewLecture")
+    assert "modelOptions(modelNames, ENGLISH_ONLY)" in view
+    assert "languageOptions(LANGUAGES)" in view
+    # Il modello e la lingua non sono più <select>/<input> nativi.
+    assert 'el("select", { id: "optModel"' not in js
+    assert 'el("input", { id: "optLang"' not in js
+
+    settings = _function_body(js, "viewSettings")
+    assert "modelOptions(" in settings and "languageOptions(" in settings
+    # Il valore si legge dal componente: il nodo è un bottone, non un campo.
+    assert 'byId("sModel")' not in settings and 'byId("sLang")' not in settings
+
+
+def test_the_flag_icons_are_well_formed_and_inside_their_viewbox(js):
+    """
+    Una bandiera malformata (un tag non chiuso, una coordinata fuori dal
+    viewBox) non fa fallire niente: si vede solo a pagina aperta, come un
+    rettangolo vuoto dentro il menu. Qui si controlla il disegno: XML valido e
+    numeri dentro il viewBox 21×15.
+    """
+    import xml.etree.ElementTree as ET
+
+    flags = js[js.index("const FLAGS = {"):]
+    flags = flags[:flags.index("\n};")]
+    drawn = re.findall(r"`([^`]+)`", flags)
+    assert len(drawn) == 3, f"attese 3 bandiere (ita, ing, mondo), trovate {len(drawn)}"
+
+    for markup in drawn:
+        ET.fromstring(f"<svg>{markup}</svg>")  # solleva se il markup non è XML valido
+        # I colori contengono cifre (`#012169`): via prima di leggere i numeri.
+        geometry = re.sub(r"#[0-9a-fA-F]{3,8}", "", markup)
+        numbers = [float(n) for n in re.findall(r"-?\d+(?:\.\d+)?", geometry)]
+        assert numbers, markup
+        assert all(0 <= n <= 21 for n in numbers), f"fuori dal viewBox: {markup}"
+
+
 def test_stylesheet_defines_both_themes():
     css = (config.WEB / "style.css").read_text(encoding="utf-8")
     assert ":root" in css

@@ -71,7 +71,8 @@ const segments = [
 
 const ROUTES = {
   "/health": { version: "0.9.3", hardware: { cuda_devices: 1, gpu_name: "RTX 4070", vram_free_gb: 9.4, cpu_count: 16, cached_models: [{ model: "distil-large-v3", device: "cuda" }] }, providers: [{ id: 1, name: "OpenRouter", enabled: true, model: "qwen2.5-72b" }] },
-  "/models": { models: ["distil-large-v3", "large-v3"], cached: [{ model: "distil-large-v3", device: "cuda" }] },
+  "/models": { models: ["distil-large-v3", "large-v3"], cached: [{ model: "distil-large-v3", device: "cuda" }],
+    english_only: ["distil-large-v3"], languages: ["de", "en", "fr", "it"] },
   "/projects": { projects: [
     { id: 1, name: "Distributed systems", code: "DS-2025", color: "#ff4a17", description: "Lectures and labs, second semester.", n_transcripts: 3, updated_at: Date.now() / 1000 },
     { id: 2, name: "Signal processing", code: "", color: "javascript:alert(1)", description: "", n_transcripts: 0, updated_at: Date.now() / 1000 - 86400 },
@@ -345,6 +346,51 @@ for (let i = 0; i < 5; i++) {
 const after = dom.listeners.filter((l) => l.type === "keydown" && l.target === doc).length;
 console.log(`\ndocument keydown listeners: with transcript view=${during}, after 5 round-trips=${after}`);
 assert("no keydown listener leak", after <= during, `${during} -> ${after}`);
+
+/* ── I due menu con le bandiere (modello e lingua) ───────────────────────── */
+function fsMenu(id) {
+  const trigger = doc.getElementById(id);
+  const wrap = trigger.parentNode;
+  return {
+    trigger, wrap,
+    rows: () => wrap.querySelectorAll(".fs-item"),
+    flags: (node) => node.querySelectorAll(".fs-flag").length,
+    open: () => trigger.dispatch("click"),
+  };
+}
+
+location.hash = "#/p/1/new";
+await doc.dispatch("hashchange");
+await settle();
+
+const modelMenu = fsMenu("optModel");
+assert("model control is a button, not a <select>", modelMenu.trigger.tagName === "BUTTON",
+  modelMenu.trigger.tagName);
+modelMenu.open();
+const flagCount = {};
+for (const row of modelMenu.rows()) flagCount[row.textContent.trim()] = modelMenu.flags(row);
+assert("English-only model: one UK/USA flag", flagCount["distil-large-v3"] === 1, JSON.stringify(flagCount));
+assert("Multilingual model: globe + Italy + UK/USA", flagCount["large-v3"] === 3, JSON.stringify(flagCount));
+
+const choose = (menu, label) => menu.rows().find((r) => r.textContent.trim() === label).dispatch("click");
+choose(modelMenu, "large-v3");
+assert("the chosen model lands in the trigger", modelMenu.trigger.textContent.includes("large-v3"));
+assert("the trigger carries the model flags", modelMenu.flags(modelMenu.trigger) === 3);
+assert("the menu closes after choosing", modelMenu.wrap.getAttribute("data-open") === "false",
+  String(modelMenu.wrap.getAttribute("data-open")));
+
+const langMenu = fsMenu("optLang");
+langMenu.open();
+const langNames = langMenu.rows().map((r) => r.textContent.trim());
+assert("language menu: auto, English, Italiano first",
+  langNames.slice(0, 3).join(" | ") === "Auto (detect) | English | Italiano", langNames.slice(0, 4).join(" | "));
+assert("language flags: globe, UK/USA, Italy",
+  langMenu.flags(langMenu.rows()[0]) === 1 && langMenu.flags(langMenu.rows()[1]) === 1
+  && langMenu.flags(langMenu.rows()[2]) === 1);
+assert("language menu keeps every other code", langNames.includes("DE") && langNames.includes("FR"),
+  langNames.slice(-4).join(","));
+choose(langMenu, "Italiano");
+assert("Italiano lands in the trigger", langMenu.trigger.textContent.includes("Italiano"));
 
 console.log(`\n${failures.length ? `${failures.length} FAILURE(S)` : "all checks passed"}`);
 process.exit(failures.length ? 1 : 0);

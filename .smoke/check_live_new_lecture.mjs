@@ -99,16 +99,33 @@ await sleep(200);
 console.log("--- chiamate API viste dal frontend ---");
 for (const line of log) console.log("   ", line);
 
-const sel = doc.getElementById("optModel");
 const view = doc.getElementById("view");
-console.log("\n--- #optModel ---");
-if (!sel) {
-  console.log("   select assente");
+console.log("\n--- menu dei modelli (bandiere comprese) ---");
+const model = doc.getElementById("optModel");
+if (!model) {
+  console.log("   controllo assente");
 } else {
-  console.log(`   opzioni: ${sel.children.length}`);
-  console.log(`   valore selezionato: ${JSON.stringify(sel.value ?? sel.attrs.value ?? null)}`);
-  console.log("   prime 5:", sel.children.slice(0, 5).map((o) => o.textContent).join(", "));
+  const wrap = model.parentNode;
+  model.dispatch("click");
+  const rows = wrap.querySelectorAll(".fs-item");
+  console.log(`   voci: ${rows.length}`);
+  for (const row of rows.slice(0, 4).concat(rows.slice(-2))) {
+    const flags = row.querySelectorAll(".fs-flag").length;
+    console.log(`   ${row.textContent.trim().padEnd(16)} bandiere=${flags} checked=${row.getAttribute("aria-checked")}`);
+  }
+  rows.find((r) => r.textContent.includes("large-v3"))?.dispatch("click");
 }
-console.log("\n--- testo vista (primi 300 char) ---");
-console.log("   " + view.textContent.replace(/\s+/g, " ").trim().slice(0, 300));
+
+console.log("\n--- menu della lingua ---");
+const lang = doc.getElementById("optLang");
+const langWrap = lang.parentNode;
+lang.dispatch("click");
+const langRows = langWrap.querySelectorAll(".fs-item");
+console.log(`   voci: ${langRows.length} (la prima è la scelta corrente)`);
+console.log("   prime 4:", langRows.slice(0, 4).map((r) => r.textContent.trim()).join(" | "));
+console.log("   ultime 3:", langRows.slice(-3).map((r) => r.textContent.trim()).join(" | "));
+console.log(`   gruppi: ${langWrap.querySelectorAll(".fs-group").map((g) => g.textContent).join(", ")}`);
+
+console.log("\n--- testo vista (primi 200 char) ---");
+console.log("   " + view.textContent.replace(/\s+/g, " ").trim().slice(0, 200));
 process.exit(0);

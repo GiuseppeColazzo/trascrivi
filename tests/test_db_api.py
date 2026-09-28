@@ -359,6 +359,27 @@ def test_create_job_validates_model_and_language(client, tmp_path):
     assert db.list_jobs() == []
 
 
+def test_models_endpoint_tells_the_ui_which_languages_each_model_knows(client):
+    """
+    Da qui la UI prende le bandiere dei menu: quali modelli sono solo-inglese e
+    quali codici lingua esistono. Se la risposta cambia forma i due menu della
+    lingua si svuotano, e nessun controllo di sintassi se ne accorgerebbe.
+    """
+    from trascrivi_audio import is_english_only
+
+    body = client.get("/api/models").json()
+
+    assert "large-v3" in body["models"] and "distil-large-v3" in body["models"]
+    # Solo-inglese = esattamente i modelli che il motore rifiuta con un'altra
+    # lingua: la regola resta una sola, in `is_english_only`.
+    assert set(body["english_only"]) == {m for m in body["models"] if is_english_only(m)}
+    assert "distil-large-v3" in body["english_only"]
+    assert "large-v3" not in body["english_only"]
+    # Il menu della lingua: en e it ci sono sempre, con un centinaio di codici.
+    assert {"en", "it"} <= set(body["languages"])
+    assert len(body["languages"]) > 50
+
+
 def test_api_transcript_list_and_get(client, make_transcript):
     tid = make_transcript()
 

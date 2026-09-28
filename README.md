@@ -382,7 +382,7 @@ persisted in `localStorage`.
 |---|---|---|
 | **Library** | `#/` | All courses with their transcript counts. Create, rename and delete a course. The header search box runs a full-text query across every transcript and links each hit with `#/t/<id>?q=word` so the matching segments are highlighted. |
 | **Course** | `#/p/<id>` | The lectures of one course, with *New lecture* and per-transcript rename/move/delete. This is also where the **Course glossary** is edited, including the `auto` checkbox. |
-| **New lecture** | `#/p/<id>/new` | The two ways to add audio (drag & drop / file picker, or an absolute local path validated live through `/api/media/probe`) plus the full transcription form: model, language, device, compute type, beam size, VAD, word timestamps, initial prompt for course vocabulary, and the two optional LLM follow-ups — the correction agent and the summary, each with its own provider picker. |
+| **New lecture** | `#/p/<id>/new` | The two ways to add audio (drag & drop / file picker, or an absolute local path validated live through `/api/media/probe`) plus the full transcription form: model, language, device, compute type, beam size, VAD, word timestamps, initial prompt for course vocabulary, and the two optional LLM follow-ups — the correction agent and the summary, each with its own provider picker. The model and language menus carry flags (below). |
 | **Jobs** | `#/jobs` | Queue and history with progress bar, `x realtime` speed, ETA, and Cancel / Retry / Resume. The header badge shows the running count. |
 | **Transcript** | `#/t/<id>` | The registry entry: editor (one line = one segment, timestamps re-attached on save), **Segments** tab, **Proposals** tab with the agent's review and diff preview, **Summary** tab, and **Info** with revision history and exports. |
 | **Settings** | `#/settings` | Transcription defaults, agent chunk size, flush interval, summary defaults (style, output language, output token cap), backups to keep, default provider, disk usage (audio copies / data dir / free space), database backup, *Delete all audio copies*, *Unload models from RAM*, and the LLM provider configuration. |
@@ -391,8 +391,8 @@ persisted in `localStorage`.
 
 | Field | Default | Notes |
 |---|---|---|
-| Model | `distil-large-v3` | Any model the CLI supports |
-| Language | `en` | `en` or `auto` |
+| Model | `distil-large-v3` | Any model the CLI supports. The menu shows what each one knows: a half British/half American flag for the English-only models, a globe plus the Italian and English flags for the multilingual ones (which is what you need for Italian). |
+| Language | `en` | Menu with flags: `Auto (detect)`, `English`, `Italiano`, then every ISO code the engine accepts. An English-only model with a language other than `en` is rejected before the job starts. |
 | Device | `auto` | `auto`, `cuda`, `cpu` |
 | Compute type | `auto` | `auto`, `int8`, `int8_float16`, `float16`, `float32`, `bfloat16` |
 | Beam size | `5` | 1–20 |
@@ -562,7 +562,7 @@ The test suite is `pytest`-based and runs against the standard library plus the 
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-193 tests, a few seconds, no GPU, no network and no Whisper model: DB isolation is done by remapping the
+212 tests, a few seconds, no GPU, no network and no Whisper model: DB isolation is done by remapping the
 `data/` paths to a temporary directory, and the LLM provider is faked. What the suite covers:
 
 | File | What it locks down |
@@ -571,11 +571,11 @@ The test suite is `pytest`-based and runs against the standard library plus the 
 | `tests/test_resume.py` | `last_transcribed_seconds`, the 2 s resume margin, the English-only model rule |
 | `tests/test_corrections.py` | the edit-plan engine: exact and whitespace-tolerant matching, `ambiguous` / `unmatched` / `noop` / `too_large` / `duplicate` / `conflict`, per-segment targets, idempotency, glossary mode, chunking |
 | `tests/test_summary.py` | the summary: normalisation of the model's answer (a code fence around the whole document, an unexpected JSON object, an empty reply), the **word budget** (ratios, floor and ceiling, that the number reaches the prompt, that the output cap follows it, that the planning block is stripped), the course context reaching the prompt, cost accounting with cache hits split from misses, the whole job, the `/api/summaries` lifecycle, and the `deepseek-chat` → `deepseek-flash` migration |
-| `tests/test_db_api.py` | project/transcript/proposal/term CRUD, FTS5 staying in sync across updates and deletes, startup recovery of stale jobs, and the REST endpoints (including the 422 on an English-only model with a non-English language) |
+| `tests/test_db_api.py` | project/transcript/proposal/term CRUD, FTS5 staying in sync across updates and deletes, startup recovery of stale jobs, and the REST endpoints (including the 422 on an English-only model with a non-English language, and `/api/models` declaring which models are English-only and which language codes exist) |
 | `tests/test_llm_parse.py` | JSON extraction from fenced or prefixed model replies, chunk budgets, API-key encryption round trip |
-| `tests/test_engine_guards.py` | the three engine bugs found on real audio: `batch_size` on the plain `transcribe`, batched inference with a clip range, and the partial file that makes cancel/resume work |
+| `tests/test_engine_guards.py` | the four engine bugs found on real audio: `batch_size` on the plain `transcribe`, batched inference with a clip range, the partial file that makes cancel/resume work, and the model download that dies when the Hugging Face cache is not writable |
 | `tests/test_markdown_render.py` | the Markdown renderer, executed for real with node: headings, lists and their closing, nested bullets, tables, code blocks kept verbatim, inline formatting, and the two safety properties — model-written HTML is escaped, and no link is ever generated |
-| `tests/test_web_contract.py` | the frontend: JS syntax (`node --check`), every `byId` having a matching element, every `/api/...` path the UI calls existing in the OpenAPI schema — both literal `href`s **and** the `api(...)` wrapper — and every data name a view uses (`settings`, `providers`, `jobs`, …) being one it actually fetched |
+| `tests/test_web_contract.py` | the frontend: JS syntax (`node --check`), every `byId` having a matching element, every `/api/...` path the UI calls existing in the OpenAPI schema — both literal `href`s **and** the `api(...)` wrapper — every data name a view uses (`settings`, `providers`, `jobs`, …) being one it actually fetched, and the two flag menus (well-formed SVG flags inside their viewBox, fed by `/api/models` and not by a native `<select>`) |
 
 Synthetic fixtures are generated by `gen_testdata.py`, which writes "speech-like" audio with the same
 spectral and temporal structure as real speech (formants, syllables, pauses). It is not meant to

@@ -240,7 +240,20 @@ def _version() -> str:
 
 @router.get("/models")
 def list_models_endpoint() -> dict:
-    return {"models": MODELS, "cached": models.loaded_models()}
+    """
+    Modelli disponibili e cosa sanno fare.
+
+    `english_only` e `languages` esistono perché la UI disegni le bandiere
+    accanto ai modelli e il menu della lingua senza duplicare le regole del
+    motore: quali modelli sono solo-inglese lo sa `is_english_only`, e i codici
+    lingua li sa il tokenizer.
+    """
+    return {
+        "models": MODELS,
+        "cached": models.loaded_models(),
+        "english_only": models.english_only_models(),
+        "languages": models.languages(),
+    }
 
 
 @router.post("/models/unload")
