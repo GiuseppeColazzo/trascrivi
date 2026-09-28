@@ -19,6 +19,9 @@ data/
 # Cache
 .pipcache/
 .piptmp/
+# Modelli Whisper/HF scaricati quando la cache di sistema non è scrivibile
+# (vedi `hf_cache_dir` in trascrivi_audio.py): pesano GB, non si versionano.
+models/
 
 # Documentazione prodotta dalle ricerche web: materiale di lavoro, non parte del
 # progetto. Convenzione: <argomento>-<AAAA-MM-GG>.md nella radice; i README non

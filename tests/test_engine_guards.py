@@ -15,6 +15,7 @@ millisecondi e senza GPU.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -65,6 +66,37 @@ def fake_pipeline(monkeypatch):
 
 def _log() -> logging.Logger:
     return logging.getLogger("test-engine")
+
+
+def test_a_new_model_is_downloaded_where_we_can_write(tmp_path, monkeypatch):
+    """
+    Regressione: con la cache Hugging Face di sistema non scrivibile, il
+    download di un modello nuovo moriva a metà job con
+        PermissionError: [WinError 5] Accesso negato:
+        '...\\models--Systran--faster-whisper-large-v3'
+    I modelli già scaricati funzionavano, quindi il guasto si vedeva solo
+    chiedendo un modello nuovo (large-v3, l'unico multilingue decente per
+    l'italiano). Il ripiego è `models/hf` accanto al progetto.
+    """
+    monkeypatch.delenv("HF_HOME", raising=False)
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+
+    # Cache scrivibile: non si cambia niente e la sonda non resta in giro.
+    writable = tmp_path / "cache-utente"
+    assert engine.hf_cache_dir(writable) is None
+    assert (writable / ".trascrivi-write-probe").exists() is False
+
+    # Cache non scrivibile (qui: un file al posto della cartella) -> ripiego.
+    blocked = tmp_path / "non-una-cartella"
+    blocked.write_text("x", encoding="utf-8")
+    fallback = engine.hf_cache_dir(blocked)
+    assert fallback is not None
+    assert (fallback.name, fallback.parent.name) == ("hf", "models")
+    assert fallback.parent.parent == Path(engine.__file__).resolve().parent
+
+    # Una scelta esplicita dell'utente (o di .env) vince sempre.
+    monkeypatch.setenv("HF_HOME", str(tmp_path / "scelta-mia"))
+    assert engine.hf_cache_dir(blocked) is None
 
 
 def test_batch_size_is_not_forwarded_to_plain_transcribe(tmp_path, monkeypatch):

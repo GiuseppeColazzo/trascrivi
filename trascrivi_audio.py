@@ -64,6 +64,53 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
+def _writable_dir(path: Path) -> bool:
+    """True se in `path` si riesce davvero a scrivere (l'ACL da sola non basta a dirlo)."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".trascrivi-write-probe"
+        probe.touch()
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def hf_cache_dir(user_cache: Path | None = None) -> Path | None:
+    """
+    Cache Hugging Face da usare, o None se va bene quella di sistema.
+
+    huggingface_hub scarica in `%USERPROFILE%\\.cache\\huggingface`. Se quella
+    cartella non è scrivibile — permessi, antivirus, o un processo avviato
+    dentro un sandbox che limita le scritture al progetto — il download di un
+    modello nuovo muore a metà job con
+        PermissionError: [WinError 5] Accesso negato: '...\\models--Systran--faster-whisper-large-v3'
+    I modelli già in cache continuano a funzionare: si rompe solo il download,
+    cioè proprio quando serve un modello nuovo (large-v3 per l'italiano).
+    In quel caso i modelli nuovi vanno in `models/hf` accanto al progetto, che è
+    scrivibile da chi esegue lo script. `HF_HOME`/`HF_HUB_CACHE` esplicite in
+    ambiente (o in `.env`) vincono comunque: qui non si sovrascrive niente.
+    """
+    if os.environ.get("HF_HOME") or os.environ.get("HF_HUB_CACHE"):
+        return None
+    try:
+        cache = Path(user_cache) if user_cache is not None else Path.home() / ".cache" / "huggingface"
+    except (OSError, RuntimeError):  # Path.home() senza HOME/USERPROFILE
+        cache = None
+    if cache is not None and _writable_dir(cache):
+        return None
+    return Path(__file__).resolve().parent / "models" / "hf"
+
+
+# DEVE stare prima di importare faster_whisper: huggingface_hub legge HF_HOME
+# all'import, non al primo download.
+_HF_HOME_FALLBACK = hf_cache_dir()
+if _HF_HOME_FALLBACK is not None:
+    os.environ["HF_HOME"] = str(_HF_HOME_FALLBACK)
+    print(f"nota: la cache dei modelli di sistema non e' scrivibile, uso {_HF_HOME_FALLBACK}",
+          file=sys.stderr)
+
+
 def _register_cuda_dlls() -> bool:
     """
     Rende trovabili a ctranslate2 le DLL CUDA (cuBLAS / cuDNN) fornite da torch.
