@@ -601,6 +601,20 @@ main > .stack > .card:first-child { padding-bottom: 22px; }
 .hero .actions,
 .toolbar.trailing { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 
+/* Colonna di destra della testata: badge hardware sopra, comandi sotto. I
+   comandi non stanno accanto ai badge perché quelli occupano tutta la larghezza
+   e schiaccerebbero il bottone; e non fluttuano stretti a destra, ma prendono la
+   larghezza della riga dei badge: due blocchi allineati invece di un bottone
+   sperduto sotto un badge lungo. */
+.hero-side {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+.hero-side > .actions { display: block; }
+.hero-side > .actions > button { width: 100%; }
+
 .breadcrumb {
   display: flex;
   align-items: center;

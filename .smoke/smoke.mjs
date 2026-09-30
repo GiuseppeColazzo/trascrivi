@@ -416,6 +416,21 @@ await settle();
 const view = doc.getElementById("view");
 const dumpBtn = view.querySelectorAll("button").find((b) => b.textContent.includes("Dump"));
 assert("dump button on the library", !!dumpBtn);
+// L'etichetta si legge per intero: i puntini di sospensione nel testo ("Dump…")
+// sembravano un troncamento CSS e non lo erano.
+assert("dump button label is not cut short",
+  dumpBtn.textContent.trim() === "Dump to zip", JSON.stringify(dumpBtn.textContent));
+// L'icona deve portarsi le sue dimensioni: un SVG con il solo viewBox cade sul
+// default 300x150, e il bottone diventa una scatola alta con l'icona invisibile.
+// Era esattamente il caso, in due punti (qui e nel bottone del dialogo).
+assert("dump button has its own icon size",
+  dumpBtn.querySelectorAll("svg")[0]?.getAttribute("width") === "14",
+  String(dumpBtn.querySelectorAll("svg")[0]?.getAttribute("width")));
+// I comandi stanno sotto i badge hardware, non accanto: i badge occupano tutta
+// la larghezza e schiacciano il bottone.
+assert("dump button sits under the hardware badges",
+  dumpBtn.parentNode.classList.contains("actions")
+  && dumpBtn.parentNode.parentNode.classList.contains("hero-side"));
 dumpBtn.dispatch("click");
 await new Promise((r) => setTimeout(r, 20));
 
@@ -427,6 +442,8 @@ const lessons = dlg.querySelectorAll(".dump-lesson");
 const picks = (row) => row.querySelectorAll(".dump-pick input");
 const stateText = () => dlg.querySelectorAll(".dump-all .hint")[0].textContent;
 const downloadBtn = dlg.querySelectorAll("button").find((b) => b.textContent.includes("Download"));
+assert("download button has its own icon size",
+  downloadBtn.querySelectorAll("svg")[0]?.getAttribute("width") === "14");
 assert("dump lists one course and both lectures", lessons.length === 2, String(lessons.length));
 assert("one course heading", dlg.querySelectorAll(".dump-course-head").length === 1);
 assert("transcript and summary per lecture", picks(lessons[0]).length === 2);

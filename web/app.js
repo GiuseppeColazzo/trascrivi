@@ -439,6 +439,13 @@ const ICONS = {
 const icon = (name, cls = "") => {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 16 16");
+  /* Dimensioni proprie, non solo il viewBox: un SVG senza `width`/`height` cade
+     sul default 300x150 e dove nessuna regola CSS lo ridimensiona diventa una
+     scatola enorme con l'icona invisibile. Le regole per posizione (`.fs-caret`,
+     `.notice svg`, …) vincono comunque su questi attributi: qui c'è solo il
+     default per chi non ne ha una. */
+  svg.setAttribute("width", "14");
+  svg.setAttribute("height", "14");
   svg.setAttribute("aria-hidden", "true");
   if (cls) svg.setAttribute("class", cls);
   svg.innerHTML = ICONS[name] || "";
@@ -979,12 +986,13 @@ async function viewDashboard(nav, params, token) {
               projects.length
                 ? `${projects.length} course${projects.length === 1 ? "" : "s"} · ${totalTranscripts} transcript${totalTranscripts === 1 ? "" : "s"}. Audio is transcoded on this machine only.`
                 : "Create a course, drop a lecture recording into it, and follow the transcription in Jobs. Audio is transcoded on this machine only.")),
-          el("div", { class: "actions" },
-            el("button", { type: "button",
-              title: "Choose courses and lectures and download them as a zip",
-              disabled: totalTranscripts ? null : "disabled",
-              onclick: openDumpDialog }, icon("download"), "Dump…"),
-            hwBadges))),
+          el("div", { class: "hero-side" },
+            hwBadges,
+            el("div", { class: "actions" },
+              el("button", { type: "button",
+                title: "Choose courses and lectures and download them as a zip",
+                disabled: totalTranscripts ? null : "disabled",
+                onclick: openDumpDialog }, icon("download"), "Dump to zip"))))),
       searchResults,
       projects.length
         ? el("p", { class: "eyebrow" }, "Courses", el("span", { class: "count" }, String(projects.length)))
