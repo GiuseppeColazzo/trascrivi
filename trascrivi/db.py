@@ -617,15 +617,22 @@ def get_transcript(transcript_id: int) -> dict | None:
 
 
 def list_transcripts(project_id: int | None = None, limit: int = 200) -> list[dict]:
-    """Elenco leggero: senza testo né segmenti (le liste non ne hanno bisogno)."""
+    """
+    Elenco leggero: senza testo né segmenti (le liste non ne hanno bisogno).
+
+    `n_summaries` serve al dump: una lezione senza riassunto non deve offrire una
+    casella che non produrrebbe nessun file.
+    """
+    columns = ("id, project_id, title, description, language, model, duration, "
+               "LENGTH(text) AS length, "
+               "(SELECT COUNT(*) FROM summaries s WHERE s.transcript_id = transcripts.id) "
+               "AS n_summaries, created_at, updated_at")
     if project_id is None:
-        sql = ("SELECT id, project_id, title, description, language, model, duration, "
-               "LENGTH(text) AS length, created_at, updated_at FROM transcripts "
+        sql = (f"SELECT {columns} FROM transcripts "
                "ORDER BY updated_at DESC LIMIT ?")
         params: Sequence[Any] = (limit,)
     else:
-        sql = ("SELECT id, project_id, title, description, language, model, duration, "
-               "LENGTH(text) AS length, created_at, updated_at FROM transcripts "
+        sql = (f"SELECT {columns} FROM transcripts "
                "WHERE project_id = ? ORDER BY updated_at DESC LIMIT ?")
         params = (project_id, limit)
     return rows(sql, params)

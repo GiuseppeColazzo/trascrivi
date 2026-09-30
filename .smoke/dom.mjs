@@ -69,6 +69,14 @@ export function makeDom() {
     select() {}
     click() { this.dispatch("click"); }
     scrollIntoView() {}
+    /* I dialoghi nativi: `open` e l'evento `close` sono quello che il codice
+       reale usa (`showModal`, `close`, il listener che ripulisce il DOM). */
+    showModal() { this.open = true; this.dispatch("show"); }
+    close(value) {
+      this.open = false;
+      this.returnValue = value;
+      this.dispatch("close");
+    }
     querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
     querySelectorAll(sel) { return queryAll(this, sel); }
     get firstChild() { return this.children[0] || null; }

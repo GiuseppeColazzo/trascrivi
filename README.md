@@ -380,7 +380,7 @@ persisted in `localStorage`.
 
 | Screen | Route | What lives there |
 |---|---|---|
-| **Library** | `#/` | All courses with their transcript counts. Create, rename and delete a course. The header search box runs a full-text query across every transcript and links each hit with `#/t/<id>?q=word` so the matching segments are highlighted. |
+| **Library** | `#/` | All courses with their transcript counts. Create, rename and delete a course. **Dump** opens a picker — course → lecture, transcript and/or summary — and downloads the selection as a zip. The header search box runs a full-text query across every transcript and links each hit with `#/t/<id>?q=word` so the matching segments are highlighted. |
 | **Course** | `#/p/<id>` | The lectures of one course, with *New lecture* and per-transcript rename/move/delete. This is also where the **Course glossary** is edited, including the `auto` checkbox. |
 | **New lecture** | `#/p/<id>/new` | The two ways to add audio (drag & drop / file picker, or an absolute local path validated live through `/api/media/probe`) plus the full transcription form: model, language, device, compute type, beam size, VAD, word timestamps, initial prompt for course vocabulary, and the two optional LLM follow-ups — the correction agent and the summary, each with its own provider picker. The model and language menus carry flags (below). |
 | **Jobs** | `#/jobs` | Queue and history with progress bar, `x realtime` speed, ETA, and Cancel / Retry / Resume. The header badge shows the running count. |
@@ -445,6 +445,7 @@ Everything is mounted under `/api` and documented interactively at `/docs`.
 | **Jobs** | `POST /api/jobs` · `GET /api/jobs?status=&limit=` · `GET /api/jobs/{id}` · `POST /api/jobs/{id}/cancel` · `POST /api/jobs/{id}/retry` |
 | **Transcripts** | `GET /api/transcripts` · `GET /api/transcripts/{id}` · `PATCH /api/transcripts/{id}` (title, description, course, text, segments) · `DELETE /api/transcripts/{id}` |
 | **Export** | `GET /api/transcripts/{id}/export?format=txt\|md\|json\|segments` |
+| **Dump** | `POST /api/dump` — the chosen lectures as a zip, `<Course>/<Lecture>/transcript.md` and `summary.md` (latest summary). Built in memory, nothing is written to disk. |
 | **Correction agent** | `POST /api/transcripts/{id}/fix` · `GET /api/transcripts/{id}/proposals` · `POST /api/transcripts/{id}/proposals/accept` · `POST /api/transcripts/{id}/proposals/reject` · `POST /api/transcripts/{id}/proposals/preview` · `POST /api/transcripts/{id}/proposals/undo` |
 | **Summaries** | `POST /api/transcripts/{id}/summary` · `GET /api/transcripts/{id}/summaries` · `GET /api/summaries/{id}` · `PATCH /api/summaries/{id}` · `DELETE /api/summaries/{id}` · `GET /api/summaries/{id}/export?format=md\|txt\|json` |
 | **Course glossary** | `GET /api/terms?project_id=` · `POST /api/terms` · `DELETE /api/terms/{id}` |

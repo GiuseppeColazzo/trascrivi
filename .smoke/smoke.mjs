@@ -80,8 +80,8 @@ const ROUTES = {
   ] },
   "/projects/1": { id: 1, name: "Distributed systems", code: "DS-2025", description: "Lectures and labs.", color: "#ff4a17" },
   "/transcripts": { transcripts: [
-    { id: 7, title: "Week 3 — Kalman filters", description: "From the whiteboard session", duration: 4520, language: "en", model: "distil-large-v3", updated_at: Date.now() / 1000 },
-    { id: 8, title: "Week 4 — Consensus", duration: 3710, language: "it", model: "large-v3", updated_at: Date.now() / 1000 - 4000 },
+    { id: 7, project_id: 1, title: "Week 3 — Kalman filters", description: "From the whiteboard session", duration: 4520, language: "en", model: "distil-large-v3", n_summaries: 1, updated_at: Date.now() / 1000 },
+    { id: 8, project_id: 1, title: "Week 4 — Consensus", duration: 3710, language: "it", model: "large-v3", n_summaries: 0, updated_at: Date.now() / 1000 - 4000 },
   ] },
   "/terms": { terms: [{ id: 1, find: "kalmann", replace: "Kalman", auto: true }, { id: 2, find: "raft", replace: "Raft", auto: false }] },
   "/transcripts/7": { id: 7, title: "Week 3 — Kalman filters", project_id: 1, project_name: "Distributed systems",
@@ -160,8 +160,20 @@ const ROUTES = {
 
 
 
+/* Il dump è un POST che restituisce uno zip: lo stub tiene il corpo ricevuto e
+   risponde come farebbe FastAPI, così si verifica cosa parte davvero. */
+let dumpRequest = null;
 globalThis.fetch = async (url, opts = {}) => {
   const p = url.replace(/^\/api/, "").split("?")[0];
+  if (p === "/dump") {
+    dumpRequest = JSON.parse(opts.body);
+    return {
+      ok: true, status: 200,
+      headers: { get: (k) => (k.toLowerCase() === "content-disposition"
+        ? 'attachment; filename="trascrivi-dump-2026-09-24-1830.zip"' : null) },
+      blob: async () => new Blob([new Uint8Array([0x50, 0x4b, 0x03, 0x04])]),
+    };
+  }
   const body = ROUTES[p];
   if (body === undefined) return { ok: false, status: 404, text: async () => JSON.stringify({ detail: `no stub for ${p}` }) };
   return { ok: true, status: 200, text: async () => JSON.stringify(body) };
@@ -391,6 +403,51 @@ assert("language menu keeps every other code", langNames.includes("DE") && langN
   langNames.slice(-4).join(","));
 choose(langMenu, "Italiano");
 assert("Italiano lands in the trigger", langMenu.trigger.textContent.includes("Italiano"));
+
+/* ── Il dump: dall'albero alla richiesta ─────────────────────────────────── */
+/* La parte che può sbagliare in silenzio non è il disegno del dialogo ma la
+   traduzione delle caselle nel corpo del POST: una lezione senza riassunto non
+   deve produrre un `summary: true`, e deselezionare tutto deve spegnere il
+   bottone invece di mandare una richiesta vuota. */
+location.hash = "#/";
+await doc.dispatch("hashchange");
+await settle();
+
+const view = doc.getElementById("view");
+const dumpBtn = view.querySelectorAll("button").find((b) => b.textContent.includes("Dump"));
+assert("dump button on the library", !!dumpBtn);
+dumpBtn.dispatch("click");
+await new Promise((r) => setTimeout(r, 20));
+
+// Il body ha già i dialoghi di conferma e rinomina: qui serve il dump, non il
+// primo `<dialog>` che capita.
+const dlg = doc.body.children.find((c) => c.tagName === "DIALOG" && c.classList.contains("dump"));
+assert("dump dialog opens", !!dlg && dlg.open === true);
+const lessons = dlg.querySelectorAll(".dump-lesson");
+const picks = (row) => row.querySelectorAll(".dump-pick input");
+const stateText = () => dlg.querySelectorAll(".dump-all .hint")[0].textContent;
+const downloadBtn = dlg.querySelectorAll("button").find((b) => b.textContent.includes("Download"));
+assert("dump lists one course and both lectures", lessons.length === 2, String(lessons.length));
+assert("one course heading", dlg.querySelectorAll(".dump-course-head").length === 1);
+assert("transcript and summary per lecture", picks(lessons[0]).length === 2);
+assert("lecture with a summary is picked", picks(lessons[0])[1].checked === true);
+assert("lecture without a summary has the box off",
+  picks(lessons[1])[1].checked === false && !!picks(lessons[1])[1].getAttribute("disabled"));
+assert("count reports both lectures", stateText().includes("2 lectures"), stateText());
+
+// Deselezionare una lezione la toglie dal totale; il corso resta indeterminato.
+picks(lessons[1])[0].checked = false;
+picks(lessons[1])[0].dispatch("change");
+assert("count follows the un-picked lecture", stateText().includes("1 lecture ·"), stateText());
+const courseBox = dlg.querySelectorAll(".dump-course-head input")[0];
+assert("course box is indeterminate", courseBox.checked === false && courseBox.indeterminate === true);
+
+downloadBtn.dispatch("click");
+await new Promise((r) => setTimeout(r, 20));
+assert("dump posts the chosen lecture only",
+  !!dumpRequest && dumpRequest.items.length === 1 && dumpRequest.items[0].id === 7
+  && dumpRequest.items[0].summary === true, JSON.stringify(dumpRequest));
+assert("dump dialog closes after the download", dlg.open === false && !doc.body.children.includes(dlg));
 
 console.log(`\n${failures.length ? `${failures.length} FAILURE(S)` : "all checks passed"}`);
 process.exit(failures.length ? 1 : 0);

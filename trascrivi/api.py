@@ -14,14 +14,18 @@ Convenzioni:
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import re
 import shutil
-from pathlib import Path
+import time
+import zipfile
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from fastapi import APIRouter, Body, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import (APIRouter, Body, FastAPI, File, Form, HTTPException, Query, Response,
+                     UploadFile)
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -152,6 +156,18 @@ class TermIn(BaseModel):
     replace: str = ""
     auto: bool = False
     note: str = ""
+
+
+class DumpItem(BaseModel):
+    """Una lezione scelta nel dump: cosa portarsi dietro, trascrizione e/o riassunto."""
+
+    id: int
+    transcript: bool = True
+    summary: bool = True
+
+
+class DumpIn(BaseModel):
+    items: list[DumpItem] = Field(default_factory=list)
 
 
 class ProviderIn(BaseModel):
@@ -728,14 +744,7 @@ def export_transcript(transcript_id: int, format: str = "txt") -> Any:
     media = "text/plain"
     ext = "txt"
     if fmt == "md":
-        project = db.get_project(t["project_id"])
-        glossary = db.list_terms(t["project_id"])
-        payload = build_markdown(t["title"], {
-            "course": project["name"] if project else "",
-            "language": t["language"],
-            "model": t["model"],
-            "duration": t["duration"],
-        }, t["segments"], glossary)
+        payload = _transcript_markdown(t)
         media = "text/markdown"
         ext = "md"
     elif fmt == "json":
@@ -763,6 +772,17 @@ def export_transcript(transcript_id: int, format: str = "txt") -> Any:
     )
 
 
+def _transcript_markdown(t: dict) -> str:
+    """Markdown di una trascrizione: una strada sola per l'export e per il dump."""
+    project = db.get_project(t["project_id"])
+    return build_markdown(t["title"], {
+        "course": project["name"] if project else "",
+        "language": t["language"],
+        "model": t["model"],
+        "duration": t["duration"],
+    }, t["segments"] or [], db.list_terms(t["project_id"]))
+
+
 def _slug(text: str) -> str:
     keep = [c if (c.isalnum() or c in " -_") else "" for c in text.strip()]
     return "-".join("".join(keep).split())[:60].strip("-")
@@ -771,6 +791,75 @@ def _slug(text: str) -> str:
 def _download_headers(filename: str) -> dict:
     """Intestazione che fa scaricare il file invece di aprirlo nel browser."""
     return {"Content-Disposition": f'attachment; filename="{filename}"'}
+
+
+def _unique_path(used: set[str], path: str) -> str:
+    """
+    Percorso libero dentro lo zip: `a/Lezione` → `a/Lezione-2` se già occupato.
+
+    Senza questo due lezioni con lo stesso titolo finiscono nella stessa cartella
+    e la seconda sovrascrive la prima: il dump sembra completo e ha perso metà
+    del contenuto.
+    """
+    if path not in used:
+        used.add(path)
+        return path
+    p = PurePosixPath(path)
+    n = 2
+    while True:
+        candidate = str(p.with_name(f"{p.stem}-{n}{p.suffix}"))
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+        n += 1
+
+
+# ── Dump ─────────────────────────────────────────────────────────────────────
+@router.post("/dump")
+def dump(body: DumpIn = Body(...)) -> Response:
+    """
+    Zip delle lezioni scelte: `<Corso>/<Lezione>/transcript.md` e `summary.md`.
+
+    Il riassunto è l'ultimo della lezione, quello che la tab Summary mostra.
+    Tutto in memoria: sono file di testo e il dump tipico sta in pochi MB.
+    """
+    if not body.items:
+        raise HTTPException(422, "Select at least one lecture")
+
+    folders: dict[int, str] = {}
+    used: set[str] = set()
+    written = 0
+    # ponytail: zip in RAM, passare a un file temporaneo se un giorno entrano gli audio.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for item in body.items:
+            t = db.get_transcript(item.id)
+            if not t or not (item.transcript or item.summary):
+                continue
+            # Una cartella per corso, riusata da tutte le sue lezioni: il nome si
+            # assegna la prima volta che il corso compare, non a ogni lezione.
+            if t["project_id"] not in folders:
+                project = db.get_project(t["project_id"])
+                folders[t["project_id"]] = _unique_path(
+                    used, _slug(project["name"] if project else "") or f"course-{t['project_id']}")
+            lesson = _slug(t["title"]) or f"lecture-{t['id']}"
+            folder = _unique_path(used, f"{folders[t['project_id']]}/{lesson}")
+
+            if item.transcript:
+                zf.writestr(f"{folder}/transcript.md", _transcript_markdown(t))
+                written += 1
+            if item.summary:
+                s = db.latest_summary(t["id"])
+                if s and s.get("markdown"):
+                    zf.writestr(f"{folder}/summary.md", s["markdown"])
+                    written += 1
+
+    if not written:
+        raise HTTPException(404, "Nothing to dump: no transcript or summary found")
+
+    stamp = time.strftime("%Y-%m-%d-%H%M")
+    return Response(buf.getvalue(), media_type="application/zip",
+                    headers=_download_headers(f"trascrivi-dump-{stamp}.zip"))
 
 
 # ── Proposte di correzione ───────────────────────────────────────────────────

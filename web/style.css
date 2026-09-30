@@ -1593,6 +1593,74 @@ dialog label,
   color: var(--text-3);
 }
 
+/* Dump: albero corsi → lezioni, con due caselle per lezione. Il dialogo di base
+   è largo 460px e qui non basta: titolo della lezione più "transcript" e
+   "summary" sulla stessa riga. */
+dialog.dump { width: min(720px, calc(100vw - 32px)); }
+dialog.dump .dump-all { margin: 12px 0 8px; }
+dialog.dump .dump-all .check { margin: 0; }
+dialog.dump > .split:last-child { margin-top: 16px; }
+
+.dump-list {
+  max-height: min(50vh, 420px);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  padding: 4px 12px 10px;
+}
+.dump-course + .dump-course { border-top: 1px solid var(--line); }
+
+.dump-course-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 11px 0 7px;
+  cursor: pointer;
+}
+.dump-course-head .dump-title { font-weight: 600; }
+.dump-count {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.dump-lesson {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 5px 6px 5px 20px;
+  cursor: pointer;
+}
+.dump-lesson:hover { background: var(--accent-soft); }
+.dump-lesson .dump-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.dump-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  cursor: pointer;
+  white-space: nowrap;
+}
+/* Casella spenta: la lezione non ha un riassunto, quindi non c'è niente da
+   scaricare. Si vede che è disabilitata, non che è rotta. */
+.dump-pick.off { opacity: 0.45; cursor: not-allowed; }
+.dump-pick input { margin: 0; }
+
 /* ── 18. Stati: vuoto, caricamento, errore ──────────────────────────────── */
 .empty {
   position: relative;

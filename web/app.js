@@ -433,6 +433,7 @@ const ICONS = {
   warn: `<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.4"></circle><path d="M8 4.9v3.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"></path><circle cx="8" cy="10.9" r="0.85" fill="currentColor"></circle>`,
   info: `<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.4"></circle><path d="M8 7.4v3.9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"></path><circle cx="8" cy="4.9" r="0.85" fill="currentColor"></circle>`,
   copy: `<rect x="5.6" y="5.6" width="7.4" height="7.4" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"></rect><path d="M10.4 3H4.2A1.2 1.2 0 0 0 3 4.2v6.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"></path>`,
+  download: `<path d="M8 2.6v7.1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"></path><path d="M4.9 6.8 8 9.9l3.1-3.1" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"></path><path d="M3.1 12.6h9.8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"></path>`,
 };
 
 const icon = (name, cls = "") => {
@@ -726,6 +727,144 @@ const exportMenu = (t) => popupMenu("Export", [
 
 
 /* ============================================================================
+   Dump
+   ========================================================================== */
+/* Scegli corso e lezioni, poi uno zip: `<Corso>/<Lezione>/transcript.md` e
+   `summary.md`. Il file lo compone il server — è l'unico posto che sa come si
+   chiama un corso e come si evita che due lezioni con lo stesso titolo si
+   sovrascrivano — e la risposta si scarica come blob, perché un POST non passa
+   da un `<a href>`. */
+async function openDumpDialog() {
+  let projects, transcripts;
+  try {
+    [{ projects }, { transcripts }] = await Promise.all([api("/projects"), api("/transcripts")]);
+  } catch (err) { return toast(err.message, "err"); }
+  if (!transcripts.length) return toast("No transcripts to dump yet", "err");
+
+  const items = transcripts.map((t) => {
+    const hasSummary = (t.n_summaries || 0) > 0;
+    return { id: t.id, project_id: t.project_id, title: t.title, hasSummary,
+             text: true, summary: hasSummary, textEl: null, sumEl: null };
+  });
+  const byCourse = new Map();
+  items.forEach((it) => {
+    if (!byCourse.has(it.project_id)) byCourse.set(it.project_id, []);
+    byCourse.get(it.project_id).push(it);
+  });
+
+  const lessonRow = (it) => el("label", { class: "dump-lesson" },
+    el("span", { class: "dump-title" }, it.title),
+    el("span", { class: "dump-pick" },
+      it.textEl = el("input", { type: "checkbox",
+        onchange: (e) => { it.text = e.target.checked; sync(); } }),
+      "transcript"),
+    el("span", { class: `dump-pick${it.hasSummary ? "" : " off"}` },
+      it.sumEl = el("input", { type: "checkbox", disabled: it.hasSummary ? null : "disabled",
+        onchange: (e) => { it.summary = e.target.checked; sync(); } }),
+      "summary"));
+
+  const allBox = el("input", { type: "checkbox", checked: "checked" });
+  const count = el("span", { class: "hint" });
+  const okBtn = el("button", { class: "primary", type: "button", onclick: download },
+    icon("download"), "Download .zip");
+  const courseBoxes = [];
+
+  const tree = el("div", { class: "dump-list" },
+    [...byCourse.entries()].map(([pid, mine]) => {
+      const project = projects.find((p) => p.id === pid);
+      const box = el("input", { type: "checkbox", checked: "checked" });
+      box.addEventListener("change", () => {
+        mine.forEach((it) => { it.text = box.checked; if (it.hasSummary) it.summary = box.checked; });
+        sync();
+      });
+      courseBoxes.push({ box, mine });
+      return el("div", { class: "dump-course" },
+        el("label", { class: "dump-course-head" }, box,
+          el("span", { class: "dump-title" }, project ? project.name : `Course ${pid}`),
+          el("span", { class: "dump-count" },
+            `${mine.length} lecture${mine.length === 1 ? "" : "s"}`)),
+        el("div", { class: "dump-lessons" }, mine.map(lessonRow)));
+    }));
+
+  allBox.addEventListener("change", () => {
+    items.forEach((it) => { it.text = allBox.checked; if (it.hasSummary) it.summary = allBox.checked; });
+    sync();
+  });
+
+  const dlg = el("dialog", { class: "dump", "aria-label": "Dump lectures to a zip" },
+    el("h2", {}, "Dump to zip"),
+    el("p", { class: "hint" },
+      "One folder per course, one per lecture: transcript.md and summary.md. ",
+      "The summary is the latest one, the same the Summary tab shows."),
+    el("div", { class: "split dump-all" },
+      el("label", { class: "check" }, allBox, el("span", {}, "All lectures")),
+      el("span", { class: "spacer" }), count),
+    tree,
+    el("div", { class: "split" },
+      el("button", { type: "button", onclick: () => dlg.close() }, "Cancel"),
+      okBtn));
+
+  async function download() {
+    const chosen = items.filter((it) => it.text || it.summary)
+      .map((it) => ({ id: it.id, transcript: it.text, summary: it.summary }));
+    if (!chosen.length) return;
+    okBtn.disabled = true;
+    okBtn.textContent = "Building…";
+    try {
+      const res = await fetch("/api/dump", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: chosen }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // Il nome lo decide il server: una sola formattazione della data in giro.
+      const name = (res.headers.get("Content-Disposition") || "")
+        .match(/filename="([^"]+)"/)?.[1] || "trascrivi-dump.zip";
+      const url = URL.createObjectURL(await res.blob());
+      const link = el("a", { href: url, download: name });
+      document.body.append(link);
+      link.click();
+      link.remove();
+      // Il blob va lasciato vivo finché il browser non ha finito di scriverlo.
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+      dlg.close();
+      toast(`${chosen.length} lecture(s) in ${name}`, "ok");
+    } catch (err) {
+      toast(`Dump failed: ${err.message}`, "err");
+    } finally {
+      okBtn.textContent = "Download .zip";
+      sync();
+    }
+  }
+
+  function sync() {
+    items.forEach((it) => { it.textEl.checked = it.text; it.sumEl.checked = it.summary; });
+    courseBoxes.forEach(({ box, mine }) => {
+      const on = mine.filter((it) => it.text || it.summary).length;
+      box.checked = on === mine.length;
+      box.indeterminate = on > 0 && on < mine.length;
+    });
+    const lectures = items.filter((it) => it.text || it.summary).length;
+    const files = items.reduce((n, it) => n + (it.text ? 1 : 0) + (it.summary ? 1 : 0), 0);
+    allBox.checked = lectures === items.length;
+    allBox.indeterminate = lectures > 0 && lectures < items.length;
+    count.textContent = lectures
+      ? `${lectures} lecture${lectures === 1 ? "" : "s"} · ${files} file${files === 1 ? "" : "s"}`
+      : "Nothing selected";
+    okBtn.disabled = !lectures;
+  }
+
+  sync();
+  document.body.append(dlg);
+  // Navigare altrove con il dialogo aperto non deve lasciarlo a schermo: sta
+  // fuori da `nav`, quindi il render della vista nuova non lo tocca.
+  onViewTeardown(() => dlg.remove());
+  dlg.addEventListener("close", () => dlg.remove());
+  dlg.showModal();
+}
+
+
+/* ============================================================================
    Dashboard
    ========================================================================== */
 async function viewDashboard(nav, params, token) {
@@ -840,7 +979,12 @@ async function viewDashboard(nav, params, token) {
               projects.length
                 ? `${projects.length} course${projects.length === 1 ? "" : "s"} · ${totalTranscripts} transcript${totalTranscripts === 1 ? "" : "s"}. Audio is transcoded on this machine only.`
                 : "Create a course, drop a lecture recording into it, and follow the transcription in Jobs. Audio is transcoded on this machine only.")),
-          hwBadges)),
+          el("div", { class: "actions" },
+            el("button", { type: "button",
+              title: "Choose courses and lectures and download them as a zip",
+              disabled: totalTranscripts ? null : "disabled",
+              onclick: openDumpDialog }, icon("download"), "Dump…"),
+            hwBadges))),
       searchResults,
       projects.length
         ? el("p", { class: "eyebrow" }, "Courses", el("span", { class: "count" }, String(projects.length)))

@@ -8,7 +8,9 @@ inferenza: nessun test carica un modello Whisper, tocca la GPU o la rete.
 
 from __future__ import annotations
 
+import io
 import json
+import zipfile
 
 from trascrivi import config, db, llm
 from trascrivi.textutil import segments_to_text
@@ -504,6 +506,62 @@ def test_api_export_transcript_formats(client, make_transcript):
 
     assert client.get(f"/api/transcripts/{tid}/export", params={"format": "xml"}).status_code == 400
     assert client.get("/api/transcripts/9999/export").status_code == 404
+
+
+def test_api_dump_zips_the_chosen_lectures(client, project, make_transcript):
+    """
+    Il dump: una cartella per corso, una per lezione, `transcript.md` e
+    `summary.md` (l'ultimo riassunto).
+
+    Il caso che conta è la collisione: due lezioni con lo stesso titolo nello
+    stesso corso devono finire in due cartelle, non in una che si sovrascrive.
+    """
+    first = make_transcript(title="Lezione 1")
+    db.create_summary(first, title="Lezione 1", markdown="# Lezione 1\n\nPunti chiave.\n")
+    same_title = make_transcript(title="Lezione 1")           # stesso corso, stesso titolo
+    other = db.create_project("Fisica 1")
+    twin = make_transcript(project_id=other, title="Lezione 1")
+    # Una lezione senza riassunto: la casella in UI resta spenta, e il server non
+    # deve inventarsi un `summary.md` vuoto.
+    bare = make_transcript(project_id=other, title="Lezione senza riassunto")
+
+    listed = {t["id"]: t for t in db.list_transcripts()}
+    assert listed[first]["n_summaries"] == 1
+    assert listed[bare]["n_summaries"] == 0
+
+    res = client.post("/api/dump", json={"items": [
+        {"id": first, "transcript": True, "summary": True},
+        {"id": same_title, "transcript": True, "summary": True},
+        {"id": twin, "transcript": True, "summary": False},
+        {"id": bare, "transcript": True, "summary": True},
+    ]})
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "application/zip"
+    assert 'filename="trascrivi-dump-' in res.headers["content-disposition"]
+
+    with zipfile.ZipFile(io.BytesIO(res.content)) as zf:
+        assert sorted(zf.namelist()) == [
+            "Analisi-1/Lezione-1-2/transcript.md",
+            "Analisi-1/Lezione-1/summary.md",
+            "Analisi-1/Lezione-1/transcript.md",
+            "Fisica-1/Lezione-1/transcript.md",
+            "Fisica-1/Lezione-senza-riassunto/transcript.md",
+        ]
+        transcript = zf.read("Analisi-1/Lezione-1/transcript.md").decode("utf-8")
+        assert transcript.startswith("# Lezione 1")
+        assert "**Course:** Analisi 1" in transcript
+        assert "Good morning everyone" in transcript
+        assert zf.read("Analisi-1/Lezione-1/summary.md").decode("utf-8") == (
+            "# Lezione 1\n\nPunti chiave.\n")
+
+    # Solo il riassunto, senza trascrizione.
+    only_summary = client.post("/api/dump", json={
+        "items": [{"id": first, "transcript": False, "summary": True}]})
+    with zipfile.ZipFile(io.BytesIO(only_summary.content)) as zf:
+        assert zf.namelist() == ["Analisi-1/Lezione-1/summary.md"]
+
+    assert client.post("/api/dump", json={"items": []}).status_code == 422
+    assert client.post("/api/dump", json={"items": [{"id": 9999}]}).status_code == 404
 
 
 def test_api_search_endpoint(client):
