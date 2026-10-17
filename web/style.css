@@ -1216,6 +1216,11 @@ td.nowrap.small { font-family: var(--font-mono); font-size: 11.5px; letter-spaci
 td.actions { white-space: nowrap; text-align: right; }
 td.actions > * { vertical-align: middle; }
 td.actions > * + * { margin-left: 4px; }
+/* Il contenitore del bottone del riassunto, che nella stessa cella passa da
+   link a bottone. Uno span inline si allineerebbe sulla propria riga di testo
+   (~15px) e il link dentro, alto 34px, resterebbe qualche pixel più in alto
+   degli altri due bottoni: inline-flex come loro, così i tre box coincidono. */
+td.actions .summary-cell { display: inline-flex; }
 
 /* Tabella chiave/valore della scheda "Details" */
 table th + td.mono { font-size: 12px; }

@@ -517,7 +517,7 @@ def test_api_dump_zips_the_chosen_lectures(client, project, make_transcript):
     stesso corso devono finire in due cartelle, non in una che si sovrascrive.
     """
     first = make_transcript(title="Lezione 1")
-    db.create_summary(first, title="Lezione 1", markdown="# Lezione 1\n\nPunti chiave.\n")
+    summary_id = db.create_summary(first, title="Lezione 1", markdown="# Lezione 1\n\nPunti chiave.\n")
     same_title = make_transcript(title="Lezione 1")           # stesso corso, stesso titolo
     other = db.create_project("Fisica 1")
     twin = make_transcript(project_id=other, title="Lezione 1")
@@ -528,6 +528,19 @@ def test_api_dump_zips_the_chosen_lectures(client, project, make_transcript):
     listed = {t["id"]: t for t in db.list_transcripts()}
     assert listed[first]["n_summaries"] == 1
     assert listed[bare]["n_summaries"] == 0
+    # Il bottone in tabella scarica l'*ultimo* riassunto: l'id è quello della
+    # versione più recente, e NULL è il segnale che non c'è niente da scaricare
+    # e la UI deve offrire di generarlo.
+    assert listed[first]["latest_summary_id"] == summary_id
+    assert listed[bare]["latest_summary_id"] is None
+    # Due versioni scritte nello stesso secondo devono avere un ordine, e il
+    # bottone scarica l'ultima inserita: è il pareggio che `created_at` da solo
+    # non risolverebbe. Su una lezione che resta fuori dal dump qui sotto — si
+    # sta verificando la lista, non lo zip.
+    rolling = make_transcript(project_id=other, title="Con due versioni")
+    db.create_summary(rolling, title="v1", markdown="# v1\n")
+    newest = db.create_summary(rolling, title="v2", markdown="# v2\n")
+    assert {t["id"]: t for t in db.list_transcripts()}[rolling]["latest_summary_id"] == newest
 
     res = client.post("/api/dump", json={"items": [
         {"id": first, "transcript": True, "summary": True},

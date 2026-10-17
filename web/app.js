@@ -1010,25 +1010,210 @@ async function viewDashboard(nav, params, token) {
    Vista progetto
    ========================================================================== */
 async function viewProject(nav, params, projectId, token) {
-  const [project, { transcripts }] = await Promise.all([
-    api(`/projects/${projectId}`), api(`/transcripts?project_id=${projectId}`),
-  ]);
-  const { terms } = await api(`/terms?project_id=${projectId}`);
+  // `providers` e `settings` servono alla modale del riassunto, `jobs` a sapere
+  // se uno è già in corso: come la vista trascrizione, la pagina se li procura
+  // da sé invece di darli per globali.
+  const [project, { transcripts }, { terms }, { jobs }, providersRes, settingsRes] =
+    await Promise.all([
+      api(`/projects/${projectId}`), api(`/transcripts?project_id=${projectId}`),
+      api(`/terms?project_id=${projectId}`), api("/jobs?limit=20"),
+      api("/providers"), api("/settings"),
+    ]);
+  const providers = providersRes.providers;
+  const settings = settingsRes.settings;
   setDocTitle(`${project.name} · Course`);
 
   const totalSeconds = transcripts.reduce((sum, t) => sum + (t.duration || 0), 0);
 
-  const rows = transcripts.map((t) => el("tr", {},
-    el("td", {}, el("a", { href: `#/t/${t.id}` }, t.title),
-      t.description ? el("div", { class: "small muted" }, t.description) : null),
-    el("td", { class: "nowrap small" }, fmtTs(t.duration)),
-    el("td", { class: "nowrap small muted" }, t.language ? t.language.toUpperCase() : "—"),
-    el("td", { class: "nowrap small muted" }, t.model || "—"),
-    el("td", { class: "nowrap small muted" }, fmtDate(t.updated_at)),
-    el("td", { class: "actions" },
-      el("a", { class: "btn", href: `/api/transcripts/${t.id}/export?format=txt` }, "txt"),
-      el("a", { class: "btn", href: `/api/transcripts/${t.id}/export?format=md` }, "md"),
-      el("button", { class: "danger", onclick: () => removeTranscript(t) }, "Delete"))));
+  /* ── Il bottone del riassunto in tabella ───────────────────────────────────
+     Un solo comando che cambia con lo stato: con un riassunto scarica l'ultimo
+     (.md), senza riassunto apre la modale che lo genera, e mentre il job scrive
+     è spento. Lo stato cambia da solo (polling), quindi ogni cella è un
+     contenitore stabile che `paintSummaryCell` ridisegna quando serve. */
+  const summaryCells = new Map();      // transcript id -> { t, host }
+  const summaryPending = new Map();    // transcript id -> job in corso
+
+  function paintSummaryCell(id) {
+    const cell = summaryCells.get(id);
+    if (!cell) return;
+    const { t, host } = cell;
+    const job = summaryPending.get(id);
+    setChildren(host,
+      job
+        ? el("button", { class: "btn", type: "button", disabled: "disabled",
+            title: "The summary is being written" }, "writing…")
+        : t.latest_summary_id
+          ? el("a", { class: "btn", title: "Download the latest summary (.md)",
+              href: `/api/summaries/${t.latest_summary_id}/export?format=md` }, "summary .md")
+          : el("button", { class: "btn", type: "button",
+              title: "Generate a summary for this lecture",
+              onclick: () => openSummaryDialog(t) }, "+ summary"));
+  }
+
+  // Polling mirato: parte solo quando c'è un riassunto in coda e si spegne da
+  // sé quando l'ultimo è finito — o quando si lascia la vista.
+  let coursePoll = null;
+  let courseTickBusy = false;
+
+  function startCoursePoll() {
+    if (!coursePoll) coursePoll = setInterval(courseTick, 2000);
+  }
+
+  function stopCoursePoll() {
+    if (coursePoll) { clearInterval(coursePoll); coursePoll = null; }
+  }
+  onViewTeardown(stopCoursePoll);
+
+  async function courseTick() {
+    if (!isCurrent(token)) { stopCoursePoll(); return; }
+    // Una risposta più lenta dell'intervallo non deve accavallarsi alla
+    // successiva: due risposte fuori ordine farebbero lampeggiare lo stato.
+    if (courseTickBusy) return;
+    courseTickBusy = true;
+    let latest;
+    try {
+      latest = (await api("/jobs?limit=20")).jobs || [];
+    } catch {
+      return;   // rete: si riprova al giro successivo, senza spaventare l'utente
+    } finally {
+      courseTickBusy = false;
+    }
+    if (!isCurrent(token)) { stopCoursePoll(); return; }
+
+    const active = new Map();
+    transcripts.forEach((t) => {
+      const job = latest.find((j) => j.kind === "llm_summary" && j.transcript_id === t.id
+        && ["queued", "running"].includes(j.status));
+      if (job) active.set(t.id, job);
+    });
+    active.forEach((job, id) => {
+      if (!summaryPending.has(id)) paintSummaryCell(id);
+      summaryPending.set(id, job);
+    });
+
+    // Usciti dalla lista: o completati o falliti. L'esito non si indovina dallo
+    // stato del job (che può non essere più tra gli ultimi 20): si rilegge la
+    // trascrizione e si guarda se il riassunto c'è.
+    for (const id of [...summaryPending.keys()]) {
+      if (active.has(id)) continue;
+      const job = summaryPending.get(id);
+      summaryPending.delete(id);
+      let fresh = null;
+      try { fresh = await api(`/transcripts/${id}`); } catch { /* si riprova al prossimo giro */ }
+      if (!isCurrent(token)) { stopCoursePoll(); return; }
+      if (!fresh) { summaryPending.set(id, job); continue; }
+      const cell = summaryCells.get(id);
+      if (cell) cell.t.latest_summary_id = fresh.latest_summary_id || null;
+      paintSummaryCell(id);
+      // Lo stato finale, se il job è ancora tra gli ultimi, sta nella lista:
+      // è lì che si trova il messaggio d'errore vero.
+      const ended = job && job.id != null ? latest.find((j) => j.id === job.id) : null;
+      if (fresh.latest_summary_id) toast("Summary ready", "ok");
+      else if (ended && ended.error) toast(`Summary failed: ${ended.error}`, "err");
+      else toast("The summary job ended without a summary — check Jobs", "err");
+    }
+    if (!summaryPending.size) stopCoursePoll();
+  }
+
+  /* La modale di generazione: le stesse scelte della tab Summary (provider,
+     stile, istruzioni) senza aprire la trascrizione. */
+  function openSummaryDialog(t) {
+    const enabled = providers.filter((p) => p.enabled);
+    const providerSel = el("select", { id: "courseSumProvider", "aria-label": "Provider for the summary" },
+      enabled.map((p) => el("option", {
+        value: p.id, selected: p.id === settings.default_provider_id ? "selected" : null,
+      }, `${p.name} · ${p.model || "no model"}`)));
+    const styleSel = el("select", { id: "courseSumStyle", "aria-label": "Summary style" },
+      [["study", "Study notes"], ["brief", "Brief"], ["detailed", "Detailed"]]
+        .map(([v, label]) => el("option", {
+          value: v, selected: v === (settings.summary_style || "study") ? "selected" : null,
+        }, label)));
+    const instruction = el("input", {
+      id: "courseSumInstruction", placeholder: "Extra instructions (optional)",
+    });
+    const error = el("p", { class: "field-error hidden" });
+    const okBtn = el("button", { class: "primary", type: "button", onclick: queue }, "Generate summary");
+    okBtn.disabled = enabled.length ? null : "disabled";
+
+    const dlg = el("dialog", { "aria-label": `Generate a summary for ${t.title}` },
+      el("h2", {}, "Generate summary"),
+      el("p", { class: "hint" }, `“${t.title}” — a single Markdown document of study notes, `,
+        "written in one call from the whole transcript. The length follows the style."),
+      enabled.length
+        ? el("div", { class: "stack" },
+            el("div", { class: "field" },
+              el("label", { for: "courseSumProvider" }, "Provider"), providerSel),
+            el("div", { class: "field" },
+              el("label", { for: "courseSumStyle" }, "Style"), styleSel),
+            el("div", { class: "field" },
+              el("label", { for: "courseSumInstruction" }, "Instructions (optional)"), instruction))
+        : notice("warn", "No LLM provider is enabled. ",
+            el("a", { href: "#/settings" }, "Open Settings")),
+      error,
+      el("div", { class: "split" },
+        el("button", { type: "button", onclick: () => dlg.close() }, "Cancel"),
+        okBtn));
+
+    async function queue() {
+      okBtn.disabled = "disabled";
+      okBtn.textContent = "Queueing…";
+      try {
+        const res = await api(`/transcripts/${t.id}/summary`, {
+          method: "POST",
+          body: {
+            provider_id: providerSel.value ? Number(providerSel.value) : null,
+            style: styleSel.value,
+            instruction: instruction.value,
+          },
+        });
+        dlg.close();
+        toast(`Summary queued · ${t.title}`, "ok");
+        // Il job c'è già nella risposta: lo stato in tabella cambia subito e il
+        // polling parte, invece di aspettare un ricaricamento della pagina.
+        summaryPending.set(t.id, res.job || { id: null, transcript_id: t.id, status: "queued" });
+        paintSummaryCell(t.id);
+        startCoursePoll();
+      } catch (err) {
+        error.textContent = err.message;
+        error.classList.remove("hidden");
+        okBtn.disabled = null;
+        okBtn.textContent = "Generate summary";
+      }
+    }
+
+    document.body.append(dlg);
+    // Navigare altrove con il dialogo aperto non deve lasciarlo a schermo: sta
+    // fuori da `nav`, quindi il render della vista nuova non lo tocca.
+    onViewTeardown(() => dlg.remove());
+    dlg.addEventListener("close", () => dlg.remove());
+    dlg.showModal();
+  }
+
+  const rows = transcripts.map((t) => {
+    const summaryHost = el("span", { class: "summary-cell" });
+    summaryCells.set(t.id, { t, host: summaryHost });
+    return el("tr", {},
+      el("td", {}, el("a", { href: `#/t/${t.id}` }, t.title),
+        t.description ? el("div", { class: "small muted" }, t.description) : null),
+      el("td", { class: "nowrap small" }, fmtTs(t.duration)),
+      el("td", { class: "nowrap small muted" }, t.language ? t.language.toUpperCase() : "—"),
+      el("td", { class: "nowrap small muted" }, t.model || "—"),
+      el("td", { class: "nowrap small muted" }, fmtDate(t.updated_at)),
+      el("td", { class: "actions" },
+        el("a", { class: "btn", href: `/api/transcripts/${t.id}/export?format=txt` }, "txt"),
+        summaryHost,
+        el("button", { class: "danger", onclick: () => removeTranscript(t) }, "Delete")));
+  });
+
+  // Stato iniziale delle celle: una lezione con un riassunto già in coda non
+  // deve mostrare "+ summary" e accodarne un secondo.
+  transcripts.forEach((t) => {
+    const job = jobs.find((j) => j.kind === "llm_summary" && j.transcript_id === t.id
+      && ["queued", "running"].includes(j.status));
+    if (job) summaryPending.set(t.id, job);
+    paintSummaryCell(t.id);
+  });
+  if (summaryPending.size) startCoursePoll();
 
   async function removeTranscript(t) {
     if (!await confirmDialog("Delete transcript", `Delete “${t.title}”? This cannot be undone.`)) return;

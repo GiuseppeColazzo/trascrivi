@@ -381,6 +381,33 @@ def test_the_transcript_view_polls_running_jobs_and_stops_cleanly(js):
     assert "loadSummaries()" in tick, "il documento pronto deve comparire da solo"
 
 
+def test_the_course_table_summary_button_downloads_or_generates(js):
+    """
+    Il bottone del riassunto in tabella ha due stati, e lo stato si legge dai
+    dati veri: con un riassunto scarica l'ultimo (`latest_summary_id`, che la
+    lista delle trascrizioni porta), senza riassunto apre la modale che lo
+    genera. Il polling che aggiorna la cella dopo la generazione deve spegnersi
+    cambiando vista, come quello della trascrizione.
+    """
+    view = _function_body(js, "viewProject")
+
+    assert "latest_summary_id" in view, "il download deve leggere l'ultimo riassunto"
+    assert "/api/summaries/${" in view, "manca il link di download dell'ultimo riassunto"
+    assert "openSummaryDialog" in view, "senza riassunto il bottone deve aprire la modale"
+    assert re.search(r"api\(`/transcripts/\$\{[^}]+\}/summary`", view), \
+        "manca il POST che accoda il riassunto"
+    assert "startCoursePoll" in view
+    assert "onViewTeardown(stopCoursePoll)" in view, "il polling deve spegnersi cambiando vista"
+
+    # Il contenitore del bottone è un inline-flex come i bottoni che contiene:
+    # da span inline si allinea sulla propria riga di testo (~15px), non sui
+    # 34px del bottone, e in tabella appare sollevato rispetto agli altri due.
+    assert 'class: "summary-cell"' in view
+    css = (config.WEB / "style.css").read_text(encoding="utf-8")
+    assert re.search(r"td\.actions \.summary-cell \{ display: inline-flex; \}", css), \
+        "il contenitore del riassunto deve allinearsi come gli altri bottoni"
+
+
 def test_the_model_list_does_not_depend_on_the_first_health_call(js):
     """
     Regressione: l'elenco dei modelli si caricava una volta sola in `init()`,

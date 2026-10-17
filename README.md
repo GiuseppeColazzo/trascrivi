@@ -264,8 +264,9 @@ screen.
 Turn a lecture into **a single Markdown document** of study notes: sections in the order the lecture
 covered them, bullet lists, a table when the lecture compares or classifies things, a diagram in a code
 block where the lecture describes a flow, and a closing section for what was left unfinished. It is
-written in the language of the transcript (or the one you choose) and it is what you download: `.md` from
-the Summary tab, or `GET /api/summaries/{id}/export?format=md`.
+written in the language of the transcript (or the one you choose) and it is what you download: `.md`
+from the Summary tab, the summary button in the course table, or
+`GET /api/summaries/{id}/export?format=md`.
 
 The model writes the document directly. There is no intermediate structure and no second pass: what you
 read in the tab is exactly what is in the file.
@@ -381,7 +382,7 @@ persisted in `localStorage`.
 | Screen | Route | What lives there |
 |---|---|---|
 | **Library** | `#/` | All courses with their transcript counts. Create, rename and delete a course. **Dump** opens a picker — course → lecture, transcript and/or summary — and downloads the selection as a zip. The header search box runs a full-text query across every transcript and links each hit with `#/t/<id>?q=word` so the matching segments are highlighted. |
-| **Course** | `#/p/<id>` | The lectures of one course, with *New lecture* and per-transcript rename/move/delete. This is also where the **Course glossary** is edited, including the `auto` checkbox. |
+| **Course** | `#/p/<id>` | The lectures of one course, with *New lecture* and per-transcript rename/move/delete. Each lecture has a **summary** button: with a summary present it downloads the latest one as `.md`, without one it opens the generation dialog (provider, style, instructions) right there — while the job writes, the button is disabled, and it turns into the download by itself when the document is ready. This is also where the **Course glossary** is edited, including the `auto` checkbox. |
 | **New lecture** | `#/p/<id>/new` | The two ways to add audio (drag & drop / file picker, or an absolute local path validated live through `/api/media/probe`) plus the full transcription form: model, language, device, compute type, beam size, VAD, word timestamps, initial prompt for course vocabulary, and the two optional LLM follow-ups — the correction agent and the summary, each with its own provider picker. The model and language menus carry flags (below). |
 | **Jobs** | `#/jobs` | Queue and history with progress bar, `x realtime` speed, ETA, and Cancel / Retry / Resume. The header badge shows the running count. |
 | **Transcript** | `#/t/<id>` | The registry entry: editor (one line = one segment, timestamps re-attached on save), **Segments** tab, **Proposals** tab with the agent's review and diff preview, **Summary** tab, and **Info** with revision history and exports. |

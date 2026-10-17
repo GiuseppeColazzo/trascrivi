@@ -621,12 +621,19 @@ def list_transcripts(project_id: int | None = None, limit: int = 200) -> list[di
     Elenco leggero: senza testo né segmenti (le liste non ne hanno bisogno).
 
     `n_summaries` serve al dump: una lezione senza riassunto non deve offrire una
-    casella che non produrrebbe nessun file.
+    casella che non produrrebbe nessun file. `latest_summary_id` serve alla
+    tabella del corso: il bottone scarica l'*ultimo* riassunto quando c'è, e
+    NULL dice alla UI che non c'è niente da scaricare e va offerta la generazione.
     """
     columns = ("id, project_id, title, description, language, model, duration, "
                "LENGTH(text) AS length, "
                "(SELECT COUNT(*) FROM summaries s WHERE s.transcript_id = transcripts.id) "
-               "AS n_summaries, created_at, updated_at")
+               "AS n_summaries, "
+               # `created_at DESC, id DESC`: due riassunti scritti nello stesso
+               # secondo devono avere un ordine, e il più recente è l'ultimo inserito.
+               "(SELECT s.id FROM summaries s WHERE s.transcript_id = transcripts.id "
+               "ORDER BY s.created_at DESC, s.id DESC LIMIT 1) AS latest_summary_id, "
+               "created_at, updated_at")
     if project_id is None:
         sql = (f"SELECT {columns} FROM transcripts "
                "ORDER BY updated_at DESC LIMIT ?")
