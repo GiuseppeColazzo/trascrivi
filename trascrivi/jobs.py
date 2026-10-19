@@ -448,7 +448,7 @@ def _maybe_queue_agent(job: dict, payload: dict, result: dict) -> None:
 def _queue_llm_job(job: dict, kind: str, payload: dict, transcript_id: int, label: str) -> None:
     """Crea il job LLM, risolvendo il provider e segnalando in `message` se manca."""
     if payload.get("provider_id") is None:
-        providers = [p for p in db.list_providers() if p["enabled"] and p["has_key"]]
+        providers = db.usable_providers()
         if not providers:
             current = (db.get_job(job["id"]) or {}).get("message") or ""
             db.update_job(job["id"], message=f"{current} . {label} skipped: no provider")
@@ -503,15 +503,163 @@ def run_summary(job_id: int, payload: dict) -> dict:
                     f"(target {result['target_words']}) from "
                     f"{result['provider']}/{result['model']}")
 
+    # Il riassunto è la controparte del matching pagina -> lezione: appena ce n'è
+    # uno nuovo, le assegnazioni di quel corso vanno ricalcolate (i vettori sono
+    # locali, costo zero). Senza slide caricate non c'è niente da riassegnare.
+    matching_job = _queue_matching(transcript.get("project_id"))
+
+    message = (f"{result['words']} words of {result['target_words']} . "
+               f"${result['cost_usd']:.4f}")
+    if matching_job:
+        message += " . slide matching queued"
+
     return {
         "summary_id": summary_id,
         "transcript_id": transcript_id,
         "words": result["words"],
         "target_words": result["target_words"],
         "cost_usd": result["cost_usd"],
-        "message": (f"{result['words']} words of {result['target_words']} . "
-                    f"${result['cost_usd']:.4f}"),
+        "message": message,
     }
+
+
+# ── Slide ────────────────────────────────────────────────────────────────────
+def run_parse_slides(job_id: int, payload: dict) -> dict:
+    """
+    Legge un documento di slide: testo, render, boilerplate, pagine complesse.
+
+    Tutto locale (pypdfium2/python-pptx/rapidocr). Il pass VLM opzionale gira
+    nello stesso job perché è la seconda metà della stessa lettura: senza, il
+    documento è comunque pronto e le pagine complesse restano col solo OCR.
+    """
+    from . import slideparser
+
+    doc_id = int(payload["doc_id"])
+    doc = db.get_slide_doc(doc_id)
+    if doc is None:
+        raise ValueError("Slide document not found (was it deleted?)")
+    path = config.slide_source_path(doc["project_id"], doc_id, doc["ext"])
+    if not path.exists():
+        db.update_slide_doc(doc_id, {"status": "error", "error": "Source file is gone"})
+        raise FileNotFoundError(f"Slide file is gone: {path}")
+
+    stop_flag = threading.Event()
+    with _lock:
+        _stop_flags[job_id] = stop_flag
+
+    def on_page(done: int, total: int) -> None:
+        _set_progress(job_id, progress=round(done / max(1, total) * 0.9, 3),
+                      message=f"page {done}/{total}")
+
+    db.update_slide_doc(doc_id, {"status": "parsing", "error": None})
+    try:
+        pages, boilerplate = slideparser.parse(path, path.parent,
+                                               should_stop=stop_flag.is_set,
+                                               on_page=on_page)
+    except slideparser.MissingDependency as exc:
+        db.update_slide_doc(doc_id, {"status": "error", "error": str(exc)[:500]})
+        raise
+
+    db.save_slide_pages(doc_id, pages)
+    db.update_slide_doc(doc_id, {"n_pages": len(pages), "status": "ready",
+                                 "boilerplate": db.jdump(boilerplate)})
+
+    n_complex = sum(1 for p in pages if p["complex"])
+    message = f"{len(pages)} pages . {n_complex} complex"
+    if boilerplate:
+        message += f" . {len(boilerplate)} boilerplate lines removed"
+
+    vlm_pages = 0
+    if not stop_flag.is_set():
+        from . import vlm
+
+        settings = config.load_settings()
+        vlm_pages = vlm.enhance_doc(doc_id, settings, on_progress=lambda done, total:
+                                    _set_progress(job_id, progress=round(0.9 + 0.1 * done / max(1, total), 3),
+                                                  message=f"VLM page {done}/{total}"))
+        if vlm_pages:
+            message += f" . {vlm_pages} pages rendered by VLM"
+
+    # Il matching è un altro giro (embeddings): meglio un job suo, così l'utente
+    # vede due passi distinti e può rifare la sola assegnazione.
+    embed_job = db.create_job("embed_match", {"project_id": doc["project_id"],
+                                              "doc_id": doc_id},
+                              project_id=doc["project_id"])
+    enqueue(embed_job)
+
+    return {"doc_id": doc_id, "pages": len(pages), "complex": n_complex,
+            "vlm_pages": vlm_pages, "boilerplate": boilerplate,
+            "cancelled": stop_flag.is_set(), "message": message}
+
+
+def run_embed_match(job_id: int, payload: dict) -> dict:
+    """Assegna le pagine di slide alle lezioni (embeddings locali, nessun costo)."""
+    from . import matching
+
+    project_id = int(payload["project_id"])
+    if not db.get_project(project_id):
+        raise ValueError("Project not found")
+
+    def on_progress(done: int, total: int) -> None:
+        _set_progress(job_id, progress=round(done / max(1, total), 3),
+                      message=f"document {done}/{total}")
+
+    result = matching.match_project(project_id, on_progress=on_progress)
+    return {**result, "message": f"{result['links']} page ranges . {result['model']}"}
+
+
+def run_cards(job_id: int, payload: dict) -> dict:
+    """Genera e salva le flashcard di una lezione (unica chiamata LLM pagata)."""
+    from . import cards as cards_mod
+
+    transcript_id = int(payload["transcript_id"])
+    transcript = db.get_transcript(transcript_id)
+    if transcript is None:
+        raise ValueError("Transcript not found")
+    provider = db.get_provider(int(payload["provider_id"])) if payload.get("provider_id") else None
+    if provider is None:
+        raise ValueError("LLM provider not configured")
+
+    settings = config.load_settings()
+
+    def on_progress(fraction: float, message: str) -> None:
+        _set_progress(job_id, progress=round(min(0.95, fraction), 3), message=message)
+
+    result = cards_mod.generate(provider, transcript, settings,
+                                force=bool(payload.get("force")),
+                                vision=payload.get("vision"),
+                                on_progress=on_progress)
+    if result.get("n_new"):
+        db.add_revision(transcript_id, "cards", result["n_new"],
+                        f"{result['n_new']} cards from {provider.get('name')}/"
+                        f"{provider.get('model')}")
+    return result
+
+
+def _queue_matching(project_id: int | None) -> int | None:
+    """
+    Accoda un `embed_match` per il corso, se serve e se non ce n'è già uno.
+
+    Tre chiamanti (fine di un parsing, fine di una trascrizione, riassunto nuovo)
+    possono trovarsi nello stesso momento — una lezione trascritta con riassunto
+    ne genera due in un colpo. Il matching è idempotente, ma accodarne due rifà
+    gli stessi prodotti scalari: la guardia sul job già in coda evita il lavoro
+    doppio senza perdere l'aggiornamento (chi lo accoda dopo legge il materiale
+    più nuovo comunque, perché gira dopo).
+    """
+    if not project_id:
+        return None
+    project_id = int(project_id)
+    if not db.list_slide_docs(project_id):
+        return None
+    if db.row("SELECT id FROM jobs WHERE kind = 'embed_match' AND project_id = ? "
+              "AND status IN ('queued', 'running')", (project_id,)):
+        return None
+    job_id = db.create_job("embed_match", {"project_id": project_id},
+                           project_id=project_id)
+    enqueue(job_id)
+    log.info("accodato embed_match %s per il corso %s", job_id, project_id)
+    return job_id
 
 
 def _finish_transcribe_cleanup(job: dict, payload: dict) -> None:
@@ -545,6 +693,12 @@ def _run_job(job: dict) -> None:
             result = run_agent(job_id, payload)
         elif kind == "llm_summary":
             result = run_summary(job_id, payload)
+        elif kind == "parse_slides":
+            result = run_parse_slides(job_id, payload)
+        elif kind == "embed_match":
+            result = run_embed_match(job_id, payload)
+        elif kind == "llm_cards":
+            result = run_cards(job_id, payload)
         else:
             raise ValueError(f"Unknown job kind: {kind}")
 
@@ -570,6 +724,10 @@ def _run_job(job: dict) -> None:
         if kind == "transcribe" and not cancelled:
             _finish_transcribe_cleanup(job, payload)
             _maybe_queue_agent(job, payload, result)
+            # Slides caricate prima della lezione: il matching va rifatto ora che
+            # c'è la controparte. Senza, le pagine resterebbero senza proposta
+            # finché non si genera un riassunto o non si preme "Associa".
+            _queue_matching(job.get("project_id"))
         log.info("job %s (%s) %s in %.1fs: %s", job_id, kind,
                  "cancelled" if cancelled else "done", time.time() - t0, result)
     except Exception as exc:  # noqa: BLE001 - un job rotto non deve uccidere il worker
@@ -589,6 +747,12 @@ def _message_for(kind: str, result: dict) -> str:
                 f"{result.get('language', '?').upper()} . {result.get('device', '?')}")
     if kind == "llm_summary":
         return f"{result.get('words', 0)} of {result.get('target_words', 0)} words"
+    if kind == "parse_slides":
+        return f"{result.get('pages', 0)} pages . {result.get('complex', 0)} complex"
+    if kind == "embed_match":
+        return f"{result.get('links', 0)} page ranges"
+    if kind == "llm_cards":
+        return f"{result.get('n_new', 0)} cards"
     return f"{result.get('proposals', 0)} proposals"
 
 

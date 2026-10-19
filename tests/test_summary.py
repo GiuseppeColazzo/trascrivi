@@ -366,9 +366,11 @@ def test_the_prompt_carries_the_budget_as_a_structure(monkeypatch, transcript_ro
     assert f"about {source} words long" in sent
     assert f"never fewer than {shape['bullets_per_section']}" in sent
     assert f"at most {shape['bullet_words']} words" in sent
-    # La tabella dei termini è una sezione prenotata, non un extra facoltativo:
+    # La sezione "cosa resta in sospeso" è prenotata, non un extra facoltativo:
     # senza prenotazione il modello la sacrifica quando il budget stringe.
-    assert "table of the terms of the lecture" in sent
+    # (La tabella dei termini era la sezione prenotata prima di cc4e607.)
+    assert "one last section, if the lecture deferred anything" in sent
+    assert shape["sections"] == shape["topic_sections"] + sm.RESERVED_SECTIONS
     # Il blocco di pianificazione è chiesto esplicitamente.
     assert "<plan>" in sent
 
@@ -457,6 +459,20 @@ def test_summarize_disables_thinking_for_deepseek(monkeypatch, transcript_row, s
     _provider, calls = fake_provider(monkeypatch, [DOCUMENT])
 
     sm.summarize({"name": "deepseek", "model": "deepseek-flash"}, transcript_row, settings)
+
+    assert calls.calls[0]["reasoning_effort"] == "none"
+
+
+def test_summarize_disables_thinking_for_a_local_reasoning_model(monkeypatch, transcript_row,
+                                                                settings):
+    """
+    Stesso problema su Ollama: `qwen3.5:4b` senza `reasoning_effort="none"` spende
+    il budget in ragionamento e restituisce zero caratteri di note. È il modello
+    locale che il piano usa per lo smoke test, quindi il caso conta.
+    """
+    _provider, calls = fake_provider(monkeypatch, [DOCUMENT])
+
+    sm.summarize({"name": "ollama", "model": "qwen3.5:4b"}, transcript_row, settings)
 
     assert calls.calls[0]["reasoning_effort"] == "none"
 

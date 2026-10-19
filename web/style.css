@@ -2020,6 +2020,115 @@ main { flex: 1 1 auto; width: 100%; }
 }
 .md hr { margin: 20px 0; border: 0; border-top: 1px solid var(--line-soft); }
 
+/* ── Slide e carte ──────────────────────────────────────────────────────────
+   Tre forme nuove: la zona di drop, le chip di pagina (una per pagina, quindi
+   devono essere compatte) e la riga di un intervallo assegnato. */
+.drop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 26px 18px;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-card);
+  color: var(--text-2);
+  font-size: 13px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.drop:hover { border-color: var(--accent-line); color: var(--text); }
+.drop:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.drop.is-over {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.drop.is-busy { opacity: 0.6; pointer-events: none; }
+.drop-mark { font-size: 18px; color: var(--accent); line-height: 1; }
+
+.slide-doc {
+  padding: 12px 0;
+  border-top: 1px solid var(--line-soft);
+}
+.slide-doc:first-of-type { border-top: 0; }
+
+details > summary { cursor: pointer; }
+
+.page-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 8px;
+}
+.page-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  height: 22px;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--text-2);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-decoration: none;
+}
+.page-chip.complex { border-color: color-mix(in srgb, var(--warn) 55%, var(--line)); color: var(--warn); }
+.page-chip.vlm { background: var(--surface-2); color: var(--text); }
+.page-chip.uncertain { border-color: color-mix(in srgb, var(--danger) 55%, var(--line)); color: var(--danger); }
+.page-chip:hover { border-color: var(--accent-line); color: var(--accent); }
+
+.slide-link {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line-soft);
+}
+.thumb {
+  width: 96px;
+  height: 54px;
+  object-fit: cover;
+  object-position: top left;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+
+.card-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line-soft);
+}
+.card-row:first-child { border-top: 0; }
+.card-front { font-size: 14px; line-height: 1.45; }
+.card-row textarea { width: 100%; font-family: var(--font-sans); font-size: 13px; }
+
+/* Testo letto dalle slide: si legge il testo vero, quindi va a capo da solo e
+   resta monospaziato (l'OCR produce una riga per box, e gli a capo sono
+   informazione: sono l'ordine di lettura). */
+.page-text {
+  margin: 2px 0 0;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.page-doc { border-top: 1px solid var(--line-soft); padding: 8px 0; }
+.page-doc:first-child { border-top: 0; }
+.page-doc > summary { cursor: pointer; }
+
 /* Stampa: si stampa il registro, non la chrome dell'app. */
 @media print {
   header.app, .app-foot, #toasts, body::after, .toolbar, .no-print { display: none !important; }

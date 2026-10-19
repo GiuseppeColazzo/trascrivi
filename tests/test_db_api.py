@@ -540,7 +540,15 @@ def test_api_dump_zips_the_chosen_lectures(client, project, make_transcript):
     rolling = make_transcript(project_id=other, title="Con due versioni")
     db.create_summary(rolling, title="v1", markdown="# v1\n")
     newest = db.create_summary(rolling, title="v2", markdown="# v2\n")
-    assert {t["id"]: t for t in db.list_transcripts()}[rolling]["latest_summary_id"] == newest
+    again = {t["id"]: t for t in db.list_transcripts()}
+    assert again[rolling]["latest_summary_id"] == newest
+    # Il nome che la tabella del corso mostra: `display_title` è il titolo
+    # dell'ultimo riassunto (o il titolo della trascrizione quando il riassunto
+    # non c'è); il taglio del prefisso della materia è verificato a parte.
+    assert listed[first]["display_title"] == "Lezione 1"
+    assert listed[bare]["display_title"] == "Lezione senza riassunto"
+    assert again[rolling]["display_title"] == "v2"
+    assert "summary_title" not in listed[first], "il valore grezzo non esce dalla lista"
 
     res = client.post("/api/dump", json={"items": [
         {"id": first, "transcript": True, "summary": True},
@@ -575,6 +583,47 @@ def test_api_dump_zips_the_chosen_lectures(client, project, make_transcript):
 
     assert client.post("/api/dump", json={"items": []}).status_code == 422
     assert client.post("/api/dump", json={"items": [{"id": 9999}]}).status_code == 404
+
+
+def test_the_course_list_shows_the_summary_title_without_the_course_prefix(make_transcript):
+    """
+    I riassunti si intitolano "<materia> — <titolo>": in tabella la materia è
+    già l'intestazione della pagina, quindi `display_title` è solo la parte
+    dopo la lineetta. Il taglio scatta solo con la lineetta circondata da spazi
+    — un titolo fuori formato resta intero, e i trattini dentro le parole
+    ("Encoder-Decoder", "S-Curves") non sono separatori — e senza riassunto il
+    nome resta quello della trascrizione.
+    """
+    def shown(transcript_id: int) -> str:
+        return {t["id"]: t for t in db.list_transcripts()}[transcript_id]["display_title"]
+
+    bare = make_transcript(title="audio_2026-10-10_09-52-31")
+    assert shown(bare) == "audio_2026-10-10_09-52-31"          # niente riassunto
+
+    with_summary = make_transcript(title="lecture1210")
+    db.create_summary(with_summary, markdown="# Riassunto\n",
+                      title="Computer Aided Simulation Lab \u2014 Generating Random "
+                            "Variables: Gaussian, Poisson and Binomial")
+    assert shown(with_summary) == \
+        "Generating Random Variables: Gaussian, Poisson and Binomial"
+
+    no_prefix = make_transcript(title="lecture4")
+    db.create_summary(no_prefix, markdown="# Riassunto\n",
+                      title="Encoder-Decoder e S-Curves: le architetture")
+    assert shown(no_prefix) == "Encoder-Decoder e S-Curves: le architetture"
+
+    # Due lineette: la prima separa la materia, il resto è tutto titolo.
+    double = make_transcript(title="lecture5")
+    db.create_summary(double, markdown="# Riassunto\n",
+                      title="Efficient Computing for AI \u2014 Lecture 5: Memory "
+                            "\u2014 Cache and Bandwidth")
+    assert shown(double) == "Lecture 5: Memory \u2014 Cache and Bandwidth"
+
+    # Vale l'ultimo riassunto, non il primo che passa.
+    db.create_summary(with_summary, markdown="# v2\n",
+                      title="Computer Aided Simulation Lab \u2014 Generating Random "
+                            "Variables: Further Methods")
+    assert shown(with_summary) == "Generating Random Variables: Further Methods"
 
 
 def test_api_search_endpoint(client):

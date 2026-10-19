@@ -29,6 +29,7 @@ TRANSCRIPTS = DATA / "transcripts"
 PARTIAL = DATA / "partial"
 LOGS = DATA / "logs"
 BACKUPS = DATA / "backup"
+SLIDES = DATA / "slides"
 WEB = ROOT / "web"
 DB_PATH = DATA / "trascrivi.db"
 SECRET_KEY_PATH = DATA / "secret.key"
@@ -39,6 +40,9 @@ SETTINGS_PATH = DATA / "settings.json"
 MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024
 # Sopra questa soglia la UI avvisa che la copia richiederà tempo/spazio.
 WARN_UPLOAD_BYTES = 1024 * 1024 * 1024
+# Un deck di slide è molto più piccolo di un video: 200 MB coprono un PDF di
+# 500 pagine con le immagini dentro.
+MAX_SLIDE_BYTES = 200 * 1024 * 1024
 
 
 @dataclass
@@ -61,6 +65,20 @@ class Settings:
     summary_language: str = ""         # vuoto = stessa lingua della trascrizione
     delete_sources_after_job: bool = True
     backup_keep: int = 5               # numero di backup da conservare
+    # ── Carte e slide (PIANO-slide-e-carte) ──────────────────────────────────
+    cards_max: int = 12                # carte massime chieste in una generazione
+    cards_language: str = ""           # vuoto = lingua del riassunto
+    cards_context_chars: int = 12000   # budget di contesto (riassunto + slide)
+    cards_vision: str = "off"          # off/auto: allega fino a 3 render di pagina
+    # `auto` = solo le pagine segnate complesse. Il gate A/B sui campioni reali
+    # (tools/vlm_ab.py, esiti in PIANO-slide-e-carte.md) ha mostrato testo e
+    # annotazioni affidabili; le formule restano bloccate da `math_uncertain`
+    # quando la VLM non le legge con certezza.
+    slides_vlm: str = "auto"           # off/auto/on
+    slides_vlm_model: str = "gemma3:4b"
+    slides_vlm_max: int = 80           # tetto di pagine VLM per documento
+    match_threshold: float = 0.55      # similarità minima pagina -> lezione
+    embed_model: str = "nomic-embed-text:v1.5"
     extra: dict = field(default_factory=dict)
 
     def to_json(self) -> dict:
@@ -78,7 +96,7 @@ class Settings:
 
 
 def ensure_dirs() -> None:
-    for d in (DATA, SOURCES, TRANSCRIPTS, PARTIAL, LOGS, BACKUPS):
+    for d in (DATA, SOURCES, TRANSCRIPTS, PARTIAL, LOGS, BACKUPS, SLIDES):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -212,3 +230,14 @@ def transcript_path(transcript_id: int) -> Path:
 
 def partial_path(job_id: int) -> Path:
     return PARTIAL / f"{job_id}.txt"
+
+
+def slide_dir(project_id: int, doc_id: int) -> Path:
+    """Cartella di un documento di slide: `data/slides/<corso>/<doc>/`."""
+    return SLIDES / str(project_id) / str(doc_id)
+
+
+def slide_source_path(project_id: int, doc_id: int, ext: str) -> Path:
+    """Il file caricato, dentro la cartella del documento (nome fisso: il vero
+    nome sta in `slide_docs.name`, e su disco non deve poter uscire dalla dir)."""
+    return slide_dir(project_id, doc_id) / f"source{ext}"

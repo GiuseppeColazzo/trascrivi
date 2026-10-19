@@ -19,6 +19,15 @@ data/
 # Cache
 .pipcache/
 .piptmp/
+# Cartelle temporanee dei tool di sviluppo: Playwright non può scrivere nella
+# cartella di sistema in alcuni ambienti, quindi browser e file temporanei
+# stanno qui (vedi tools/shots.py). Sono centinaia di MB.
+.tmp/
+.pwbrowsers/
+# Screenshot di review: si rigenerano con `tools/shots.py`.
+tools/shots/out/
+# Pytest può creare le sue cartelle dentro il repo quando TMPDIR non è scrivibile.
+pytest-of-*/
 # Modelli Whisper/HF scaricati quando la cache di sistema non è scrivibile
 # (vedi `hf_cache_dir` in trascrivi_audio.py): pesano GB, non si versionano.
 models/

@@ -27,6 +27,7 @@ Redis.
 | **Python** | 3.11 or newer |
 | **GPU** | NVIDIA GPU is *optional*. With CUDA the default `distil-large-v3` model runs at several times realtime; on CPU the same code works but you should pick a smaller model — see [README_CPU.md](README_CPU.md) |
 | **New runtime dependencies** | `fastapi`, `uvicorn`, `python-multipart` (plus `pytest` for development), listed in `requirements.txt` |
+| **Slides, cards and decks** | `rapidocr` + `onnxruntime` (OCR), `python-pptx`, `python-docx`, `pypdfium2`, `genanki` — all optional and imported lazily: without them the app starts and only the slide/export features explain what to install. `playwright` is development-only (screenshots) |
 | **Already present** | `faster-whisper` 1.2.1, `torch` 2.5.1+cu121, `rich`, `cryptography`, `openai` — the project `.venv` is created with `--system-site-packages` so these are reused from the system installation |
 | **Disk** | Each Whisper model is 0.1–1.5 GB on first download from Hugging Face, plus the audio copies and transcripts under `data/` |
 
@@ -364,6 +365,93 @@ guarantees:
 > seeded itself — a model you chose yourself is never overwritten.
 
 
+### Slides, flashcards and Anki export
+
+The slides of a course can be used as **extra context** for flashcards, and Trascrivi is where you review
+and export the deck. Nothing here is automatic: uploading a deck, parsing it and matching it to lectures
+never calls a model over the network, and the cards are generated **only when you press the button**, with
+a local estimate of the cost shown first.
+
+**1. Upload.** In the course page, drop a `.pdf`, `.pptx`, `.docx`, `.png` or `.jpg` on the *Slide* box
+(or press Enter to pick a file). A `parse_slides` job runs locally:
+
+| Step | What happens |
+|---|---|
+| native text | `pypdfium2` for PDF pages, `python-pptx` for shapes, tables and **speaker notes**, `python-docx` for paragraphs and tables |
+| render | one PNG per page (long side 1600 px) in `data/slides/<course>/<doc>/pages/` — the preview, the OCR input and the image the vision mode can attach |
+| OCR | RapidOCR (ONNX, CPU) on pages without native text and on the images embedded in a deck; boxes are sorted into reading order (vertical band, then left to right) |
+| cleanup | lines that recur on more than half the pages (footers, logos, page numbers) are removed and listed in `slide_docs.boilerplate` |
+| complexity | a page is flagged `complex` when it has math symbols, sub/superscripts, text clipped at the edge, many short fragments, or a figure with little text |
+| VLM (optional) | `slides_vlm=auto` sends **only the complex pages** to a local vision model (Ollama, default `gemma3:4b`) which returns a structured rendering: text in reading order, formulas in LaTeX, figure structure, annotations |
+
+The VLM pass is a *rendering*, not a source of truth: a page whose math did not make it into LaTeX is
+marked `math_uncertain`, and no card about those formulas will be generated (see below). Pages rendered by
+hand from `data/slides/` are served at `/api/slides/<id>/pages/<n>.png`.
+
+The **Testi** button next to each deck opens what the parser actually read, page by page: the native/OCR text
+and, where it exists, the VLM rendering, with the `complessa` / `VLM` / `formula incerta` flags and a link to
+the page render. It is the answer to "why did this card come out like that" — and the reason a page is
+skipped is usually visible there in ten seconds.
+
+**2. Match.** *Associa alle lezioni* runs `embed_match`: pages and lecture summaries are embedded locally
+with Ollama (`nomic-embed-text:v1.5`), each page picks the most similar lecture above `match_threshold`,
+and runs shorter than three pages are absorbed by their neighbours (or dropped, if the two neighbours
+disagree). The proposals appear in the *Associa* dialog with a page preview and a score; **Accetta tutte**
+confirms them in one click, and a range can be removed or added by hand. A confirmed link (`manual`) is
+never overwritten by a later matching run.
+
+The matching also runs by itself, with no button: at the end of every `parse_slides` (upload or *Rileggi*),
+at the end of every transcription, and at the end of every `llm_summary` when the course has slides on file —
+a new summary *is* the other half of the comparison. Vectors are stored with a hash of the text they came
+from, so a rewritten summary or a page that gained a VLM rendering is re-embedded on the next run; nothing
+else is recomputed.
+
+**Slides first, lectures later** is a supported order. A deck uploaded into a course with no lectures is
+parsed normally — text, OCR, renders, page badges — and stays readable through *Testi*; the matching still
+runs, finds no candidate and proposes **nothing** (a job that finishes with `0 page ranges`, not an error),
+and *Associa alle lezioni* is disabled until a lecture exists. The proposals appear by themselves when the
+first transcription of that course finishes, and are refined when its summary is written.
+
+**3. Cards.** The **Cards** tab of a lecture shows the estimate — linked slides, context characters,
+estimated input tokens, images if vision is on, and whether the material is unchanged since the last run —
+then *Genera carte*. The context is the lecture summary plus the linked pages (`text` + `vlm_md`), inside
+`cards_context_chars`; the existing fronts of the course go into the prompt so the model does not rewrite a
+question that already exists.
+
+| Rule | Why it is there |
+|---|---|
+| the output is JSON `{"cards": [...]}` | one call, no per-card round trip; a bare array or a single card is accepted too |
+| dedup on normalized text | the same question with different punctuation is not a new card |
+| a card quoting LaTeX that is **not** in the material is dropped | a formula the model remembered is a formula nobody can check — this is the concrete form of "no invented formulas" |
+| `inputs_hash` cache | the same material is not paid twice; **forza** regenerates anyway |
+| regeneration replaces only untouched LLM cards | what you edited by hand stays, and is passed to the model as an existing front |
+| `uid` → Anki GUID | re-importing the deck **updates** the notes instead of duplicating them |
+
+Vision mode (`cards_vision=auto`) attaches up to three page renders (≤1024 px) when the chosen provider can
+read images — Ollama and OpenRouter can, DeepSeek cannot — and the estimate counts ~1000 tokens per image.
+
+**4. Export.** Two formats. Per lecture they are the *deck .apkg* / *.tsv* buttons in the Cards tab; per
+course the same pair at `/api/projects/<id>/deck.apkg` (all lectures, or `?transcripts=3,7`). The `.apkg`
+contains a Basic and a Cloze note type with fixed IDs, so the deck and the notes are updated in place;
+suspended cards are left out of the export (a suspension here is a decision taken here). The `.tsv` mirrors
+the demo decks in `decks/`: two columns for cloze, three for QA. A card taken from a slide carries
+`(slide N)` at the end of the back.
+
+```text
+Upload deck ──► parse_slides (local: text, render, OCR, boilerplate, complexity)
+            ──► VLM on complex pages (local, optional) ──► slide_pages.vlm_md
+            ──► embed_match (local embeddings) ──► proposals ──► confirm/​correct in UI
+[click] ──► llm_cards ──► cards in DB (edit / suspend) ──► .apkg / .tsv ──► Anki
+```
+
+> **Limits.** A `.pptx` has no page render without PowerPoint installed (text and speaker notes are read
+> anyway), so it has no preview and no vision mode. The VLM A/B on three real ECAI slides
+> (`tools/vlm_ab.py`, results in `PIANO-slide-e-carte.md`) found text, annotations and most formulas solid,
+> figure *relations* only partly reliable: figure descriptions are context worth reading, not a fact source.
+> No image inside the exported cards yet — just the `(slide N)` reference.
+
+---
+
 ### Course glossary
 
 Each course has a list of deterministic `find → replace` rules. A rule marked **`auto`** is applied
@@ -382,11 +470,11 @@ persisted in `localStorage`.
 | Screen | Route | What lives there |
 |---|---|---|
 | **Library** | `#/` | All courses with their transcript counts. Create, rename and delete a course. **Dump** opens a picker — course → lecture, transcript and/or summary — and downloads the selection as a zip. The header search box runs a full-text query across every transcript and links each hit with `#/t/<id>?q=word` so the matching segments are highlighted. |
-| **Course** | `#/p/<id>` | The lectures of one course, with *New lecture* and per-transcript rename/move/delete. Each lecture has a **summary** button: with a summary present it downloads the latest one as `.md`, without one it opens the generation dialog (provider, style, instructions) right there — while the job writes, the button is disabled, and it turns into the download by itself when the document is ready. This is also where the **Course glossary** is edited, including the `auto` checkbox. |
+| **Course** | `#/p/<id>` | The lectures of one course, each named by the title of its latest summary with the leading course name dropped (`Course — Lecture 9: …` → `Lecture 9: …`); titles without that separator and lectures without a summary keep the transcript/file title. Each row has a **summary** chip (downloads the latest `.md`, or opens the generation dialog; disabled while the job writes) and a **cards** chip (`3 cards`, or `+ cards` to open the lecture and generate). *New lecture* and per-lecture rename/move/delete. The **Slide** section: drop zone, per-deck status/`VLM` toggle/*Associa*/*Rileggi*/*Elimina*, expandable page chips (`giallo` complex, filled = VLM rendering, red = uncertain formula), and the assignment dialog with page previews and *Accetta tutte*. This is also where the **Course glossary** is edited, including the `auto` checkbox. |
 | **New lecture** | `#/p/<id>/new` | The two ways to add audio (drag & drop / file picker, or an absolute local path validated live through `/api/media/probe`) plus the full transcription form: model, language, device, compute type, beam size, VAD, word timestamps, initial prompt for course vocabulary, and the two optional LLM follow-ups — the correction agent and the summary, each with its own provider picker. The model and language menus carry flags (below). |
 | **Jobs** | `#/jobs` | Queue and history with progress bar, `x realtime` speed, ETA, and Cancel / Retry / Resume. The header badge shows the running count. |
-| **Transcript** | `#/t/<id>` | The registry entry: editor (one line = one segment, timestamps re-attached on save), **Segments** tab, **Proposals** tab with the agent's review and diff preview, **Summary** tab, and **Info** with revision history and exports. |
-| **Settings** | `#/settings` | Transcription defaults, agent chunk size, flush interval, summary defaults (style, output language, output token cap), backups to keep, default provider, disk usage (audio copies / data dir / free space), database backup, *Delete all audio copies*, *Unload models from RAM*, and the LLM provider configuration. |
+| **Transcript** | `#/t/<id>` | The registry entry: editor (one line = one segment, timestamps re-attached on save), **Segments** tab, **Proposals** tab with the agent's review and diff preview, **Summary** tab, **Cards** tab (estimate, generate/regenerate, edit, suspend, download `.apkg`/`.tsv`) and **Info** with revision history and exports. |
+| **Settings** | `#/settings` | Transcription defaults, agent chunk size, flush interval, summary defaults (style, output language, output token cap), **Slide e carte** (VLM mode and model, embedding model, matching threshold, cards per lecture, context size, cards language, images in the prompt), backups to keep, default provider, disk usage (audio copies / data dir / free space), database backup, *Delete all audio copies*, *Unload models from RAM*, and the LLM provider configuration. |
 
 ### Transcription options
 
@@ -577,7 +665,15 @@ The test suite is `pytest`-based and runs against the standard library plus the 
 | `tests/test_llm_parse.py` | JSON extraction from fenced or prefixed model replies, chunk budgets, API-key encryption round trip |
 | `tests/test_engine_guards.py` | the four engine bugs found on real audio: `batch_size` on the plain `transcribe`, batched inference with a clip range, the partial file that makes cancel/resume work, and the model download that dies when the Hugging Face cache is not writable |
 | `tests/test_markdown_render.py` | the Markdown renderer, executed for real with node: headings, lists and their closing, nested bullets, tables, code blocks kept verbatim, inline formatting, and the two safety properties — model-written HTML is escaped, and no link is ever generated |
-| `tests/test_web_contract.py` | the frontend: JS syntax (`node --check`), every `byId` having a matching element, every `/api/...` path the UI calls existing in the OpenAPI schema — both literal `href`s **and** the `api(...)` wrapper — every data name a view uses (`settings`, `providers`, `jobs`, …) being one it actually fetched, and the two flag menus (well-formed SVG flags inside their viewBox, fed by `/api/models` and not by a native `<select>`) |
+| `tests/test_web_contract.py` | the frontend: JS syntax (`node --check`), every `byId` having a matching element, every `/api/...` path the UI calls existing in the OpenAPI schema — both literal `href`s **and** the `api(...)` wrapper — every data name a view uses (`settings`, `providers`, `jobs`, …) being one it actually fetched, the two flag menus (well-formed SVG flags inside their viewBox, fed by `/api/models` and not by a native `<select>`), and the slide/cards surfaces (drop zone, matching, accept-all, cards tab wired to the job tick, settings fields) |
+| `tests/test_no_network.py` | the autouse guard that makes any real provider client impossible inside the suite: a chat call, a summary and the key-validation path that must still be reachable |
+| `tests/test_slides.py` | slide upload: file on disk under `data/slides/<course>/<doc>/`, `sha256` dedup, hostile filenames not escaping the folder, unsupported formats, list/delete, and the `parse_slides` job writing pages and queueing the matching |
+| `tests/test_slideparser.py` | the parser on real files built in-test: a hand-written PDF read without OCR, a page without text going through the OCR (with reading order), **RapidOCR reading a page we rendered ourselves**, PPTX text + speaker notes + pictures, DOCX paragraphs and tables, boilerplate removal (and not removing it below three pages), complexity signals, the missing-library message |
+| `tests/test_matching.py` | page → lecture assignment with deterministic fake embeddings: threshold, short-run smoothing (absorbed / dropped / kept at the edge), cached vectors, manual links surviving a new run, and the matching API |
+| `tests/test_vlm.py` | the VLM pass with a fake client: `auto` takes only complex pages, `on` takes every page with a render, the per-document cap, the cache, `math_uncertain` from both signals, and a missing/broken VLM not breaking a good parse |
+| `tests/test_cards.py` | context assembly and its budget, inputs-hash cache and invalidation, force + hand-edited cards kept, dedup, unverified LaTeX rejected, bad cloze rejected, slide number outside the context dropped, the card cap, garbage saved as nothing, the per-run ledger, the local estimate (images counted), and the cards API |
+| `tests/test_decks.py` | `.apkg` read back as SQLite: stable GUIDs from `uid`, suspended cards out, `(slide N)` on the back, the tags, the `.tsv` shape matching `decks/`, and the download endpoints |
+| `tests/test_tools_demo.py` | the synthetic dataset behind `tools/shots.py`, so a broken fixture is a test failure instead of a Playwright traceback |
 
 Synthetic fixtures are generated by `gen_testdata.py`, which writes "speech-like" audio with the same
 spectral and temporal structure as real speech (formants, syllables, pauses). It is not meant to
@@ -610,6 +706,11 @@ trascrivi/
 │   ├── jobs.py            queue worker, cancel, resume, crash recovery
 │   ├── corrections.py     deterministic edit-plan engine
 │   ├── summary.py         lecture → study notes (one call, with a word budget)
+│   ├── slideparser.py     PDF/PPTX/DOCX/images → pages of text + renders (OCR, boilerplate, complexity)
+│   ├── vlm.py             structured rendering of complex pages (local Ollama VLM)
+│   ├── matching.py        pages → lectures with local embeddings and short-run smoothing
+│   ├── cards.py           flashcards: context, prompt, cache, dedup, LaTeX gate
+│   ├── decks.py           .apkg / .tsv export with stable GUIDs
 │   ├── llm.py             OpenAI-compatible provider adapter
 │   ├── api.py             all REST routes under /api
 │   └── textutil.py        text ⇄ segments, timestamp parsing, markdown export
@@ -618,6 +719,12 @@ trascrivi/
 │   ├── app.js
 │   ├── markdown.js        Markdown → HTML for the summary (pure, testable with node)
 │   └── style.css
+├── tools/                 development only
+│   ├── shots.py           screenshots of the key views (Playwright, seeded temp DB)
+│   ├── seed_ui_demo.py    the synthetic dataset those screenshots need
+│   └── vlm_ab.py          A/B of the local VLM on the slides in slide_samples/
+├── slide_samples/         the three real slides the VLM prompt was tuned on
+├── decks/                 two demo decks in the .tsv format the export mirrors
 ├── tests/                 pytest suite
 └── data/                  all runtime state (gitignored) — see "Data layout" above
 ```
@@ -635,6 +742,10 @@ dependencies, each under its own license:
 - **rich** — terminal output of the CLI
 - **cryptography** — Fernet encryption of the stored API keys
 - **openai** — the OpenAI-compatible client used for Ollama, DeepSeek and OpenRouter
+- **rapidocr** (Apache-2.0, PP-OCR models via ONNX Runtime) — the OCR of slides
+- **pypdfium2**, **python-pptx**, **python-docx** — reading PDF, PPTX and DOCX
+- **genanki** — writing the `.apkg` for Anki
+- **Pillow** — resizing the page renders and the images inside decks
 
 The underlying models (`distil-large-v3`, `large-v3`, …) are downloaded from Hugging Face at runtime and
 remain subject to their own licenses.

@@ -16,5 +16,16 @@ cryptography
 # Client OpenAI-compatibile: un adapter copre OpenRouter, DeepSeek e Ollama.
 openai
 
+# --- Slide, OCR e mazzi (PIANO-slide-e-carte) ---
+# Import lazy: senza queste l'app parte lo stesso, e solo le funzioni slide
+# falliscono con un messaggio che dice cosa installare.
+rapidocr              # OCR ONNX (port dei modelli PP-OCR), gira su CPU
+onnxruntime           # gia' presente con faster-whisper
+python-pptx           # testo, note speaker e immagini dei PPTX
+python-docx           # paragrafi e immagini dei DOCX
+pypdfium2             # testo per pagina e render dei PDF
+genanki               # export .apkg per Anki
+
 # --- Solo sviluppo ---
 pytest
+playwright            # screenshot delle viste in tools/shots.py (dev-only)

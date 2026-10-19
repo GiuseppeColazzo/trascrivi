@@ -1009,18 +1009,344 @@ async function viewDashboard(nav, params, token) {
 /* ============================================================================
    Vista progetto
    ========================================================================== */
+/* ── Slide del corso ──────────────────────────────────────────────────────────
+   Upload (drag&drop o file picker), stato del parsing per documento, badge per
+   pagina e assegnazione alle lezioni. Un deck ha centinaia di pagine: i badge
+   stanno dentro un `<details>` chiuso, altrimenti la scheda del corso diventa
+   lunga quanto il corso. */
+function slideDocsCard({ projectId, docs, links, transcripts, jobs, settings }) {
+  const host = el("div", { class: "stack" });
+  const picker = el("input", {
+    type: "file", id: "slideUpload", multiple: "multiple", class: "hidden",
+    accept: ".pdf,.pptx,.docx,.png,.jpg,.jpeg,.webp",
+    onchange: (e) => { upload([...e.currentTarget.files]); e.currentTarget.value = ""; },
+  });
+
+  const drop = el("div", {
+    class: "drop", tabindex: "0", role: "button",
+    "aria-label": "Upload slides: drop files here, or press Enter to choose a file",
+    onclick: () => picker.click(),
+    onkeydown: (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); picker.click(); }
+    },
+    ondragover: (e) => { e.preventDefault(); drop.classList.add("is-over"); },
+    ondragleave: () => drop.classList.remove("is-over"),
+    ondrop: (e) => {
+      e.preventDefault();
+      drop.classList.remove("is-over");
+      upload([...e.dataTransfer.files]);
+    },
+  },
+    el("span", { class: "drop-mark", "aria-hidden": "true" }, "⇪"),
+    el("span", {}, "Drop a deck here or press Enter — PDF, PPTX, DOCX, PNG/JPG"));
+
+  let busy = false;
+
+  async function upload(files) {
+    if (busy || !files.length) return;
+    busy = true;
+    drop.classList.add("is-busy");
+    try {
+      for (const file of files) {
+        const form = new FormData();
+        form.append("file", file);
+        const res = await api(`/projects/${projectId}/slides`, { method: "POST", body: form });
+        if (res.duplicate_of) toast(`${file.name} è già stato caricato`, "");
+        else toast(`${file.name} in coda per il parsing`, "ok");
+      }
+      render();
+    } catch (err) {
+      toast(err.message, "err");
+    } finally {
+      busy = false;
+      drop.classList.remove("is-busy");
+    }
+  }
+
+  async function toggleVlm(doc, enabled) {
+    try {
+      await api(`/slides/${doc.id}`, { method: "PATCH", body: { vlm_enabled: enabled } });
+      toast(enabled ? "VLM attiva su questo deck: rileggi il file per applicarla"
+        : "VLM spenta su questo deck", "ok");
+    } catch (err) { toast(err.message, "err"); }
+  }
+
+  async function reparse(doc) {
+    try {
+      await api(`/slides/${doc.id}/reparse`, { method: "POST" });
+      toast("Documento in coda per la rilettura", "ok");
+      render();
+    } catch (err) { toast(err.message, "err"); }
+  }
+
+  async function removeDoc(doc) {
+    if (!(await confirmDialog("Delete slides",
+      `Delete “${doc.name}” and its pages? The assignments go with it.`))) return;
+    try {
+      await api(`/slides/${doc.id}`, { method: "DELETE" });
+      toast("Deck eliminato", "ok");
+      render();
+    } catch (err) { toast(err.message, "err"); }
+  }
+
+  async function findMatches() {
+    try {
+      await api(`/projects/${projectId}/slides/match`, { method: "POST" });
+      toast("Associazione in coda: le proposte compaiono qui", "ok");
+      render();
+    } catch (err) { toast(err.message, "err"); }
+  }
+
+  function pageChip(page) {
+    const flags = [page.complex ? "complex" : "", page.vlm_md ? "vlm" : "",
+      page.math_uncertain ? "uncertain" : ""].filter(Boolean);
+    const title = [`pagina ${page.page_no}`, page.complex ? "complessa" : "",
+      page.vlm_md ? "rendering VLM" : "", page.math_uncertain ? "formula incerta" : ""]
+      .filter(Boolean).join(" · ");
+    return el("a", {
+      class: `page-chip ${flags.join(" ")}`, title,
+      href: page.render_path ? `/api/slides/${page.doc_id}/pages/${page.page_no}.png` : null,
+      target: page.render_path ? "_blank" : null, rel: "noopener",
+    }, String(page.page_no));
+  }
+
+  /* Il testo che il parser ha letto: OCR/testo nativo e rendering VLM, pagina
+     per pagina. È la forma intermedia da cui nascono le carte, e senza vederla
+     non c'è modo di capire perché una carta manca o perché una pagina è
+     "incerta": si apre una volta e si legge tutto. */
+  function openTexts(doc) {
+    const body = el("div", { class: "stack", style: "max-height:62vh; overflow:auto" },
+      el("p", { class: "muted small" }, "Lettura del documento…"));
+    const dlg = el("dialog", { "aria-label": `Testo letto da ${doc.name}` },
+      el("h2", {}, "Testo letto dalle slide"),
+      el("p", { class: "hint" }, `“${doc.name}” — `,
+        "testo nativo/OCR e rendering VLM per pagina. È il materiale che finisce nel contesto delle carte; ",
+        "le pagine con formule incerte non producono carte di matematica."),
+      body,
+      el("div", { class: "split" },
+        el("button", { type: "button", onclick: () => dlg.close() }, "Chiudi")));
+    dlg.addEventListener("close", () => dlg.remove());
+    document.body.append(dlg);
+    dlg.showModal();
+
+    api(`/slides/${doc.id}`).then(({ pages }) => {
+      if (!pages || !pages.length) {
+        body.replaceChildren(el("p", { class: "muted small" }, "Nessuna pagina letta."));
+        return;
+      }
+      body.replaceChildren(...pages.map((page) => {
+        const flags = [page.complex ? "complessa" : "", page.vlm_md ? "VLM" : "",
+          page.math_uncertain ? "formula incerta" : ""].filter(Boolean).join(" · ");
+        const ocr = el("pre", { class: "page-text" }, page.text || "(nessun testo riconosciuto)");
+        const block = [el("div", { class: "small muted" }, "Testo / OCR"), ocr];
+        if (page.vlm_md) {
+          block.push(el("div", { class: "small muted", style: "margin-top:8px" }, "Rendering VLM"),
+            el("pre", { class: "page-text" }, page.vlm_md));
+        }
+        return el("details", { class: "page-doc" },
+          el("summary", {},
+            el("strong", {}, `pagina ${page.page_no}`),
+            flags ? el("span", { class: "small muted" }, ` · ${flags}`) : null),
+          el("div", { class: "stack", style: "margin-top:8px" }, ...block,
+            page.render_path
+              ? el("a", { class: "small", href: `/api/slides/${doc.id}/pages/${page.page_no}.png`,
+                  target: "_blank", rel: "noopener" }, "apri il render")
+              : null));
+      }));
+    }).catch((err) => {
+      body.replaceChildren(el("p", { class: "field-error" }, err.message));
+    });
+  }
+
+  function docRow(doc) {
+    const parsed = doc.n_parsed || 0;
+    const details = el("details", {
+      ontoggle: async (e) => {
+        if (!e.currentTarget.open || e.currentTarget.dataset.loaded) return;
+        e.currentTarget.dataset.loaded = "1";
+        const grid = e.currentTarget.querySelector(".page-grid");
+        try {
+          const { pages } = await api(`/slides/${doc.id}`);
+          grid.replaceChildren(...pages.map(pageChip));
+        } catch (err) { grid.replaceChildren(el("span", { class: "small muted" }, err.message)); }
+      },
+    }, el("summary", { class: "small muted" }, "pagine"),
+      el("div", { class: "small muted", style: "margin-top:6px" },
+        "giallo = complessa · pieno = rendering VLM · rosso = formula incerta",
+        " — clicca un numero per aprire il render"),
+      el("div", { class: "page-grid" }));
+
+    return el("div", { class: "slide-doc" },
+      el("div", { class: "split" },
+        el("div", { class: "grow" },
+          el("strong", {}, doc.name),
+          el("div", { class: "small muted" },
+            `${parsed} pagine · ${doc.n_complex || 0} complesse · ${doc.n_vlm || 0} con VLM · `,
+            `${doc.n_links || 0} intervalli assegnati`),
+          doc.error ? el("div", { class: "small field-error" }, doc.error) : null),
+        el("span", { class: `badge ${doc.status === "ready" ? "ok" : "warn"}` }, doc.status),
+        el("label", { class: "check", title: "Rendering strutturato delle pagine complesse" },
+          el("input", {
+            type: "checkbox", checked: doc.vlm_enabled ? "checked" : null,
+            onchange: (e) => toggleVlm(doc, e.currentTarget.checked),
+          }), el("span", {}, "VLM")),
+        el("button", {
+          type: "button", class: "btn", disabled: parsed ? null : "disabled",
+          title: "Assegna le pagine alle lezioni", onclick: () => openLinks(doc),
+        }, "Associa"),
+        el("button", {
+          type: "button", class: "btn", disabled: parsed ? null : "disabled",
+          title: "Testo letto da ogni pagina (OCR e rendering VLM)",
+          onclick: () => openTexts(doc),
+        }, "Testi"),
+        el("button", { type: "button", class: "btn", onclick: () => reparse(doc),
+          title: "Rilegge il file (utile dopo aver acceso la VLM)" }, "Rileggi"),
+        el("button", { type: "button", class: "danger", onclick: () => removeDoc(doc) },
+          "Elimina")),
+      parsed ? details : null);
+  }
+
+  /* La conferma delle assegnazioni: un intervallo per riga, con l'anteprima
+     della prima pagina — un numero di pagina da solo non dice se è giusto. */
+  function openLinks(doc) {
+    const mine = links.filter((l) => l.doc_id === doc.id);
+    // Un deck grande produce decine di intervalli: la finestra scorre, non cresce
+    // oltre lo schermo.
+    const rowsHost = el("div", { class: "stack", style: "max-height:52vh; overflow:auto" });
+    const from = el("input", { id: "linkFrom", type: "number", min: "1", max: String(doc.n_pages || 1),
+      value: "1", "aria-label": "Dalla pagina", style: "width:5em" });
+    const to = el("input", { id: "linkTo", type: "number", min: "1", max: String(doc.n_pages || 1),
+      value: String(doc.n_pages || 1), "aria-label": "Alla pagina", style: "width:5em" });
+    const target = el("select", { id: "linkTarget", "aria-label": "Lezione" },
+      transcripts.map((t) => el("option", { value: t.id }, t.title)));
+
+    function paint() {
+      rowsHost.replaceChildren(...(mine.length ? mine.map((link) => el("div", { class: "slide-link" },
+        el("img", {
+          class: "thumb", loading: "lazy", alt: "",
+          src: `/api/slides/${doc.id}/pages/${link.page_from}.png`,
+          onerror: (e) => { e.currentTarget.classList.add("hidden"); },
+        }),
+        el("div", { class: "grow" },
+          el("div", { class: "small" },
+            `pagine ${link.page_from}–${link.page_to} → `, el("strong", {}, link.transcript_title)),
+          el("div", { class: "small muted nowrap" },
+            el("span", { class: "badge" }, link.source),
+            ` score ${(link.score || 0).toFixed(2)}`),
+          el("div", { class: "small muted" }, (link.first_text || "").slice(0, 140))),
+        el("button", { type: "button", class: "btn", title: "Rimuovi questo intervallo",
+          onclick: async () => {
+            try {
+              await api(`/slide-links/${link.id}`, { method: "DELETE" });
+              mine.splice(mine.indexOf(link), 1);
+              paint();
+            } catch (err) { toast(err.message, "err"); }
+          } }, "Rimuovi"))) : [
+        el("p", { class: "muted small" }, "Nessun intervallo assegnato. ",
+          "Lancia il matching o aggiungine uno a mano."),
+      ]));
+    }
+    paint();
+
+    const dlg = el("dialog", { "aria-label": `Assign the pages of ${doc.name}` },
+      el("h2", {}, "Associa le pagine"),
+      el("p", { class: "hint" }, `“${doc.name}” — ${doc.n_pages || 0} pagine. `,
+        "Le proposte arrivano dal matching locale: qui si accettano, si correggono o si cancellano."),
+      rowsHost,
+      el("hr"),
+      el("div", { class: "split" },
+        el("span", { class: "small muted" }, "pagine"), from, el("span", { class: "muted" }, "→"), to,
+        target,
+        el("button", { type: "button", onclick: async () => {
+          try {
+            await api(`/slides/${doc.id}/links`, {
+              method: "POST",
+              body: {
+                page_from: Number(from.value), page_to: Number(to.value),
+                transcript_id: Number(target.value),
+              },
+            });
+            toast("Intervallo assegnato", "ok");
+            dlg.close();
+            render();
+          } catch (err) { toast(err.message, "err"); }
+        } }, "Assegna")),
+      el("div", { class: "split" },
+        el("button", { type: "button", onclick: () => dlg.close() }, "Chiudi"),
+        el("span", { class: "spacer" }),
+        el("button", { type: "button", class: "primary", onclick: async () => {
+          try {
+            await api(`/slides/${doc.id}/links/accept`, { method: "POST", body: {} });
+            toast("Assegnazioni confermate", "ok");
+            dlg.close();
+            render();
+          } catch (err) { toast(err.message, "err"); }
+        } }, "Accetta tutte")));
+
+    dlg.addEventListener("close", () => dlg.remove());
+    document.body.append(dlg);
+    dlg.showModal();
+  }
+
+  const ready = docs.filter((d) => d.status === "ready").length;
+  // Senza lezioni non c'è niente a cui associare: il bottone lo dice invece di
+  // accodare un job che trova zero candidati e non spiega perché.
+  const hasLectures = transcripts.length > 0;
+  setChildren(host,
+    el("div", { class: "split" },
+      el("div", { class: "grow" },
+        el("h2", {}, "Slide"),
+        el("p", { class: "muted small" },
+          "Il testo delle slide è contesto per le carte: PDF, PPTX, DOCX e immagini. ",
+          "Parsing, OCR e matching girano in locale; la VLM è opzionale e resta in locale.")),
+      el("button", {
+        type: "button", class: "btn", disabled: ready && hasLectures ? null : "disabled",
+        title: hasLectures
+          ? "Trova a quali lezioni appartengono le pagine"
+          : "Serve almeno una lezione trascritta in questo corso",
+        onclick: findMatches,
+      }, "Associa alle lezioni")),
+    picker,
+    drop,
+    docs.length
+      ? el("div", { class: "stack" }, docs.map(docRow))
+      : el("p", { class: "muted small" }, "Nessun deck caricato."),
+    !hasLectures && ready
+      ? notice("warn", "Questo corso non ha ancora lezioni: le pagine restano lette e "
+          + "consultabili (bottone Testi) e verranno associate da sole alla prima trascrizione.")
+      : null,
+    /* La VLM è quella che può mancare senza far fallire niente: se una pagina
+       complessa non ha il rendering, quasi sempre Ollama è spento o il modello
+       non è scaricato. Dirlo qui evita di cercare il problema nel parser. */
+    (settings.slides_vlm || "auto") !== "off"
+      && docs.some((d) => d.status === "ready" && (d.n_complex || 0) > 0 && !d.n_vlm)
+      ? notice("warn",
+          `Rendering VLM assente su ${settings.slides_vlm_model || "gemma3:4b"}: controlla `
+          + "che Ollama sia in esecuzione e il modello scaricato, poi premi ",
+          el("strong", {}, "Rileggi"))
+      : null,
+    docs.some((d) => ["parsing", "queued"].includes(d.status))
+      ? notice("warn", "Parsing in corso: la pagina si aggiorna da sola.")
+      : null);
+  return host;
+}
+
 async function viewProject(nav, params, projectId, token) {
   // `providers` e `settings` servono alla modale del riassunto, `jobs` a sapere
   // se uno è già in corso: come la vista trascrizione, la pagina se li procura
   // da sé invece di darli per globali.
-  const [project, { transcripts }, { terms }, { jobs }, providersRes, settingsRes] =
+  const [project, { transcripts }, { terms }, { jobs }, providersRes, settingsRes,
+    slidesRes, linksRes] =
     await Promise.all([
       api(`/projects/${projectId}`), api(`/transcripts?project_id=${projectId}`),
       api(`/terms?project_id=${projectId}`), api("/jobs?limit=20"),
       api("/providers"), api("/settings"),
+      api(`/projects/${projectId}/slides`), api(`/projects/${projectId}/slide-links`),
     ]);
   const providers = providersRes.providers;
   const settings = settingsRes.settings;
+  const slides = slidesRes.slides || [];
+  const slideLinks = linksRes.links || [];
   setDocTitle(`${project.name} · Course`);
 
   const totalSeconds = transcripts.reduce((sum, t) => sum + (t.duration || 0), 0);
@@ -1032,6 +1358,29 @@ async function viewProject(nav, params, projectId, token) {
      contenitore stabile che `paintSummaryCell` ridisegna quando serve. */
   const summaryCells = new Map();      // transcript id -> { t, host }
   const summaryPending = new Map();    // transcript id -> job in corso
+  /* Il chip delle carte, accanto a quello del riassunto: conteggio delle carte
+     della lezione e, mentre il job gira, lo stato. Le carte si generano dentro
+     la lezione (tab Carte), quindi qui il chip è un puntatore con il numero. */
+  const cardsCells = new Map();        // transcript id -> { t, host }
+  const cardsPending = new Map();      // transcript id -> job in corso
+
+  function paintCardsCell(id) {
+    const cell = cardsCells.get(id);
+    if (!cell) return;
+    const { t, host } = cell;
+    const job = cardsPending.get(id);
+    const counts = t.card_counts || {};
+    const total = counts.total || t.n_cards || 0;
+    setChildren(host,
+      job
+        ? el("button", { class: "btn", type: "button", disabled: "disabled",
+            title: "Le carte stanno venendo generate" }, "cards…")
+        : el("a", {
+            class: "btn", href: `#/t/${t.id}`,
+            title: total ? `${total} carte: aprì la lezione per rivederle`
+              : "Apri la lezione e genera le carte dal materiale",
+          }, total ? `${total} card${total === 1 ? "" : "s"}` : "+ cards"));
+  }
 
   function paintSummaryCell(id) {
     const cell = summaryCells.get(id);
@@ -1051,9 +1400,14 @@ async function viewProject(nav, params, projectId, token) {
   }
 
   // Polling mirato: parte solo quando c'è un riassunto in coda e si spegne da
-  // sé quando l'ultimo è finito — o quando si lascia la vista.
+  // sé quando l'ultimo è finito — o quando si lascia la vista. Lo stesso ciclo
+  // segue le slide (parsing e matching) e le carte: sono tutti job dello stesso
+  // corso, e un intervallo per tipo sarebbe tre timer per la stessa pagina.
   let coursePoll = null;
   let courseTickBusy = false;
+  const SLIDE_JOBS = ["parse_slides", "embed_match"];
+  let slidesPending = jobs.some((j) => SLIDE_JOBS.includes(j.kind) && j.project_id === projectId
+    && ["queued", "running"].includes(j.status));
 
   function startCoursePoll() {
     if (!coursePoll) coursePoll = setInterval(courseTick, 2000);
@@ -1091,6 +1445,40 @@ async function viewProject(nav, params, projectId, token) {
       summaryPending.set(id, job);
     });
 
+    // Carte in corso: stesso schema del riassunto, cella diversa.
+    const cardsActive = new Map();
+    transcripts.forEach((t) => {
+      const job = latest.find((j) => j.kind === "llm_cards" && j.transcript_id === t.id
+        && ["queued", "running"].includes(j.status));
+      if (job) cardsActive.set(t.id, job);
+    });
+    cardsActive.forEach((job, id) => {
+      if (!cardsPending.has(id)) paintCardsCell(id);
+      cardsPending.set(id, job);
+    });
+    for (const id of [...cardsPending.keys()]) {
+      if (cardsActive.has(id)) continue;
+      cardsPending.delete(id);
+      try {
+        const fresh = await api(`/transcripts/${id}`);
+        const cell = cardsCells.get(id);
+        if (cell) cell.t.card_counts = fresh.card_counts;
+        if (isCurrent(token)) paintCardsCell(id);
+        if (fresh.card_counts && fresh.card_counts.total) toast("Carte pronte", "ok");
+      } catch { /* si riprova al prossimo giro */ }
+    }
+
+    // Slide: parsing o matching finiti -> la pagina si ridisegna una volta sola,
+    // con i nuovi conteggi e i badge delle pagine.
+    const stillSlides = latest.some((j) => SLIDE_JOBS.includes(j.kind)
+      && j.project_id === projectId && ["queued", "running"].includes(j.status));
+    if (slidesPending && !stillSlides && isCurrent(token)) {
+      slidesPending = false;
+      render();
+      return;
+    }
+    slidesPending = stillSlides;
+
     // Usciti dalla lista: o completati o falliti. L'esito non si indovina dallo
     // stato del job (che può non essere più tra gli ultimi 20): si rilegge la
     // trascrizione e si guarda se il riassunto c'è.
@@ -1112,7 +1500,7 @@ async function viewProject(nav, params, projectId, token) {
       else if (ended && ended.error) toast(`Summary failed: ${ended.error}`, "err");
       else toast("The summary job ended without a summary — check Jobs", "err");
     }
-    if (!summaryPending.size) stopCoursePoll();
+    if (!summaryPending.size && !cardsPending.size && !slidesPending) stopCoursePoll();
   }
 
   /* La modale di generazione: le stesse scelte della tab Summary (provider,
@@ -1189,11 +1577,20 @@ async function viewProject(nav, params, projectId, token) {
     dlg.showModal();
   }
 
+  /* Il nome della lezione che si legge in tabella arriva dal server come
+     `display_title`: il titolo dell'ultimo riassunto senza il prefisso della
+     materia ("lecture1410" non dice niente mentre si cerca una lezione), o
+     il titolo della trascrizione quando il riassunto non c'è. Il nome del
+     file resta nel tooltip del link, così non si perde l'aggancio con l'audio. */
+  const lessonName = (t) => t.display_title || t.title;
+
   const rows = transcripts.map((t) => {
     const summaryHost = el("span", { class: "summary-cell" });
     summaryCells.set(t.id, { t, host: summaryHost });
+    const cardsHost = el("span", { class: "summary-cell" });
+    cardsCells.set(t.id, { t, host: cardsHost });
     return el("tr", {},
-      el("td", {}, el("a", { href: `#/t/${t.id}` }, t.title),
+      el("td", {}, el("a", { href: `#/t/${t.id}`, title: t.title }, lessonName(t)),
         t.description ? el("div", { class: "small muted" }, t.description) : null),
       el("td", { class: "nowrap small" }, fmtTs(t.duration)),
       el("td", { class: "nowrap small muted" }, t.language ? t.language.toUpperCase() : "—"),
@@ -1202,21 +1599,26 @@ async function viewProject(nav, params, projectId, token) {
       el("td", { class: "actions" },
         el("a", { class: "btn", href: `/api/transcripts/${t.id}/export?format=txt` }, "txt"),
         summaryHost,
+        cardsHost,
         el("button", { class: "danger", onclick: () => removeTranscript(t) }, "Delete")));
   });
 
-  // Stato iniziale delle celle: una lezione con un riassunto già in coda non
-  // deve mostrare "+ summary" e accodarne un secondo.
+  // Stato iniziale delle celle: una lezione con un riassunto (o delle carte) già
+  // in coda non deve mostrare "+ summary" e accodarne un secondo.
   transcripts.forEach((t) => {
     const job = jobs.find((j) => j.kind === "llm_summary" && j.transcript_id === t.id
       && ["queued", "running"].includes(j.status));
     if (job) summaryPending.set(t.id, job);
     paintSummaryCell(t.id);
+    const cardJob = jobs.find((j) => j.kind === "llm_cards" && j.transcript_id === t.id
+      && ["queued", "running"].includes(j.status));
+    if (cardJob) cardsPending.set(t.id, cardJob);
+    paintCardsCell(t.id);
   });
-  if (summaryPending.size) startCoursePoll();
+  if (summaryPending.size || cardsPending.size || slidesPending) startCoursePoll();
 
   async function removeTranscript(t) {
-    if (!await confirmDialog("Delete transcript", `Delete “${t.title}”? This cannot be undone.`)) return;
+    if (!await confirmDialog("Delete transcript", `Delete “${lessonName(t)}”? This cannot be undone.`)) return;
     await api(`/transcripts/${t.id}`, { method: "DELETE" });
     toast("Transcript deleted", "ok");
     render();
@@ -1301,6 +1703,9 @@ async function viewProject(nav, params, projectId, token) {
         el("div", { class: "empty-actions" },
           el("button", { class: "primary",
             onclick: () => { location.hash = `#/p/${projectId}/new`; } }, "Add the first lecture")))),
+    el("div", { class: "card" },
+      slideDocsCard({ projectId, docs: slides, links: slideLinks, transcripts, jobs,
+        settings })),
     el("div", { class: "card" },
       el("h2", {}, "Course glossary"),
       el("p", { class: "muted small" },
@@ -2290,6 +2695,204 @@ async function viewTranscript(nav, params, transcriptId, token) {
     }
   }
 
+  // ── Tab Cards ──────────────────────────────────────────────────────────────
+  /* Le carte: generazione su click (con preventivo locale), revisione, modifica,
+     sospensione ed export. Il preventivo è la parte importante: nessuna chiamata
+     parte senza che l'utente abbia visto cosa costa e se è già in cache. */
+  const cardsHost = el("div", { class: "stack" });
+  const cardsBar = el("div", { class: "split" });
+  const tabCards = el("div", { class: "stack" }, cardsBar, cardsHost);
+
+  let cardList = [];
+  let cardCounts = { total: 0, active: 0, suspended: 0 };
+  let cardsEstimate = null;
+  let cardsJob = jobs.find((j) => j.kind === "llm_cards" && j.transcript_id === t.id
+    && ["queued", "running"].includes(j.status)) || null;
+
+  const cardsProvider = el("select", {
+    id: "cardsProvider", "aria-label": "Provider for the cards",
+    // `select` è a larghezza piena per i form: in una barra di comandi va limitato,
+    // altrimenti occupa una riga intera e manda i bottoni a capo.
+    style: "max-width:280px",
+  },
+    providers.filter((p) => p.enabled).map((p) => el("option", {
+      value: p.id, selected: p.id === settings.default_provider_id ? "selected" : null,
+    }, `${p.name} · ${p.model || "no model"}`)));
+  const cardsForce = el("input", { type: "checkbox", id: "cardsForce" });
+
+  function renderCardsBar() {
+    const hasProvider = providers.some((p) => p.enabled);
+    const cached = Boolean(cardsEstimate && cardsEstimate.cached);
+    setChildren(cardsBar,
+      ...(hasProvider ? [cardsProvider] : []),
+      el("label", { class: "check", title: "Rigenera anche se il materiale non è cambiato" },
+        cardsForce, el("span", {}, "forza")),
+      el("button", {
+        class: "primary", type: "button",
+        disabled: hasProvider && !cardsJob ? null : "disabled",
+        onclick: () => runCards(cached || cardsForce.checked),
+      }, cardsJob ? "Generazione…" : cached ? "Aggiorna (in cache)" : (cardList.length ? "Rigenera" : "Genera carte")),
+      el("span", { class: "spacer" }),
+      cardList.length
+        ? el("a", { class: "btn", href: `/api/transcripts/${t.id}/deck.apkg`,
+            title: "Importa in Anki: re-importare aggiorna le note" }, "deck .apkg")
+        : null,
+      cardList.length
+        ? el("a", { class: "btn", href: `/api/transcripts/${t.id}/deck.tsv` }, ".tsv")
+        : null);
+  }
+
+  function cardText(text) {
+    /* Le cancellazioni di un cloze si vedono: `{{c1::x}}` diventa una parola
+       evidenziata, senza passare dall'HTML (il testo arriva dal modello). */
+    const parts = [];
+    const re = /\{\{c(\d)::(.+?)\}\}/g;
+    let last = 0;
+    let match;
+    while ((match = re.exec(text || "")) !== null) {
+      if (match.index > last) parts.push(text.slice(last, match.index));
+      parts.push(el("mark", {}, match[2]));
+      last = match.index + match[0].length;
+    }
+    if (last < (text || "").length) parts.push(text.slice(last));
+    return parts.length ? parts : [text || ""];
+  }
+
+  function cardRow(card) {
+    const row = el("div", { class: "card-row" });
+    const actions = el("div", { class: "actions" });
+
+    function view() {
+      setChildren(row,
+        el("div", { class: "grow" },
+          el("div", { class: "small" },
+            el("span", { class: `badge ${card.kind === "cloze" ? "warn" : "ok"}` }, card.kind),
+            card.slide_ref ? el("span", { class: "small muted" }, ` slide ${card.slide_ref}`) : null,
+            card.edited ? el("span", { class: "badge" }, "edited") : null,
+            card.status === "suspended" ? el("span", { class: "badge" }, "suspended") : null),
+          el("div", { class: "card-front" }, cardText(card.front)),
+          card.back ? el("div", { class: "small muted" }, cardText(card.back)) : null),
+        actions);
+      setChildren(actions,
+        el("button", { class: "btn", type: "button", onclick: edit }, "Modifica"),
+        el("button", {
+          class: "btn", type: "button",
+          onclick: () => patch({
+            status: card.status === "suspended" ? "active" : "suspended",
+          }),
+        }, card.status === "suspended" ? "Riattiva" : "Sospendi"),
+        el("button", {
+          class: "danger", type: "button",
+          onclick: async () => {
+            if (!(await confirmDialog("Elimina carta", "Eliminare questa carta?"))) return;
+            try {
+              await api(`/cards/${card.id}`, { method: "DELETE" });
+              cardList = cardList.filter((c) => c.id !== card.id);
+              paint();
+            } catch (err) { toast(err.message, "err"); }
+          },
+        }, "Elimina"));
+    }
+
+    function edit() {
+      const front = el("textarea", { rows: "2", "aria-label": "Davanti" }, card.front);
+      const back = el("textarea", { rows: "2", "aria-label": "Retro" }, card.back || "");
+      setChildren(row,
+        el("div", { class: "stack grow" },
+          front,
+          card.kind === "cloze" ? null : back,
+          el("div", { class: "actions" },
+            el("button", { class: "primary", type: "button", onclick: async () => {
+              await patch({ front: front.value, back: back.value });
+            } }, "Salva"),
+            el("button", { type: "button", onclick: view }, "Annulla"))));
+      front.focus();
+    }
+
+    async function patch(fields) {
+      try {
+        const updated = await api(`/cards/${card.id}`, { method: "PATCH", body: fields });
+        Object.assign(card, updated);
+        view();
+        if ("status" in fields) await loadCards();
+      } catch (err) { toast(err.message, "err"); }
+    }
+
+    view();
+    return row;
+  }
+
+  function paint() {
+    cardCounts = {
+      total: cardList.length,
+      active: cardList.filter((c) => c.status !== "suspended").length,
+      suspended: cardList.filter((c) => c.status === "suspended").length,
+    };
+    renderCardsBar();
+    setChildren(cardsHost,
+      cardsEstimate
+        ? el("p", { class: "muted small" },
+            cardsEstimate.slides
+              ? `${cardsEstimate.slides} slide assegnate · `
+              : "Nessuna slide assegnata a questa lezione: le carte verranno dal solo riassunto · ",
+            `${cardsEstimate.chars} caratteri di contesto · ~${cardsEstimate.tokens_in} token in ingresso`,
+            cardsEstimate.images ? ` (${cardsEstimate.images} immagini)` : "",
+            ` · max ${cardsEstimate.cards_max} carte`,
+            cardsEstimate.cached ? " · materiale invariato: nessuna chiamata necessaria" : "")
+        : null,
+      cardsJob
+        ? el("div", { class: "card" }, el("div", { class: "split" },
+            el("span", { class: "spin" }),
+            el("div", { class: "grow" },
+              el("p", {}, cardsJob.message || "Generazione delle carte…"),
+              el("p", { class: "muted small tabnum" }, `job #${cardsJob.id} · ${Math.round((cardsJob.progress || 0) * 100)}%`)),
+            el("a", { href: `#/jobs?focus=${cardsJob.id}` }, "Follow in Jobs")))
+        : null,
+      cardList.length
+        ? el("div", { class: "stack" }, cardList.map(cardRow))
+        : el("div", { class: "empty" },
+            el("p", { class: "empty-kicker" }, "Nessuna carta"),
+            el("p", {}, "Le carte nascono dal riassunto e dalle slide assegnate a questa lezione. ",
+              "La generazione parte solo quando premi il bottone: prima vedi quanto costa.")));
+  }
+
+  async function loadCards() {
+    try {
+      const res = await api(`/transcripts/${transcriptId}/cards`);
+      cardList = res.cards || [];
+      cardsEstimate = await api(`/transcripts/${transcriptId}/cards/estimate`);
+      if (isCurrent(token)) paint();
+    } catch (err) { toast(err.message, "err"); }
+  }
+
+  async function runCards(force) {
+    if (!providers.some((p) => p.enabled)) {
+      toast("Configure an LLM provider first", "err");
+      return;
+    }
+    if (cardsEstimate && cardsEstimate.cached && !force) {
+      const ok = await confirmDialog("Materiale invariato",
+        "Il materiale non è cambiato da quando hai generato queste carte. "
+        + "Rigenerare costa una chiamata e sostituisce le carte non modificate.", "Rigenera");
+      if (!ok) return;
+      force = true;
+    }
+    try {
+      const res = await api(`/transcripts/${transcriptId}/cards`, {
+        method: "POST",
+        body: {
+          provider_id: cardsProvider.value ? Number(cardsProvider.value) : null,
+          force: Boolean(force),
+        },
+      });
+      cardsJob = res.job || { id: null, status: "queued", progress: 0, message: "queued" };
+      toast("Generazione carte in coda", "ok");
+      renderJobBanners();
+      paint();
+      startJobPoll();
+    } catch (err) { toast(err.message, "err"); }
+  }
+
   const tabInfo = el("div", { class: "stack" }, detailsCard, historyCard);
 
   function row(k, v) { return el("tr", {}, el("th", {}, k), el("td", {}, String(v))); }
@@ -2299,6 +2902,7 @@ async function viewTranscript(nav, params, transcriptId, token) {
     segments: tabSegments,
     proposals: tabProposals,
     summary: tabSummary,
+    cards: tabCards,
     info: tabInfo,
   };
   const panel = el("div", { role: "tabpanel", "aria-label": "Transcript view" }, tabs.content);
@@ -2341,7 +2945,8 @@ async function viewTranscript(nav, params, transcriptId, token) {
   let bannerEntries = [];
 
   function renderJobBanners() {
-    const active = [["Correction agent", runningFix], ["Summary", summaryJob]]
+    const active = [["Correction agent", runningFix], ["Summary", summaryJob],
+      ["Cards", cardsJob]]
       .filter(([, job]) => Boolean(job));
     const key = active.map(([label, job]) => `${label}:${job.id}`).join("|");
     // Si ricostruisce il DOM solo quando cambia *quali* lavori sono in corso.
@@ -2390,7 +2995,7 @@ async function viewTranscript(nav, params, transcriptId, token) {
   let jobTickBusy = false;
 
   function startJobPoll() {
-    if (jobPoll || !(runningFix || summaryJob)) return;
+    if (jobPoll || !(runningFix || summaryJob || cardsJob)) return;
     jobPoll = setInterval(jobTick, 2000);
   }
 
@@ -2417,8 +3022,10 @@ async function viewTranscript(nav, params, transcriptId, token) {
     const mine = (kind) => latest.find((j) => j.kind === kind && j.transcript_id === t.id
       && ["queued", "running"].includes(j.status)) || null;
     const finishedSummary = summaryJob && !mine("llm_summary");
+    const finishedCards = cardsJob && !mine("llm_cards");
     runningFix = mine("llm_fix");
     summaryJob = mine("llm_summary");
+    cardsJob = mine("llm_cards");
 
     renderJobBanners();
     if (finishedSummary) {
@@ -2429,7 +3036,13 @@ async function viewTranscript(nav, params, transcriptId, token) {
       renderSummaryBar();
       renderSummaryBody();
     }
-    if (!runningFix && !summaryJob) stopJobPoll();
+    if (finishedCards) {
+      await loadCards();
+      if (isCurrent(token)) toast("Carte pronte", "ok");
+    } else {
+      paint();
+    }
+    if (!runningFix && !summaryJob && !cardsJob) stopJobPoll();
   }
 
   if (!isCurrent(token)) return;
@@ -2457,6 +3070,8 @@ async function viewTranscript(nav, params, transcriptId, token) {
   await loadProposals();
   await loadSummaries();
   renderJobBanners();
+  paint();
+  loadCards();
   startJobPoll();
   onViewTeardown(stopJobPoll);
 
@@ -2534,6 +3149,14 @@ async function viewSettings(nav, params, token) {
         summary_style: byId("sSumStyle").value,
         summary_language: byId("sSumLang").value.trim(),
         backup_keep: Number(byId("sKeep").value) || 5,
+        cards_max: Number(byId("sCardsMax").value) || 12,
+        cards_language: byId("sCardsLang").value.trim(),
+        cards_context_chars: Number(byId("sCardsCtx").value) || 12000,
+        cards_vision: byId("sCardsVision").value,
+        slides_vlm: byId("sVlmMode").value,
+        slides_vlm_model: byId("sVlmModel").value.trim(),
+        match_threshold: Number(byId("sMatch").value) || 0.55,
+        embed_model: byId("sEmbed").value.trim(),
       } });
       toast("Settings saved", "ok");
     } catch (err) { toast(err.message, "err"); }
@@ -2574,6 +3197,46 @@ async function viewSettings(nav, params, token) {
         "The summary is written in a single call: the whole transcript goes in, which is why the ",
         "length budget can be respected. This is a ceiling for the output only — the real limit is ",
         "the word budget, which follows the style and the length of the transcript."),
+      el("button", { class: "primary", type: "submit" }, "Save settings")),
+
+    el("div", { class: "card" }, el("h2", {}, "Slide e carte"),
+      el("p", { class: "hint" },
+        "Le slide sono contesto per le carte: parsing e OCR girano sempre in locale. ",
+        "La VLM (Ollama) rende leggibili formule e diagrammi delle pagine complesse; ",
+        "gli embeddings assegnano le pagine alle lezioni. Nessuna chiave API entra in gioco ",
+        "finché non premi “Genera carte”.",),
+      el("div", { class: "row" },
+        el("div", { class: "grow field" }, el("label", { for: "sVlmMode" }, "Rendering VLM"),
+          el("select", { id: "sVlmMode" },
+            [["off", "spenta"], ["auto", "solo pagine complesse"], ["on", "tutte le pagine"]]
+              .map(([v, label]) => el("option", {
+                value: v, selected: v === (settings.slides_vlm || "auto") ? "selected" : null,
+              }, label)))),
+        el("div", { class: "grow field" }, el("label", { for: "sVlmModel" }, "Modello VLM"),
+          el("input", { id: "sVlmModel", value: settings.slides_vlm_model || "gemma3:4b",
+            placeholder: "gemma3:4b" })),
+        el("div", { class: "grow field" }, el("label", { for: "sEmbed" }, "Modello embeddings"),
+          el("input", { id: "sEmbed", value: settings.embed_model || "nomic-embed-text:v1.5" }))),
+      el("div", { class: "row" },
+        el("div", { class: "grow field" }, el("label", { for: "sMatch" }, "Soglia di matching"),
+          el("input", { id: "sMatch", type: "number", min: "0.3", max: "0.9", step: "0.05",
+            value: settings.match_threshold ?? 0.55 })),
+        el("div", { class: "grow field" }, el("label", { for: "sCardsMax" }, "Carte per lezione"),
+          el("input", { id: "sCardsMax", type: "number", min: "3", max: "60",
+            value: settings.cards_max ?? 12 })),
+        el("div", { class: "grow field" }, el("label", { for: "sCardsCtx" }, "Contesto (caratteri)"),
+          el("input", { id: "sCardsCtx", type: "number", min: "2000", max: "60000", step: "1000",
+            value: settings.cards_context_chars ?? 12000 }))),
+      el("div", { class: "row" },
+        el("div", { class: "grow field" }, el("label", { for: "sCardsLang" }, "Lingua delle carte"),
+          el("input", { id: "sCardsLang", value: settings.cards_language || "",
+            placeholder: "vuoto = lingua del riassunto" })),
+        el("div", { class: "grow field" }, el("label", { for: "sCardsVision" }, "Immagini nel prompt"),
+          el("select", { id: "sCardsVision" },
+            [["off", "no"], ["auto", "sì, se il modello le legge"]]
+              .map(([v, label]) => el("option", {
+                value: v, selected: v === (settings.cards_vision || "off") ? "selected" : null,
+              }, label))))),
       el("button", { class: "primary", type: "submit" }, "Save settings")),
 
     el("div", { class: "card" }, el("h2", {}, "LLM providers"),

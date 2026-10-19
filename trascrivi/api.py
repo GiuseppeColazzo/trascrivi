@@ -32,7 +32,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from trascrivi_audio import MODELS
 
-from . import config, db, jobs, llm, models
+from . import config, db, decks, jobs, llm, models
 from . import corrections as corr
 from .textutil import build_markdown, parse_raw, segments_to_text, text_to_segments
 
@@ -240,8 +240,7 @@ def health() -> dict:
         "hardware": hw,
         "providers": providers,
         "queue": jobs.queue_size(),
-        "has_llm_provider": any(p["enabled"] and (p["has_key"] or p["name"] == "ollama")
-                               for p in providers),
+        "has_llm_provider": bool(db.usable_providers()),
         "defaults": {
             "model": config.load_settings().default_model,
             "language": config.load_settings().default_language,
@@ -355,6 +354,7 @@ def delete_project(project_id: int) -> dict:
     src_dir = config.SOURCES / str(project_id)
     if src_dir.exists():
         shutil.rmtree(src_dir, ignore_errors=True)
+    shutil.rmtree(config.SLIDES / str(project_id), ignore_errors=True)
     return {"deleted_sources": len(payload["sources"]),
             "deleted_transcripts": len(payload["transcripts"])}
 
@@ -488,6 +488,198 @@ def probe_media_endpoint(path: str) -> dict:
     }
 
 
+# ── Slide ────────────────────────────────────────────────────────────────────
+class SlidePatch(BaseModel):
+    vlm_enabled: bool | None = None
+
+
+class SlideLinkIn(BaseModel):
+    """Un intervallo di pagine assegnato a una lezione (correzione manuale)."""
+
+    page_from: int = Field(ge=1)
+    page_to: int = Field(ge=1)
+    transcript_id: int
+
+
+class SlideLinksAccept(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+
+
+@router.get("/projects/{project_id}/slides")
+def get_slides(project_id: int) -> dict:
+    if not db.get_project(project_id):
+        raise HTTPException(404, "Project not found")
+    return {"slides": db.list_slide_docs(project_id)}
+
+
+@router.post("/projects/{project_id}/slides", status_code=201)
+async def upload_slide(project_id: int, file: UploadFile = File(...)) -> dict:
+    """
+    Carica un documento di slide e avvia il parsing locale.
+
+    Il file finisce in `data/slides/<corso>/<doc>/source<ext>`: su disco il nome
+    è fisso, quindi un nome ostile non può uscire dalla cartella. Lo `sha256` fa
+    da dedup: lo stesso deck caricato due volte è un errore frequente, e
+    rifarebbe il parsing (con l'OCR) per niente.
+    """
+    from . import slideparser
+
+    if not db.get_project(project_id):
+        raise HTTPException(404, "Project not found")
+    name = Path(file.filename or "slides").name
+    ext = Path(name).suffix.lower()
+    if ext not in slideparser.SLIDE_EXTS:
+        raise HTTPException(400, f"Unsupported format '{ext}'. "
+                                 f"Allowed: {', '.join(sorted(slideparser.SLIDE_EXTS))}")
+
+    staging = config.SLIDES / str(project_id)
+    staging.mkdir(parents=True, exist_ok=True)
+    tmp = staging / f".upload-{int(time.time() * 1000)}{ext}"
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with tmp.open("wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > config.MAX_SLIDE_BYTES:
+                    raise HTTPException(413, "Slides too large (limit 200 MB)")
+                digest.update(chunk)
+                out.write(chunk)
+    except HTTPException:
+        _unlink(tmp)
+        raise
+    except OSError as exc:
+        _unlink(tmp)
+        raise HTTPException(500, f"Write failed: {exc}") from exc
+
+    sha = digest.hexdigest()
+    duplicate = db.find_duplicate_slide(project_id, sha)
+    if duplicate:
+        _unlink(tmp)
+        return {"slide": duplicate, "duplicate_of": duplicate["id"], "job_id": None}
+
+    doc_id = db.create_slide_doc(project_id, name, ext, sha)
+    target = config.slide_source_path(project_id, doc_id, ext)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp.replace(target)
+    job_id = db.create_job("parse_slides", {"doc_id": doc_id}, project_id=project_id)
+    jobs.enqueue(job_id)
+    return {"slide": db.get_slide_doc(doc_id), "duplicate_of": None, "job_id": job_id}
+
+
+@router.get("/slides/{doc_id}")
+def get_slide(doc_id: int) -> dict:
+    """Documento + pagine: quello che serve alla UI per i badge e le anteprime."""
+    doc = db.get_slide_doc(doc_id)
+    if not doc:
+        raise HTTPException(404, "Slide document not found")
+    pages = db.list_slide_pages(doc_id)
+    return {"slide": doc, "pages": pages, "links": db.list_slide_links(doc_id=doc_id)}
+
+
+@router.patch("/slides/{doc_id}")
+def patch_slide(doc_id: int, body: SlidePatch) -> dict:
+    if not db.get_slide_doc(doc_id):
+        raise HTTPException(404, "Slide document not found")
+    if body.vlm_enabled is not None:
+        db.update_slide_doc(doc_id, {"vlm_enabled": 1 if body.vlm_enabled else 0})
+    return {"slide": db.get_slide_doc(doc_id)}
+
+
+@router.post("/slides/{doc_id}/reparse", status_code=201)
+def reparse_slide(doc_id: int) -> dict:
+    """Rilegge il documento: serve dopo aver acceso la VLM su un deck già letto."""
+    doc = db.get_slide_doc(doc_id)
+    if not doc:
+        raise HTTPException(404, "Slide document not found")
+    job_id = db.create_job("parse_slides", {"doc_id": doc_id},
+                           project_id=doc["project_id"])
+    jobs.enqueue(job_id)
+    return {"job": db.get_job(job_id)}
+
+
+@router.delete("/slides/{doc_id}")
+def delete_slide(doc_id: int) -> dict:
+    doc = db.delete_slide_doc(doc_id)
+    if not doc:
+        raise HTTPException(404, "Slide document not found")
+    shutil.rmtree(config.slide_dir(doc["project_id"], doc_id), ignore_errors=True)
+    return {"deleted": doc_id}
+
+
+@router.get("/slides/{doc_id}/pages/{page_no}.png")
+def slide_page_image(doc_id: int, page_no: int) -> Any:
+    """Il render di una pagina: anteprima in UI e allegato della vision mode."""
+    page = db.get_slide_page(doc_id, page_no)
+    if not page or not page.get("render_path"):
+        raise HTTPException(404, "No render for this page")
+    path = Path(page["render_path"]).resolve()
+    # Il percorso viene dal database, non dall'utente, ma un render_path corrotto
+    # non deve poter servire un file qualunque del disco.
+    if not path.is_relative_to(config.SLIDES.resolve()) or not path.exists():
+        raise HTTPException(404, "No render for this page")
+    return FileResponse(path, media_type="image/png")
+
+
+@router.post("/projects/{project_id}/slides/match", status_code=201)
+def match_slides(project_id: int) -> dict:
+    """Accoda il matching pagine -> lezioni (embeddings locali)."""
+    if not db.get_project(project_id):
+        raise HTTPException(404, "Project not found")
+    if not db.list_slide_docs(project_id):
+        raise HTTPException(422, "Upload a slide deck first")
+    job_id = db.create_job("embed_match", {"project_id": project_id},
+                           project_id=project_id)
+    jobs.enqueue(job_id)
+    return {"job": db.get_job(job_id)}
+
+
+@router.get("/projects/{project_id}/slide-links")
+def get_slide_links(project_id: int, doc_id: int | None = None) -> dict:
+    if not db.get_project(project_id):
+        raise HTTPException(404, "Project not found")
+    return {"links": db.list_slide_links(project_id, doc_id)}
+
+
+@router.post("/slides/{doc_id}/links", status_code=201)
+def add_slide_link(doc_id: int, body: SlideLinkIn) -> dict:
+    """Assegna a mano un intervallo di pagine a una lezione."""
+    doc = db.get_slide_doc(doc_id)
+    if not doc:
+        raise HTTPException(404, "Slide document not found")
+    if body.page_to < body.page_from:
+        raise HTTPException(422, "page_to must be greater than page_from")
+    if doc.get("n_pages") and body.page_to > int(doc["n_pages"]):
+        raise HTTPException(422, f"This document has {doc['n_pages']} pages")
+    if not db.get_transcript(body.transcript_id):
+        raise HTTPException(422, "Target lecture does not exist")
+    db.upsert_link(doc_id, body.page_from, body.page_to, body.transcript_id,
+                   source="manual")
+    return {"links": db.list_slide_links(doc_id=doc_id)}
+
+
+@router.post("/slides/{doc_id}/links/accept")
+def accept_slide_links(doc_id: int, body: SlideLinksAccept) -> dict:
+    """
+    "Accetta tutte" in un gesto: le proposte automatiche diventano confermate.
+
+    Senza `ids` vale per tutto il documento — è il caso normale (il matching ha
+    fatto un buon lavoro e l'utente vuole solo dire di sì).
+    """
+    if not db.get_slide_doc(doc_id):
+        raise HTTPException(404, "Slide document not found")
+    links = db.list_slide_links(doc_id=doc_id)
+    wanted = set(body.ids) if body.ids else {int(l["id"]) for l in links}
+    db.confirm_links(sorted(wanted))
+    return {"links": db.list_slide_links(doc_id=doc_id)}
+
+
+@router.delete("/slide-links/{link_id}")
+def delete_slide_link(link_id: int) -> dict:
+    db.delete_link(link_id)
+    return {"deleted": link_id}
+
+
 # ── Job ──────────────────────────────────────────────────────────────────────
 @router.post("/jobs", status_code=201)
 def create_transcribe_job(body: TranscribeIn) -> dict:
@@ -557,12 +749,7 @@ def create_fix_job(transcript_id: int, body: FixIn) -> dict:
     transcript = db.get_transcript(transcript_id)
     if not transcript:
         raise HTTPException(404, "Transcript not found")
-    provider_id = body.provider_id
-    if provider_id is None:
-        providers = [p for p in db.list_providers() if p["enabled"] and p["has_key"]]
-        if not providers:
-            raise HTTPException(422, "Configure an LLM provider first (Settings -> Providers)")
-        provider_id = providers[0]["id"]
+    provider_id = _resolve_provider(body.provider_id)
     job_id = db.create_job(
         "llm_fix",
         {"transcript_id": transcript_id, "provider_id": provider_id,
@@ -571,6 +758,183 @@ def create_fix_job(transcript_id: int, body: FixIn) -> dict:
     )
     jobs.enqueue(job_id)
     return {"job": db.get_job(job_id)}
+
+
+# ── Carte ────────────────────────────────────────────────────────────────────
+class CardsIn(BaseModel):
+    provider_id: int | None = None
+    force: bool = False
+    vision: bool | None = None
+
+
+class CardPatch(BaseModel):
+    front: str | None = None
+    back: str | None = None
+    kind: str | None = None
+    status: str | None = None
+
+
+def _resolve_provider(provider_id: int | None) -> int:
+    """Il provider della chiamata: quello scelto, o il primo utilizzabile."""
+    if provider_id is not None:
+        return provider_id
+    providers = db.usable_providers()
+    if not providers:
+        raise HTTPException(422, "Configure an LLM provider first (Settings -> Providers)")
+    return int(providers[0]["id"])
+
+
+@router.get("/transcripts/{transcript_id}/cards")
+def get_cards(transcript_id: int) -> dict:
+    transcript = db.get_transcript(transcript_id)
+    if not transcript:
+        raise HTTPException(404, "Transcript not found")
+    return {
+        "cards": db.list_cards(transcript_id),
+        "counts": db.count_cards(transcript_id),
+        "run": db.latest_card_run(transcript_id),
+        "n_slide_links": db.count_slide_links(transcript_id),
+    }
+
+
+@router.post("/transcripts/{transcript_id}/cards", status_code=201)
+def create_cards_job(transcript_id: int, body: CardsIn) -> dict:
+    """
+    Accoda la generazione delle carte. È l'unico punto in cui si spende: nessun
+    upload, nessun parsing e nessun job di background chiamano il provider.
+    """
+    transcript = db.get_transcript(transcript_id)
+    if not transcript:
+        raise HTTPException(404, "Transcript not found")
+    if not (transcript.get("segments") or transcript.get("text")):
+        raise HTTPException(422, "This transcript is empty")
+    provider_id = _resolve_provider(body.provider_id)
+    job_id = db.create_job(
+        "llm_cards",
+        {"transcript_id": transcript_id, "provider_id": provider_id,
+         "force": bool(body.force), "vision": body.vision},
+        project_id=transcript["project_id"], transcript_id=transcript_id,
+    )
+    jobs.enqueue(job_id)
+    return {"job": db.get_job(job_id)}
+
+
+@router.get("/transcripts/{transcript_id}/cards/estimate")
+def estimate_cards(transcript_id: int, provider_id: int | None = None,
+                   vision: bool | None = None) -> dict:
+    """
+    Il preventivo: caratteri, token stimati, immagini. Nessuna chiamata.
+
+    Con `vision` assente decide da sé se la modalità è disponibile, così la UI
+    può mostrare il costo delle immagini senza replicare la mappa dei provider.
+    """
+    from . import cards as cards_mod
+
+    transcript = db.get_transcript(transcript_id)
+    if not transcript:
+        raise HTTPException(404, "Transcript not found")
+    provider = db.get_provider(_resolve_provider(provider_id))
+    if not provider:
+        raise HTTPException(404, "Provider not found")
+    return cards_mod.estimate(transcript, provider, config.load_settings(), vision=vision)
+
+
+@router.patch("/cards/{card_id}")
+def patch_card(card_id: int, body: CardPatch) -> dict:
+    """
+    Modifica manuale o sospensione. `edited=1` protegge la carta dalla
+    rigenerazione: quello che hai scritto tu non lo cancella un run.
+    """
+    if not db.get_card(card_id):
+        raise HTTPException(404, "Card not found")
+    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    if "kind" in fields and fields["kind"] not in ("qa", "cloze"):
+        raise HTTPException(422, "kind must be qa or cloze")
+    if "status" in fields and fields["status"] not in ("active", "suspended"):
+        raise HTTPException(422, "status must be active or suspended")
+    if fields:
+        fields["edited"] = 1
+        db.update_card(card_id, fields)
+    return db.get_card(card_id) or {}
+
+
+@router.delete("/cards/{card_id}")
+def delete_card(card_id: int) -> dict:
+    if not db.get_card(card_id):
+        raise HTTPException(404, "Card not found")
+    db.delete_card(card_id)
+    return {"deleted": card_id}
+
+
+# ── Export per Anki ──────────────────────────────────────────────────────────
+def _deck_for_transcript(transcript: dict) -> tuple[str, list[dict]]:
+    project = db.get_project(int(transcript["project_id"]))
+    name = decks.deck_name(project, transcript)
+    return name, decks.cards_for([int(transcript["id"])])
+
+
+@router.get("/transcripts/{transcript_id}/deck.apkg")
+def transcript_deck(transcript_id: int) -> Any:
+    transcript = db.get_transcript(transcript_id)
+    if not transcript:
+        raise HTTPException(404, "Transcript not found")
+    name, cards = _deck_for_transcript(transcript)
+    if not cards:
+        raise HTTPException(404, "This lecture has no active cards to export")
+    return Response(decks.build_apkg(cards, name), media_type="application/octet-stream",
+                    headers=_download_headers(f"{_slug(name)}.apkg"))
+
+
+@router.get("/transcripts/{transcript_id}/deck.tsv")
+def transcript_deck_tsv(transcript_id: int) -> Any:
+    transcript = db.get_transcript(transcript_id)
+    if not transcript:
+        raise HTTPException(404, "Transcript not found")
+    name, cards = _deck_for_transcript(transcript)
+    if not cards:
+        raise HTTPException(404, "This lecture has no active cards to export")
+    return PlainTextResponse(decks.build_tsv(cards, name), media_type="text/tab-separated-values",
+                             headers=_download_headers(f"{_slug(name)}.tsv"))
+
+
+@router.get("/projects/{project_id}/deck.apkg")
+def project_deck(project_id: int, transcripts: str = "") -> Any:
+    """
+    Un mazzo per il corso: tutte le sue lezioni, o solo quelle elencate.
+
+    `transcripts=3,7` limita l'export (la UI manda quelle selezionate nella
+    library); senza, il mazzo è il corso intero.
+    """
+    project = db.get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    ids = [int(x) for x in re.findall(r"\d+", transcripts)] or [
+        int(t["id"]) for t in db.list_transcripts(project_id)]
+    ids = [i for i in ids if db.get_transcript(i)]
+    if not ids:
+        raise HTTPException(404, "No lectures in this course")
+    cards = decks.cards_for(ids)
+    if not cards:
+        raise HTTPException(404, "No active cards to export")
+    name = decks.deck_name(project)
+    return Response(decks.build_apkg(cards, name), media_type="application/octet-stream",
+                    headers=_download_headers(f"{_slug(name)}.apkg"))
+
+
+@router.get("/projects/{project_id}/deck.tsv")
+def project_deck_tsv(project_id: int, transcripts: str = "") -> Any:
+    project = db.get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    ids = [int(x) for x in re.findall(r"\d+", transcripts)] or [
+        int(t["id"]) for t in db.list_transcripts(project_id)]
+    ids = [i for i in ids if db.get_transcript(i)]
+    cards = decks.cards_for(ids)
+    if not cards:
+        raise HTTPException(404, "No active cards to export")
+    name = decks.deck_name(project)
+    return PlainTextResponse(decks.build_tsv(cards, name), media_type="text/tab-separated-values",
+                             headers=_download_headers(f"{_slug(name)}.tsv"))
 
 
 # ── Riassunti ────────────────────────────────────────────────────────────────
@@ -586,12 +950,7 @@ def create_summary_job(transcript_id: int, body: SummaryIn) -> dict:
         raise HTTPException(404, "Transcript not found")
     if not (transcript.get("segments") or transcript.get("text")):
         raise HTTPException(422, "This transcript is empty")
-    provider_id = body.provider_id
-    if provider_id is None:
-        providers = [p for p in db.list_providers() if p["enabled"] and p["has_key"]]
-        if not providers:
-            raise HTTPException(422, "Configure an LLM provider first (Settings -> Providers)")
-        provider_id = providers[0]["id"]
+    provider_id = _resolve_provider(body.provider_id)
     job_id = db.create_job(
         "llm_summary",
         {"transcript_id": transcript_id, "provider_id": provider_id,
@@ -694,6 +1053,9 @@ def get_transcript(transcript_id: int) -> dict:
     summaries = db.list_summaries(transcript_id)
     t["n_summaries"] = len(summaries)
     t["latest_summary_id"] = summaries[0]["id"] if summaries else None
+    t["card_counts"] = db.count_cards(transcript_id)
+    t["n_slide_links"] = db.count_slide_links(transcript_id)
+    t["latest_card_run"] = db.latest_card_run(transcript_id)
     t["revisions"] = db.list_revisions(transcript_id)
     project = db.get_project(t["project_id"])
     t["project_name"] = project["name"] if project else None
@@ -1052,7 +1414,11 @@ _SETTINGS_FIELDS = {"default_project_id", "default_model", "default_language",
                     "default_device", "default_compute_type", "default_provider_id",
                     "flush_every", "llm_chunk_chars", "delete_sources_after_job",
                     "summary_max_tokens", "summary_style",
-                    "summary_language", "backup_keep"}
+                    "summary_language", "backup_keep",
+                    # Carte e slide (PIANO-slide-e-carte).
+                    "cards_max", "cards_language", "cards_context_chars", "cards_vision",
+                    "slides_vlm", "slides_vlm_model", "slides_vlm_max",
+                    "match_threshold", "embed_model"}
 
 
 @router.get("/settings")

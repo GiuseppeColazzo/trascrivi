@@ -354,8 +354,16 @@ def _function_body(js: str, name: str) -> str:
     match = re.search(rf"\n\s*(?:async\s+)?function {re.escape(name)}\s*\(", js)
     assert match, f"funzione {name} non trovata"
     tail = js[match.start():]
-    cut = re.search(r"\n(?:const|let|var|function|async function|class)\s", tail[1:])
-    return tail[:cut.start() + 1] if cut else tail
+    # Il taglio si cerca *dopo* la riga della firma: partendo da `tail[1:]` la
+    # ricerca trovava la firma stessa ("\nasync function …") quando la funzione
+    # era preceduta da una riga vuota, e il corpo tornava un `\n` — cioè tutti i
+    # lock su quella funzione passavano senza controllare niente.
+    signature_end = tail.find("\n", match.end() - match.start())
+    cut = re.search(r"\n(?:const|let|var|function|async function|class)\s",
+                    tail[signature_end:] if signature_end >= 0 else tail)
+    if not cut:
+        return tail
+    return tail[:signature_end + cut.start() + 1] if signature_end >= 0 else tail[:cut.start() + 1]
 
 
 def test_the_transcript_view_polls_running_jobs_and_stops_cleanly(js):
@@ -499,3 +507,113 @@ def test_stylesheet_defines_both_themes():
     assert ":root" in css
     assert ':root[data-theme="dark"]' in css
     assert "color-scheme" in css
+
+
+# ── Slide e carte (PIANO-slide-e-carte) ──────────────────────────────────────
+def test_the_course_view_has_the_slides_section(js):
+    """
+    La sezione slide del corso: upload con drag&drop, un bottone che lancia il
+    matching, e la conferma delle assegnazioni con "accetta tutte".
+    """
+    view = _function_body(js, "viewProject")
+    assert "slideDocsCard(" in view
+    assert 'api(`/projects/${projectId}/slides`)' in view
+
+    card = _function_body(js, "slideDocsCard")
+    assert 'api(`/projects/${projectId}/slides`' in card
+    assert "dataTransfer" in card, "l'upload deve accettare il drag&drop"
+    assert 'accept: ".pdf,.pptx,.docx' in card, "il picker deve filtrare i formati"
+    assert 'api(`/projects/${projectId}/slides/match`' in card, "manca il matching"
+    assert "/links/accept" in card, "manca l'accettazione in blocco"
+    assert "page-chip" in js, "i badge delle pagine devono avere una loro classe"
+    # Un corso senza lezioni: il bottone non deve accodare un job che non trova
+    # candidati, e la pagina deve dire cosa succede.
+    assert "hasLectures" in card
+    assert "non ha ancora lezioni" in card
+    # Pagine complesse senza rendering: quasi sempre Ollama spento, e va detto.
+    assert "Rendering VLM assente" in card
+
+
+def test_the_course_table_shows_the_card_count(js):
+    """Il chip delle carte accanto a quello del riassunto, con lo stato del job."""
+    view = _function_body(js, "viewProject")
+    assert "paintCardsCell" in view
+    assert "card_counts" in view, "il conteggio arriva da list_transcripts"
+
+    cell = _function_body(js, "paintCardsCell")
+    assert "cardsPending" in cell, "un job in corso deve cambiare lo stato del chip"
+    assert "`#/t/${t.id}`" in cell, "il chip deve portare alla lezione"
+
+
+def test_the_course_table_shows_the_display_title(js):
+    """
+    Il nome della lezione in tabella arriva dal server come `display_title`:
+    il titolo dell'ultimo riassunto senza il prefisso della materia, o il
+    titolo della trascrizione quando il riassunto non c'è. I nomi dei file
+    ("lecture1410", "audio_2026-09-28_11-40-26") non dicono niente mentre si
+    cerca una lezione. Il taglio e il fallback stanno in `_display_title`
+    (test in test_db_api); qui si blocca che la tabella usi il campo, che il
+    nome del file resti nel tooltip e che anche la conferma di eliminazione
+    usi il nome mostrato.
+    """
+    view = _function_body(js, "viewProject")
+    assert re.search(r"display_title\s*\|\|\s*t\.title", view), \
+        "il fallback deve essere il titolo della trascrizione"
+    assert "title: t.title" in view, "il nome del file resta nel tooltip"
+    assert re.search(r"Delete .\$\{lessonName\(t\)\}.\? This cannot be undone", view), \
+        "anche la conferma di eliminazione usa il nome mostrato"
+
+
+def test_the_transcript_view_has_the_cards_tab(js):
+    """
+    La tab Carte: preventivo locale, generazione su click, modifica/sospensione,
+    export. E il polling deve accorgersi del job `llm_cards`, altrimenti la tab
+    resta vuota fino al refresh (lo stesso errore già pagato col riassunto).
+    """
+    assert "cards: tabCards" in js
+    view = _function_body(js, "viewTranscript")
+    assert "loadCards()" in view and "tabCards" in view
+
+    cards = js[js.index("// ── Tab Cards"):]
+    cards = cards[:cards.index("\n  const tabInfo")]
+    assert 'api(`/transcripts/${transcriptId}/cards/estimate`)' in cards
+    assert 'api(`/transcripts/${transcriptId}/cards`' in cards
+    assert "deck.apkg" in cards and "deck.tsv" in cards
+    assert "cardsForce" in cards, "manca la forzatura della rigenerazione"
+    assert "Materiale invariato" in cards, "una cache hit va spiegata prima di spendere"
+    assert "{{c" not in cards or "cardText" in cards, "le cancellazioni cloze vanno mostrate"
+
+    tick = _function_body(js, "jobTick")
+    assert 'mine("llm_cards")' in tick
+    assert "loadCards()" in tick, "le carte finite devono comparire da sole"
+
+
+def test_the_parser_output_is_readable_in_the_ui(js):
+    """
+    Il testo letto da una pagina (OCR + rendering VLM) si deve poter vedere:
+    è la forma intermedia da cui nascono le carte, e senza vederla non si capisce
+    perché una carta manca o perché una pagina è "incerta".
+    """
+    card = _function_body(js, "slideDocsCard")
+    assert 'onclick: () => openTexts(doc)' in card
+    assert "Testi" in card
+
+    viewer = _function_body(js, "openTexts")
+    assert 'api(`/slides/${doc.id}`)' in viewer
+    assert "page.text" in viewer, "manca il testo/OCR"
+    assert "page.vlm_md" in viewer, "manca il rendering VLM"
+    assert "math_uncertain" in viewer, "i flag vanno mostrati accanto al testo"
+    assert "page-text" in viewer
+
+    css = (config.WEB / "style.css").read_text(encoding="utf-8")
+    assert re.search(r"\.page-text \{[^}]*white-space: pre-wrap", css), \
+        "il testo deve conservare gli a capo: sono l'ordine di lettura"
+
+
+def test_the_settings_view_covers_slides_and_cards(js):
+    settings = _function_body(js, "viewSettings")
+    for field_id in ("sCardsMax", "sCardsCtx", "sCardsVision", "sVlmMode", "sVlmModel",
+                     "sMatch", "sEmbed"):
+        assert field_id in settings, field_id
+    for key in ("cards_max", "cards_vision", "slides_vlm", "match_threshold", "embed_model"):
+        assert key in settings, key

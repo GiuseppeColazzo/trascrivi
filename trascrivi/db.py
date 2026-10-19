@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -186,6 +187,118 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT
 );
 
+-- ── Slide (PIANO-slide-e-carte) ─────────────────────────────────────────────
+-- Un documento caricato dal browser, già copiato in data/slides/<corso>/<doc>/.
+-- `boilerplate` è l'elenco JSON delle righe filtrate perché ricorrono su più
+-- della metà delle pagine: serve alla UI per dire cosa è stato buttato via.
+CREATE TABLE IF NOT EXISTS slide_docs (
+  id          INTEGER PRIMARY KEY,
+  project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name        TEXT NOT NULL,
+  ext         TEXT NOT NULL DEFAULT '',
+  sha256      TEXT NOT NULL DEFAULT '',
+  n_pages     INTEGER NOT NULL DEFAULT 0,
+  status      TEXT NOT NULL DEFAULT 'parsing',
+  error       TEXT,
+  boilerplate TEXT NOT NULL DEFAULT '[]',
+  vlm_enabled INTEGER NOT NULL DEFAULT 1,
+  created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_slide_docs_project ON slide_docs(project_id);
+
+-- Una riga per pagina. `text` è il testo nativo + OCR, `vlm_md` il rendering
+-- strutturato della pagina complessa. `render_path` è il PNG su cui girano OCR e
+-- VLM (e che la vision mode allega al generatore di carte); `render_sha` dice se
+-- il pass VLM va rifatto.
+CREATE TABLE IF NOT EXISTS slide_pages (
+  doc_id         INTEGER NOT NULL REFERENCES slide_docs(id) ON DELETE CASCADE,
+  page_no        INTEGER NOT NULL,
+  text           TEXT NOT NULL DEFAULT '',
+  complex        INTEGER NOT NULL DEFAULT 0,
+  vlm_md         TEXT,
+  math_uncertain INTEGER NOT NULL DEFAULT 0,
+  n_images       INTEGER NOT NULL DEFAULT 0,
+  ocr_chars      INTEGER NOT NULL DEFAULT 0,
+  has_text       INTEGER NOT NULL DEFAULT 0,
+  render_path    TEXT,
+  render_sha     TEXT,
+  PRIMARY KEY (doc_id, page_no)
+);
+
+-- Un intervallo di pagine assegnato a una lezione. `source='auto'` viene dal
+-- matching per embeddings, `manual` da una conferma o correzione in UI.
+CREATE TABLE IF NOT EXISTS slide_links (
+  id            INTEGER PRIMARY KEY,
+  doc_id        INTEGER NOT NULL REFERENCES slide_docs(id) ON DELETE CASCADE,
+  page_from     INTEGER NOT NULL,
+  page_to       INTEGER NOT NULL,
+  transcript_id INTEGER NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+  score         REAL NOT NULL DEFAULT 0,
+  source        TEXT NOT NULL DEFAULT 'auto',
+  updated_at    REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_slide_links_unique
+  ON slide_links(doc_id, page_from, page_to);
+CREATE INDEX IF NOT EXISTS idx_slide_links_transcript ON slide_links(transcript_id);
+
+-- ── Carte ───────────────────────────────────────────────────────────────────
+-- `uid` è immutabile e diventa il GUID della nota in Anki: re-importare un mazzo
+-- aggiorna la carta, non ne crea una seconda.
+CREATE TABLE IF NOT EXISTS cards (
+  id            INTEGER PRIMARY KEY,
+  uid           TEXT NOT NULL UNIQUE,
+  transcript_id INTEGER NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+  kind          TEXT NOT NULL DEFAULT 'qa',
+  front         TEXT NOT NULL,
+  back          TEXT NOT NULL DEFAULT '',
+  origin        TEXT NOT NULL DEFAULT 'llm',
+  edited        INTEGER NOT NULL DEFAULT 0,
+  slide_ref     TEXT,
+  status        TEXT NOT NULL DEFAULT 'active',
+  model         TEXT DEFAULT '',
+  run_id        INTEGER,
+  created_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cards_transcript ON cards(transcript_id, status);
+
+-- Un run di generazione: `inputs_hash` è la cache (stessi input = non si paga
+-- due volte) e insieme il registro del costo di quella chiamata.
+CREATE TABLE IF NOT EXISTS card_runs (
+  id            INTEGER PRIMARY KEY,
+  transcript_id INTEGER NOT NULL REFERENCES transcripts(id) ON DELETE CASCADE,
+  job_id        INTEGER,
+  inputs_hash   TEXT NOT NULL DEFAULT '',
+  provider      TEXT DEFAULT '',
+  model         TEXT DEFAULT '',
+  prompt_version TEXT DEFAULT '',
+  n_new         INTEGER DEFAULT 0,
+  n_skipped_dup INTEGER DEFAULT 0,
+  tokens_in     INTEGER DEFAULT 0,
+  tokens_out    INTEGER DEFAULT 0,
+  cache_hit     INTEGER DEFAULT 0,
+  cost_usd      REAL DEFAULT 0,
+  status        TEXT NOT NULL DEFAULT 'ok',
+  created_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_card_runs_transcript
+  ON card_runs(transcript_id, created_at DESC);
+
+-- Embeddings dei riassunti e delle pagine, in float32: il matching pagina ->
+-- lezione è un prodotto scalare, non serve SQLite vettoriale. `source_sha` è
+-- l'impronta del testo da cui il vettore è stato calcolato: senza, un riassunto
+-- riscritto (o una pagina riletta con la VLM) continuerebbe a usare il vettore
+-- vecchio e il matching risponderebbe su un testo che non esiste più.
+CREATE TABLE IF NOT EXISTS vectors (
+  kind       TEXT NOT NULL,
+  ref_id     INTEGER NOT NULL,
+  model      TEXT NOT NULL,
+  dim        INTEGER NOT NULL DEFAULT 0,
+  source_sha TEXT NOT NULL DEFAULT '',
+  vec        BLOB NOT NULL,
+  created_at REAL NOT NULL,
+  PRIMARY KEY (kind, ref_id, model)
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
   title, text, content='transcripts', content_rowid='id', tokenize='unicode61'
 );
@@ -286,6 +399,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
                       ("target_words", "INTEGER DEFAULT 0"),
                       ("source_words", "INTEGER DEFAULT 0"),
                       ("truncated", "INTEGER NOT NULL DEFAULT 0")],
+        # `vectors` è nata senza l'impronta del testo: aggiunta quando si è
+        # visto che un riassunto riscritto lasciava il vettore vecchio.
+        "vectors": [("source_sha", "TEXT NOT NULL DEFAULT ''")],
     }
     for table, columns in wanted.items():
         existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -616,6 +732,28 @@ def get_transcript(transcript_id: int) -> dict | None:
     return t
 
 
+# I riassunti, per come è fatto il prompt, si intitolano "<materia> — <titolo>".
+# In tabella la materia è già l'intestazione della pagina, quindi il prefisso si
+# butta e resta il titolo. Il taglio scatta solo con la lineetta circondata da
+# spazi: un titolo fuori formato ("Appunti di strategia digitale", oppure
+# "Encoder-Decoder" con i trattini dentro le parole) resta intero — meglio un
+# nome lungo che un nome tagliato a metà.
+_COURSE_PREFIX_RE = re.compile(r"^.+?\s+[\u2013\u2014]\s+(.+)$")
+
+
+def _display_title(summary_title: str | None, fallback: str) -> str:
+    """
+    Il nome della lezione da mostrare in tabella: l'ultimo titolo di riassunto
+    senza il prefisso della materia, o il titolo della trascrizione (il nome
+    del file) quando il riassunto non c'è.
+    """
+    title = (summary_title or "").strip()
+    if not title:
+        return fallback
+    match = _COURSE_PREFIX_RE.match(title)
+    return match.group(1).strip() if match else title
+
+
 def list_transcripts(project_id: int | None = None, limit: int = 200) -> list[dict]:
     """
     Elenco leggero: senza testo né segmenti (le liste non ne hanno bisogno).
@@ -624,6 +762,11 @@ def list_transcripts(project_id: int | None = None, limit: int = 200) -> list[di
     casella che non produrrebbe nessun file. `latest_summary_id` serve alla
     tabella del corso: il bottone scarica l'*ultimo* riassunto quando c'è, e
     NULL dice alla UI che non c'è niente da scaricare e va offerta la generazione.
+
+    Il nome da mostrare arriva già pronto in `display_title`: il titolo
+    dell'ultimo riassunto senza il prefisso della materia, o `title` quando il
+    riassunto non c'è. Il taglio e il fallback stanno qui perché sono
+    verificabili con un test vero, non con una regex in JavaScript.
     """
     columns = ("id, project_id, title, description, language, model, duration, "
                "LENGTH(text) AS length, "
@@ -633,6 +776,19 @@ def list_transcripts(project_id: int | None = None, limit: int = 200) -> list[di
                # secondo devono avere un ordine, e il più recente è l'ultimo inserito.
                "(SELECT s.id FROM summaries s WHERE s.transcript_id = transcripts.id "
                "ORDER BY s.created_at DESC, s.id DESC LIMIT 1) AS latest_summary_id, "
+               # Il titolo dell'ultimo riassunto: è il materiale grezzo da cui
+               # `_display_title` ricava `display_title`, e viene tolto dal
+               # risultato dopo il calcolo.
+               "(SELECT s.title FROM summaries s WHERE s.transcript_id = transcripts.id "
+               "ORDER BY s.created_at DESC, s.id DESC LIMIT 1) AS summary_title, "
+               # Carte e stato dell'ultimo run: la tabella del corso mostra il
+               # conteggio e se la generazione è in corso senza una seconda query.
+               "(SELECT COUNT(*) FROM cards c WHERE c.transcript_id = transcripts.id) "
+               "AS n_cards, "
+               "(SELECT COUNT(*) FROM slide_links l "
+               "WHERE l.transcript_id = transcripts.id) AS n_slide_links, "
+               "(SELECT r.status FROM card_runs r WHERE r.transcript_id = transcripts.id "
+               "ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS last_card_run, "
                "created_at, updated_at")
     if project_id is None:
         sql = (f"SELECT {columns} FROM transcripts "
@@ -642,7 +798,12 @@ def list_transcripts(project_id: int | None = None, limit: int = 200) -> list[di
         sql = (f"SELECT {columns} FROM transcripts "
                "WHERE project_id = ? ORDER BY updated_at DESC LIMIT ?")
         params = (project_id, limit)
-    return rows(sql, params)
+    out = rows(sql, params)
+    # `summary_title` è solo il valore di passaggio: la lista è "leggera" e
+    # porta quello che serve alla UI, cioè il nome già pronto da mostrare.
+    for t in out:
+        t["display_title"] = _display_title(t.pop("summary_title", None), t["title"])
+    return out
 
 
 TRANSCRIPT_FIELDS = {"title", "description", "language", "segments", "text", "project_id",
@@ -874,6 +1035,18 @@ def get_provider_by_name(name: str) -> dict | None:
     return row("SELECT * FROM providers WHERE name = ?", (name,))
 
 
+def usable_providers() -> list[dict]:
+    """
+    I provider che possono fare una chiamata: abilitati e con una chiave.
+
+    Ollama è l'eccezione: è locale e non ha chiavi. Senza questa eccezione un
+    utente che lavora solo in locale non troverebbe mai un provider e la UI gli
+    direbbe di configurare una chiave che non gli serve.
+    """
+    return [p for p in list_providers()
+            if p["enabled"] and (p["has_key"] or p["name"] == "ollama")]
+
+
 def update_provider(provider_id: int, base_url: str | None = None,
                     model: str | None = None, fallback_model: str | None = None,
                     enabled: bool | None = None,
@@ -938,3 +1111,373 @@ def _prune_backups(keep: int | None = None) -> None:
             old.unlink()
         except OSError:
             pass
+
+
+# ── Slide: documenti e pagine ────────────────────────────────────────────────
+SLIDE_DOC_FIELDS = {"n_pages", "status", "error", "boilerplate", "vlm_enabled", "sha256"}
+SLIDE_PAGE_FIELDS = {"text", "complex", "vlm_md", "math_uncertain", "n_images",
+                     "ocr_chars", "has_text", "render_path", "render_sha"}
+
+
+def create_slide_doc(project_id: int, name: str, ext: str, sha256: str) -> int:
+    return execute(
+        "INSERT INTO slide_docs(project_id, name, ext, sha256, status, created_at) "
+        "VALUES (?, ?, ?, ?, 'parsing', ?)",
+        (project_id, name, ext, sha256, now()),
+    )
+
+
+def get_slide_doc(doc_id: int) -> dict | None:
+    return row("SELECT * FROM slide_docs WHERE id = ?", (doc_id,))
+
+
+def list_slide_docs(project_id: int) -> list[dict]:
+    """Elenco per la UI: numero di pagine, stato e quante ne sono assegnate."""
+    return rows(
+        """SELECT d.*,
+                  (SELECT COUNT(*) FROM slide_pages p WHERE p.doc_id = d.id) AS n_parsed,
+                  (SELECT COUNT(*) FROM slide_pages p WHERE p.doc_id = d.id AND p.complex = 1)
+                    AS n_complex,
+                  (SELECT COUNT(*) FROM slide_pages p WHERE p.doc_id = d.id
+                     AND p.vlm_md IS NOT NULL) AS n_vlm,
+                  (SELECT COUNT(*) FROM slide_links l WHERE l.doc_id = d.id) AS n_links
+           FROM slide_docs d WHERE d.project_id = ? ORDER BY d.created_at DESC""",
+        (project_id,),
+    )
+
+
+def find_duplicate_slide(project_id: int, sha256: str) -> dict | None:
+    return row("SELECT * FROM slide_docs WHERE project_id = ? AND sha256 = ?",
+               (project_id, sha256))
+
+
+def update_slide_doc(doc_id: int, fields: dict) -> None:
+    clean = {k: v for k, v in fields.items() if k in SLIDE_DOC_FIELDS}
+    if not clean:
+        return
+    sets = ", ".join(f"{k} = ?" for k in clean)
+    execute(f"UPDATE slide_docs SET {sets} WHERE id = ?", (*clean.values(), doc_id))
+
+
+def delete_slide_doc(doc_id: int) -> dict | None:
+    doc = get_slide_doc(doc_id)
+    if doc:
+        execute("DELETE FROM slide_docs WHERE id = ?", (doc_id,))
+    return doc
+
+
+def save_slide_pages(doc_id: int, pages: list[dict]) -> None:
+    """Scrive le pagine di un documento (insert-or-replace: un re-parse le aggiorna)."""
+    payload = [
+        (doc_id, int(p["page_no"]), p.get("text") or "", 1 if p.get("complex") else 0,
+         p.get("vlm_md"), 1 if p.get("math_uncertain") else 0, int(p.get("n_images") or 0),
+         int(p.get("ocr_chars") or 0), 1 if p.get("has_text") else 0,
+         p.get("render_path"), p.get("render_sha"))
+        for p in pages
+    ]
+    if not payload:
+        return
+    with connect() as conn:
+        conn.executemany(
+            """INSERT INTO slide_pages(doc_id, page_no, text, complex, vlm_md,
+                                       math_uncertain, n_images, ocr_chars, has_text,
+                                       render_path, render_sha)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(doc_id, page_no) DO UPDATE SET
+                 text = excluded.text, complex = excluded.complex,
+                 math_uncertain = excluded.math_uncertain, n_images = excluded.n_images,
+                 ocr_chars = excluded.ocr_chars, has_text = excluded.has_text,
+                 render_path = excluded.render_path, render_sha = excluded.render_sha""",
+            payload,
+        )
+        conn.commit()
+
+
+def update_slide_page(doc_id: int, page_no: int, fields: dict) -> None:
+    clean = {k: v for k, v in fields.items() if k in SLIDE_PAGE_FIELDS}
+    if not clean:
+        return
+    sets = ", ".join(f"{k} = ?" for k in clean)
+    execute(f"UPDATE slide_pages SET {sets} WHERE doc_id = ? AND page_no = ?",
+            (*clean.values(), doc_id, page_no))
+
+
+def list_slide_pages(doc_id: int) -> list[dict]:
+    return rows("SELECT * FROM slide_pages WHERE doc_id = ? ORDER BY page_no", (doc_id,))
+
+
+def get_slide_page(doc_id: int, page_no: int) -> dict | None:
+    return row("SELECT * FROM slide_pages WHERE doc_id = ? AND page_no = ?", (doc_id, page_no))
+
+
+# ── Slide: assegnazione alle lezioni ─────────────────────────────────────────
+def replace_auto_links(doc_id: int, ranges: list[dict]) -> int:
+    """
+    Sostituisce le proposte automatiche di un documento.
+
+    Le righe `manual` non si toccano: una correzione fatta in UI non deve essere
+    cancellata dal run successivo del matching. Per lo stesso motivo il
+    `ON CONFLICT` aggiorna solo se la riga esistente è ancora `auto`: senza il
+    `WHERE`, un intervallo corretto a mano verrebbe sovrascritto dalla proposta.
+    """
+    with connect() as conn:
+        conn.execute("DELETE FROM slide_links WHERE doc_id = ? AND source = 'auto'", (doc_id,))
+        conn.executemany(
+            """INSERT INTO slide_links(doc_id, page_from, page_to, transcript_id, score,
+                                       source, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'auto', ?)
+               ON CONFLICT(doc_id, page_from, page_to) DO UPDATE SET
+                 transcript_id = excluded.transcript_id, score = excluded.score,
+                 updated_at = excluded.updated_at
+               WHERE slide_links.source = 'auto'""",
+            [(doc_id, int(r["page_from"]), int(r["page_to"]), int(r["transcript_id"]),
+              float(r.get("score") or 0.0), now()) for r in ranges],
+        )
+        conn.commit()
+    return len(ranges)
+
+
+def upsert_link(doc_id: int, page_from: int, page_to: int, transcript_id: int,
+                score: float = 0.0, source: str = "manual") -> None:
+    execute(
+        """INSERT INTO slide_links(doc_id, page_from, page_to, transcript_id, score,
+                                   source, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(doc_id, page_from, page_to) DO UPDATE SET
+             transcript_id = excluded.transcript_id, score = excluded.score,
+             source = excluded.source, updated_at = excluded.updated_at""",
+        (doc_id, page_from, page_to, transcript_id, score, source, now()),
+    )
+
+
+def delete_link(link_id: int) -> None:
+    execute("DELETE FROM slide_links WHERE id = ?", (link_id,))
+
+
+def confirm_links(ids: Sequence[int]) -> int:
+    """Una proposta confermata diventa `manual`: il matching non la cancella più."""
+    if not ids:
+        return 0
+    marks = ",".join("?" for _ in ids)
+    with connect() as conn:
+        cur = conn.execute(f"UPDATE slide_links SET source = 'manual', updated_at = ? "
+                           f"WHERE id IN ({marks})", (now(), *ids))
+        conn.commit()
+        return cur.rowcount
+
+
+def list_slide_links(project_id: int | None = None, doc_id: int | None = None,
+                     transcript_id: int | None = None) -> list[dict]:
+    """Righe pronte per la schermata di conferma e per il contesto delle carte."""
+    sql = """SELECT l.*, d.name AS doc_name, d.n_pages, t.title AS transcript_title,
+                    (SELECT p.text FROM slide_pages p
+                     WHERE p.doc_id = l.doc_id AND p.page_no = l.page_from) AS first_text
+             FROM slide_links l
+             JOIN slide_docs d ON d.id = l.doc_id
+             JOIN transcripts t ON t.id = l.transcript_id"""
+    where, params = [], []
+    if project_id is not None:
+        where.append("d.project_id = ?")
+        params.append(project_id)
+    if doc_id is not None:
+        where.append("l.doc_id = ?")
+        params.append(doc_id)
+    if transcript_id is not None:
+        where.append("l.transcript_id = ?")
+        params.append(transcript_id)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY d.name, l.page_from"
+    return rows(sql, tuple(params))
+
+
+def linked_pages(transcript_id: int) -> list[dict]:
+    """Le pagine assegnate a una lezione, in ordine: è il contesto delle carte."""
+    return rows(
+        """SELECT d.id AS doc_id, d.name AS doc_name, p.page_no, p.text, p.vlm_md,
+                  p.math_uncertain, p.complex, p.render_path, l.score
+           FROM slide_links l
+           JOIN slide_docs d ON d.id = l.doc_id
+           JOIN slide_pages p ON p.doc_id = l.doc_id
+                             AND p.page_no BETWEEN l.page_from AND l.page_to
+           WHERE l.transcript_id = ?
+           ORDER BY d.name, p.page_no""",
+        (transcript_id,),
+    )
+
+
+def count_slide_links(transcript_id: int) -> int:
+    return int(scalar("SELECT COUNT(*) FROM slide_links WHERE transcript_id = ?",
+                      (transcript_id,), default=0) or 0)
+
+
+# ── Carte ────────────────────────────────────────────────────────────────────
+CARD_FIELDS = {"kind", "front", "back", "origin", "edited", "slide_ref", "status", "model"}
+
+
+def create_cards(transcript_id: int, items: list[dict], run_id: int | None = None) -> list[int]:
+    """Inserisce le carte di un run e restituisce gli id."""
+    if not items:
+        return []
+    ts = now()
+    ids: list[int] = []
+    with connect() as conn:
+        for it in items:
+            cur = conn.execute(
+                """INSERT INTO cards(uid, transcript_id, kind, front, back, origin, edited,
+                                     slide_ref, status, model, run_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (it["uid"], transcript_id, it.get("kind") or "qa", it["front"],
+                 it.get("back") or "", it.get("origin") or "llm", 1 if it.get("edited") else 0,
+                 it.get("slide_ref"), it.get("status") or "active", it.get("model") or "",
+                 run_id, ts),
+            )
+            ids.append(int(cur.lastrowid))
+        conn.commit()
+    return ids
+
+
+def get_card(card_id: int) -> dict | None:
+    return row("SELECT * FROM cards WHERE id = ?", (card_id,))
+
+
+def list_cards(transcript_id: int, status: str | None = None) -> list[dict]:
+    if status:
+        return rows("SELECT * FROM cards WHERE transcript_id = ? AND status = ? ORDER BY id",
+                    (transcript_id, status))
+    return rows("SELECT * FROM cards WHERE transcript_id = ? ORDER BY id", (transcript_id,))
+
+
+def project_cards(project_id: int, status: str | None = None) -> list[dict]:
+    """Tutte le carte di un corso, per l'export di un mazzo unico."""
+    sql = """SELECT c.*, t.title AS transcript_title, t.project_id
+             FROM cards c JOIN transcripts t ON t.id = c.transcript_id
+             WHERE t.project_id = ?"""
+    params: list[Any] = [project_id]
+    if status:
+        sql += " AND c.status = ?"
+        params.append(status)
+    sql += " ORDER BY t.title, c.id"
+    return rows(sql, tuple(params))
+
+
+def update_card(card_id: int, fields: dict) -> None:
+    clean = {k: v for k, v in fields.items() if k in CARD_FIELDS}
+    if not clean:
+        return
+    sets = ", ".join(f"{k} = ?" for k in clean)
+    execute(f"UPDATE cards SET {sets} WHERE id = ?", (*clean.values(), card_id))
+
+
+def delete_card(card_id: int) -> None:
+    execute("DELETE FROM cards WHERE id = ?", (card_id,))
+
+
+def delete_llm_cards(transcript_id: int, keep_edited: bool = True) -> int:
+    """Rigenerazione: le carte scritte a mano (`edited=1`) restano."""
+    sql = ("DELETE FROM cards WHERE transcript_id = ? AND origin = 'llm'"
+           + (" AND edited = 0" if keep_edited else ""))
+    with connect() as conn:
+        cur = conn.execute(sql, (transcript_id,))
+        conn.commit()
+        return cur.rowcount
+
+
+def card_fronts(transcript_id: int) -> list[dict]:
+    """
+    I `front` già esistenti della lezione: servono al prompt anti-duplicato e al
+    dedup testuale. `edited` dice quali sono stati scritti a mano.
+    """
+    return rows("SELECT id, front, kind, edited FROM cards WHERE transcript_id = ? "
+                "ORDER BY id", (transcript_id,))
+
+
+def count_cards(transcript_id: int) -> dict:
+    out = {"total": 0, "active": 0, "suspended": 0}
+    for r in rows("SELECT status, COUNT(*) AS n FROM cards WHERE transcript_id = ? "
+                  "GROUP BY status", (transcript_id,)):
+        out["total"] += int(r["n"])
+        if r["status"] in out:
+            out[r["status"]] = int(r["n"])
+    return out
+
+
+def create_card_run(transcript_id: int, job_id: int | None = None, **fields) -> int:
+    return execute(
+        """INSERT INTO card_runs(transcript_id, job_id, inputs_hash, provider, model,
+                                 prompt_version, n_new, n_skipped_dup, tokens_in,
+                                 tokens_out, cache_hit, cost_usd, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (transcript_id, job_id, fields.get("inputs_hash") or "",
+         fields.get("provider") or "", fields.get("model") or "",
+         fields.get("prompt_version") or "", int(fields.get("n_new") or 0),
+         int(fields.get("n_skipped_dup") or 0), int(fields.get("tokens_in") or 0),
+         int(fields.get("tokens_out") or 0), int(fields.get("cache_hit") or 0),
+         float(fields.get("cost_usd") or 0.0), fields.get("status") or "ok", now()),
+    )
+
+
+def latest_card_run(transcript_id: int) -> dict | None:
+    return row("SELECT * FROM card_runs WHERE transcript_id = ? "
+               "ORDER BY created_at DESC, id DESC LIMIT 1", (transcript_id,))
+
+
+def update_card_run(run_id: int, fields: dict) -> None:
+    wanted = {"inputs_hash", "provider", "model", "prompt_version", "n_new",
+              "n_skipped_dup", "tokens_in", "tokens_out", "cache_hit", "cost_usd", "status"}
+    clean = {k: v for k, v in fields.items() if k in wanted}
+    if not clean:
+        return
+    sets = ", ".join(f"{k} = ?" for k in clean)
+    execute(f"UPDATE card_runs SET {sets} WHERE id = ?", (*clean.values(), run_id))
+
+
+# ── Vettori (embeddings locali) ──────────────────────────────────────────────
+def put_vector(kind: str, ref_id: int, model: str, vec: Sequence[float],
+               source_sha: str = "") -> None:
+    import array
+
+    blob = array.array("f", [float(x) for x in vec]).tobytes()
+    execute(
+        """INSERT INTO vectors(kind, ref_id, model, dim, source_sha, vec, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(kind, ref_id, model) DO UPDATE SET
+             dim = excluded.dim, source_sha = excluded.source_sha, vec = excluded.vec,
+             created_at = excluded.created_at""",
+        (kind, ref_id, model, len(vec), source_sha, blob, now()),
+    )
+
+
+def get_vector(kind: str, ref_id: int, model: str) -> list[float] | None:
+    import array
+
+    found = row("SELECT vec FROM vectors WHERE kind = ? AND ref_id = ? AND model = ?",
+                (kind, ref_id, model))
+    if not found:
+        return None
+    arr = array.array("f")
+    arr.frombytes(found["vec"])
+    return list(arr)
+
+
+def load_vectors(kind: str, model: str) -> dict[int, list[float]]:
+    """Tutti i vettori di un tipo, già decodificati: il matching ne fa un dict."""
+    return {ref_id: vec for ref_id, (vec, _sha) in load_vectors_with_source(kind, model).items()}
+
+
+def load_vectors_with_source(kind: str, model: str) -> dict[int, tuple[list[float], str]]:
+    """
+    I vettori **con l'impronta del testo** da cui sono nati.
+
+    Serve a capire quando un vettore è vecchio: il matching confronta l'impronta
+    del testo attuale con quella salvata e ricalcola solo i vettori cambiati.
+    """
+    import array
+
+    out: dict[int, tuple[list[float], str]] = {}
+    for found in rows("SELECT ref_id, vec, source_sha FROM vectors "
+                      "WHERE kind = ? AND model = ?", (kind, model)):
+        arr = array.array("f")
+        arr.frombytes(found["vec"])
+        out[int(found["ref_id"])] = (list(arr), found["source_sha"] or "")
+    return out

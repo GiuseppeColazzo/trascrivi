@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:  # normalmete lo fa pytest (pythonpath in pytest.ini)
     sys.path.insert(0, str(ROOT))
 
-from trascrivi import config, db  # noqa: E402
+from trascrivi import config, db, llm  # noqa: E402
 from trascrivi.textutil import segments_to_text  # noqa: E402
 
 # Segmenti noti: i test che hanno bisogno di una trascrizione "vera" partono da qui.
@@ -38,6 +38,7 @@ def isolated_config(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "PARTIAL", data / "partial")
     monkeypatch.setattr(config, "LOGS", data / "logs")
     monkeypatch.setattr(config, "BACKUPS", data / "backup")
+    monkeypatch.setattr(config, "SLIDES", data / "slides")
     monkeypatch.setattr(config, "DB_PATH", data / "trascrivi.db")
     monkeypatch.setattr(config, "SECRET_KEY_PATH", data / "secret.key")
     monkeypatch.setattr(config, "SETTINGS_PATH", data / "settings.json")
@@ -51,10 +52,58 @@ def isolated_config(tmp_path, monkeypatch):
     return data
 
 
+@pytest.fixture(autouse=True)
+def no_provider_calls(monkeypatch):
+    """
+    Nessun test automatico apre una connessione verso un provider LLM.
+
+    È la regola numero uno del piano: la chiave dell'utente non deve mai essere
+    usata da pytest (e nemmeno da un Ollama locale, che renderebbe i test lenti e
+    dipendenti da cosa è scaricato).
+
+    Il blocco sta su `openai.OpenAI`, cioè dove nasce il client HTTP: tutto passa
+    di lì — chat, embeddings, VLM. Prima era su `llm._client`, che però valida
+    anche le chiavi *senza* toccare la rete: bloccarlo rendeva non testabile il
+    percorso "chiave non decifrabile". Un test che vuole un finto sostituisce
+    `llm._client` e vince lui, perché la sua monkeypatch è più interna.
+    """
+
+    class _Blocked:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "il test ha provato a creare un client LLM reale: "
+                "sostituisci llm._client con un fake (vedi tests/test_costs.py)"
+            )
+
+    import openai
+
+    monkeypatch.setattr(openai, "OpenAI", _Blocked)
+
+
 @pytest.fixture
 def project():
     """Progetto di appoggio per i test che non stanno testando i progetti."""
     return db.create_project("Analisi 1", code="AN1")
+
+
+@pytest.fixture
+def mock_settings(monkeypatch):
+    """
+    Cambia le impostazioni per un test: `mock_settings(cards_max=3)`.
+
+    Si sovrascrive `config.load_settings` invece di scrivere `settings.json`:
+    i moduli leggono le impostazioni dalla funzione, quindi la patch copre anche
+    i job, che non ricevono le impostazioni come argomento.
+    """
+
+    def _apply(**fields):
+        settings = config.load_settings()
+        for key, value in fields.items():
+            setattr(settings, key, value)
+        monkeypatch.setattr(config, "load_settings", lambda: settings)
+        return settings
+
+    return _apply
 
 
 @pytest.fixture

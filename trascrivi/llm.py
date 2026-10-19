@@ -29,7 +29,12 @@ log = logging.getLogger("trascrivi.llm")
 NO_THINKING = {"reasoning_effort": "none"}
 THINKING_OFF_BODY = {"thinking": {"type": "disabled"}}
 # Provider a cui mandiamo `reasoning_effort` senza doverlo scoprire a errori.
-REASONING_EFFORT_PROVIDERS = {"deepseek"}
+# Ollama è nell'elenco per i modelli locali "reasoning" (qwen3.5 e simili): senza,
+# spendono tutto il budget in ragionamento e restituiscono `content` vuoto con
+# `finish_reason="length"` — misurato qui: 2392 caratteri di pensiero e zero note.
+# Il suo endpoint OpenAI-compatibile accetta il parametro, e se un modello non lo
+# conosce `_is_unknown_parameter` fa riprovare senza.
+REASONING_EFFORT_PROVIDERS = {"deepseek", "ollama"}
 # Tetto di output per chunk. Non è il budget di ragionamento: con il thinking
 # disattivato serve solo a produrre il JSON delle proposte.
 MAX_OUTPUT_TOKENS = 8000
@@ -172,6 +177,40 @@ def list_models(provider: dict) -> list[str]:
     client = _client(provider)
     models = client.models.list()
     return sorted(m.id for m in getattr(models, "data", []) or [])
+
+
+# Gli embeddings servono al matching slide -> lezioni e sono locali (Ollama):
+# costano zero e non toccano la chiave dell'utente. Passano però dallo stesso
+# adapter, così c'è un solo punto che parla con i provider.
+EMBED_BATCH = 32
+
+
+def embed_texts(provider: dict, texts: list[str], model: str) -> list[list[float]]:
+    """
+    Embedding di una lista di testi, a blocchi: la risposta è nello stesso ordine.
+
+    Gli errori vengono riscritti con il provider e l'indirizzo: il caso normale è
+    Ollama spento, e un job fallito con "Connection error." non dice a nessuno
+    che cosa avviare. Il messaggio originale resta nella catena (`from exc`).
+    """
+    if not texts:
+        return []
+    client = _client(provider)
+    out: list[list[float]] = []
+    try:
+        for start in range(0, len(texts), EMBED_BATCH):
+            batch = texts[start:start + EMBED_BATCH]
+            resp = client.embeddings.create(model=model, input=batch)
+            out.extend(list(item.embedding) for item in resp.data)
+    except Exception as exc:  # noqa: BLE001 - il tipo dipende dall'SDK e dal provider
+        raise RuntimeError(
+            f"Embeddings from '{provider.get('name')}' ({provider.get('base_url')}) failed: "
+            f"{type(exc).__name__}: {exc}. If it is Ollama, start it and pull the model "
+            f"(`ollama pull {model}`)."
+        ) from exc
+    if len(out) != len(texts):
+        raise RuntimeError(f"Embedding truncated: {len(out)} vectors for {len(texts)} texts")
+    return out
 
 
 def test_provider(provider: dict) -> dict:
@@ -422,21 +461,33 @@ def _chat_once(provider: dict, model: str, transcript_text: str,
 
 def chat_completion(provider: dict, model: str, system: str, user: str, *,
                     max_tokens: int, temperature: float = 0.0,
-                    json_mode: bool = True) -> tuple[str, dict]:
+                    json_mode: bool = True,
+                    images: list[str] | None = None) -> tuple[str, dict]:
     """
     Una chiamata chat generica sullo stesso adattatore dei provider.
 
-    È il punto unico in cui si decide come parlare ai provider: il riassunto la
-    usa invece di reimplementare JSON mode e disattivazione del thinking, così
-    una correzione vale per entrambe le funzioni.
+    È il punto unico in cui si decide come parlare ai provider: il riassunto e le
+    carte lo usano invece di reimplementare JSON mode e disattivazione del
+    thinking, così una correzione vale per tutte le funzioni.
+
+    `images` sono PNG in base64: quando ci sono, il messaggio utente diventa
+    multimodale. Sapere *quali* provider accettano immagini è compito di chi
+    chiama (`cards.VISION_PROVIDERS`): qui si manda quello che ci viene dato.
     """
     client = _client(provider)
+
+    user_content: object = user
+    if images:
+        user_content = [{"type": "text", "text": user}, *[
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}}
+            for data in images
+        ]]
 
     kwargs: dict = {
         "model": model,
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "user", "content": user_content},
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
