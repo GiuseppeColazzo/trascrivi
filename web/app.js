@@ -2764,37 +2764,61 @@ async function viewJobs(nav, params, token) {
    ========================================================================== */
 /* Modalità lettura: il riassunto a tutto schermo, con l'indice delle sezioni
    a lato (in colonna sotto i 900px). Esc chiude. */
+/* Indice delle sezioni (h2) di un documento, che segue la lettura. `scroller`
+   è l'elemento che scorre (null = la finestra); `offset` è quanto spazio in
+   alto coprono le barre fisse. Restituisce null se le sezioni sono poche.
+   `prefix` tiene distinti gli id quando due documenti sono nella pagina. */
+function sectionIndex(doc, { scroller = null, offset = 80, prefix = "sec", className = "reading-toc" } = {}) {
+  const heads = [...doc.querySelectorAll("h2")];
+  if (heads.length <= 2) return null;
+  heads.forEach((h, i) => { h.id = `${prefix}-${i}`; });
+  const links = heads.map((h) => el("a", { href: `#${h.id}`, onclick: (e) => {
+    e.preventDefault(); h.scrollIntoView({ behavior: "smooth", block: "start" });
+  } }, h.textContent));
+  const toc = el("nav", { class: className, "aria-label": t("summary.toc") },
+    el("p", { class: "eyebrow" }, t("summary.toc")), links);
+  const target = scroller || window;
+  let pending = false;
+  const spy = () => {
+    pending = false;
+    // Il documento non c'è più (cambio di pagina o dialogo chiuso): si smette.
+    if (!doc.isConnected) { target.removeEventListener("scroll", onScroll); return; }
+    const viewTop = scroller ? scroller.getBoundingClientRect().top : 0;
+    const viewBottom = scroller ? scroller.getBoundingClientRect().bottom : window.innerHeight;
+    let current = heads[0];
+    for (const h of heads) { if (h.getBoundingClientRect().top <= viewTop + offset) current = h; else break; }
+    // In fondo l'ultima sezione non può salire fino alla barra: se è corta il
+    // suo titolo non passerebbe mai la soglia e l'indice resterebbe sulla
+    // penultima. Arrivati in fondo vale l'ultimo titolo che si vede.
+    const atBottom = scroller
+      ? scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4
+      : window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 4;
+    if (atBottom) {
+      const visible = heads.filter((h) => h.getBoundingClientRect().top < viewBottom);
+      if (visible.length) current = visible[visible.length - 1];
+    }
+    links.forEach((a, i) => a.classList.toggle("active", heads[i] === current));
+  };
+  const onScroll = () => { if (!pending) { pending = true; requestAnimationFrame(spy); } };
+  target.addEventListener("scroll", onScroll, { passive: true });
+  // Prima misura quando il documento è in pagina e ha un'altezza.
+  requestAnimationFrame(spy);
+  return toc;
+}
+
 function readingMode(summary) {
   const doc = el("article", { class: "md reading-doc", html: renderMarkdown(summary.markdown || "") });
-  const heads = [...doc.querySelectorAll("h2")];
-  heads.forEach((h, i) => { h.id = `sec-${i}`; });
-  const toc = el("nav", { class: "reading-toc", "aria-label": t("summary.toc") },
-    el("p", { class: "eyebrow" }, t("summary.toc")),
-    heads.map((h) => el("a", { href: `#${h.id}`, onclick: (e) => {
-      e.preventDefault(); h.scrollIntoView({ behavior: "smooth", block: "start" });
-    } }, h.textContent)));
+  const body = el("div", { class: "reading-body" });
+  const toc = sectionIndex(doc, { scroller: body, prefix: "read" });
+  body.append(...[toc, doc].filter(Boolean));
   const dlg = el("dialog", { class: "reading", "aria-label": summary.title || t("summary.default_title") },
     el("div", { class: "reading-bar" },
       el("strong", {}, summary.title || ""), el("span", { class: "spacer" }),
       el("button", { type: "button", onclick: () => window.print() }, t("summary.print")),
       el("button", { type: "button", onclick: () => dlg.close() }, t("common.close"))),
-    el("div", { class: "reading-body" }, heads.length > 2 ? toc : null, doc));
+    body);
   document.body.append(dlg);
   dlg.showModal();
-  // L'indice segue la lettura: è attiva l'ultima sezione il cui titolo è già
-  // passato sotto la barra. Su scroll, un calcolo per frame al massimo.
-  const body = dlg.querySelector(".reading-body");
-  const links = [...toc.querySelectorAll("a")];
-  let pending = false;
-  const spy = () => {
-    pending = false;
-    const top = body.getBoundingClientRect().top + 80;
-    let current = heads[0];
-    for (const h of heads) { if (h.getBoundingClientRect().top <= top) current = h; else break; }
-    links.forEach((a) => a.classList.toggle("active", current && a.getAttribute("href") === `#${current.id}`));
-  };
-  body.addEventListener("scroll", () => { if (!pending) { pending = true; requestAnimationFrame(spy); } }, { passive: true });
-  spy();
   dlg.addEventListener("close", () => dlg.remove());
 }
 
@@ -3134,9 +3158,19 @@ async function viewTranscript(nav, params, transcriptId, token) {
         // Il modello ha finito i token a metà frase: il documento c'è, ma non è
         // completo, e dirlo è l'unico modo perché non venga preso per finito.
         s.truncated ? notice("warn", t("summary.truncated")) : null,
-        // Il titolo è già l'intestazione della card: il primo "# …" del
-        // documento non si ripete sotto.
-        el("div", { class: "md", html: renderMarkdown((s.markdown || "").replace(/^\s*# [^\n]*\n+/, "")) })));
+        summaryDoc(s)));
+  }
+
+  /* Il documento nella scheda: a sinistra la prosa, a destra (sugli schermi
+     larghi) l'indice delle sezioni che segue la lettura, come in modalità
+     lettura. Lo spazio a destra della prosa era vuoto. */
+  function summaryDoc(s) {
+    // Il titolo è già l'intestazione della card: il primo "# …" del
+    // documento non si ripete sotto.
+    const doc = el("div", { class: "md", html: renderMarkdown((s.markdown || "").replace(/^\s*# [^\n]*\n+/, "")) });
+    // 150 px: header dell'app + barra delle schede, entrambi fissi in alto.
+    const toc = sectionIndex(doc, { offset: 150, prefix: "sum", className: "reading-toc summary-toc" });
+    return toc ? el("div", { class: "summary-layout" }, doc, toc) : doc;
   }
 
   async function loadSummaries() {
