@@ -104,6 +104,54 @@ def test_the_context_is_the_summary_plus_the_linked_pages(lecture):
     assert "structured rendering" in context["slides"][1]
 
 
+def test_auto_links_are_used_but_marked_unconfirmed(lecture):
+    doc = db.list_slide_docs(db.get_transcript(lecture)["project_id"])[0]
+    db.upsert_link(doc["id"], 24, 25, lecture, source="auto")
+
+    context = cards.build_context(db.get_transcript(lecture), config.load_settings())
+
+    assert context["confirmed"] is False
+    assert context["unconfirmed"] == 2
+    assert context["auto_ignored"] == 0
+    assert context["linked"] == 2
+
+
+def test_confirmed_links_win_and_auto_proposals_are_ignored(lecture):
+    doc = db.list_slide_docs(db.get_transcript(lecture)["project_id"])[0]
+    db.upsert_link(doc["id"], 40, 40, lecture, score=1.0, source="auto")
+
+    context = cards.build_context(db.get_transcript(lecture), config.load_settings())
+
+    assert context["confirmed"] is True
+    assert context["unconfirmed"] == 0
+    assert context["auto_ignored"] == 1
+    assert len(context["slides"]) == 2
+    assert all("Slide 40" not in block for block in context["slides"])
+
+
+def test_context_orders_pages_by_score_not_by_filename(project, make_transcript):
+    tid = make_transcript(project, "Score order", segments=[
+        {"start": 0, "end": 5, "text": "Today we rank the slides by relevance"},
+    ])
+    db.create_summary(tid, markdown="# Score order\n\nIl deck giusto deve entrare nel contesto.\n",
+                      title="Score order", overview="slide relevance")
+    low = db.create_slide_doc(project, "a-low.pdf", ".pdf", "sha-low")
+    high = db.create_slide_doc(project, "z-high.pdf", ".pdf", "sha-high")
+    for doc_id in (low, high):
+        db.save_slide_pages(doc_id, [
+            {"page_no": 1, "text": f"contenuto di {doc_id}", "has_text": True,
+             "render_path": None, "complex": False},
+        ])
+        db.update_slide_doc(doc_id, {"status": "ready", "n_pages": 1})
+    db.upsert_link(low, 1, 1, tid, score=0.30, source="auto")
+    db.upsert_link(high, 1, 1, tid, score=0.90, source="auto")
+
+    context = cards.build_context(db.get_transcript(tid), config.load_settings())
+
+    assert context["slides"][0].startswith("Slide 1 — z-high.pdf")
+    assert context["slides"][1].startswith("Slide 1 — a-low.pdf")
+
+
 def test_the_context_never_exceeds_its_budget(lecture, mock_settings):
     mock_settings(cards_context_chars=600)
     context = cards.build_context(db.get_transcript(lecture), config.load_settings())
@@ -165,8 +213,9 @@ def test_force_regenerates_and_keeps_the_hand_edited_cards(monkeypatch, lecture)
     # Una rigenerazione vera propone carte nuove: se proponesse le stesse, il
     # dedup le scarterebbe (ed è giusto: sono già lì).
     fresh = {"cards": [
-        {"kind": "qa", "front": f"Domanda nuova {i}?", "back": "Risposta.", "slide": 24}
-        for i in range(3)
+        {"kind": "qa", "front": f"Domanda nuova {i}?", "back": "Risposta.",
+         "slide": slide}
+        for i, slide in enumerate((24, 25, None))
     ]}
     fake_cards_llm(monkeypatch, fresh)
     job_id = db.create_job("llm_cards", {"transcript_id": lecture}, transcript_id=lecture)
@@ -258,6 +307,36 @@ def test_the_maximum_number_of_cards_is_respected(monkeypatch, lecture, mock_set
     ]}
     result, _calls = _run(monkeypatch, lecture, payload=payload)
     assert result["n_new"] == 2
+
+
+def test_no_more_than_two_cards_come_from_the_same_slide(monkeypatch, lecture):
+    """Il prompt lo chiede, ma il taglio deve essere garantito dal codice."""
+    payload = {"cards": [
+        {"kind": "qa", "front": f"Domanda su slide 25 n. {i}?", "back": "Risposta.",
+         "slide": 25}
+        for i in range(4)
+    ] + [
+        {"kind": "qa", "front": "Domanda su slide 24?", "back": "Risposta.",
+         "slide": 24},
+    ]}
+    result, _calls = _run(monkeypatch, lecture, payload=payload)
+
+    assert result["n_new"] == 3
+    assert result["rejected"].count("page_cap") == 2
+    saved = db.list_cards(lecture)
+    assert sum(1 for card in saved if str(card["slide_ref"]) == "25") == 2
+    assert sum(1 for card in saved if str(card["slide_ref"]) == "24") == 1
+
+
+def test_the_prompt_puts_the_summary_first_and_requires_coverage():
+    prompt = cards.SYSTEM_PROMPT
+    assert "primary source" in prompt
+    assert "at least four different sections" in prompt
+    assert "second half of the summary" in prompt
+    # La richiesta è ripetuta alla fine del messaggio utente: i modelli la
+    # seguono più spesso dell'istruzione sepolta nel system prompt.
+    assert "first slide pages do not decide the coverage" in cards.USER_PROMPT
+    assert "replace cards until it passes" in cards.USER_PROMPT
 
 
 def test_garbage_from_the_model_saves_nothing(monkeypatch, lecture):
@@ -371,3 +450,5 @@ def test_the_estimate_endpoint_needs_no_network(client, lecture):
     body = res.json()
     assert body["cards_max"] == 12
     assert "tokens_in" in body
+    assert (body["slides"], body["linked"]) == (2, 2)
+    assert body["confirmed"] is True and body["unconfirmed"] == 0

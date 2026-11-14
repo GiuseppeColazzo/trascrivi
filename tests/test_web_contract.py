@@ -281,7 +281,8 @@ def test_each_view_fetches_the_data_it_uses(js):
                 continue
             # `(?<!\.)` esclude gli accessi a proprietà: `s.terms` non è l'uso
             # di una variabile `terms`.
-            if re.search(rf"(?<!\.)\b{name}\b", body):
+            # `(?!\s*:)` esclude le chiavi di oggetto: t("x", { courses: … }).
+            if re.search(rf"(?<!\.)\b{name}\b(?!\s*:)", body):
                 problems.append(f"{match.group(1)} usa `{name}` senza procurarselo")
 
     assert problems == [], "dati usati ma mai richiesti: " + "; ".join(problems)
@@ -379,7 +380,7 @@ def test_the_transcript_view_polls_running_jobs_and_stops_cleanly(js):
     view = _function_body(js, "viewTranscript")
 
     assert re.search(r"let summaryJob\s*=", view), "lo stato del job deve poter cambiare"
-    assert "renderMarkdown(s.markdown" in view or "renderMarkdown(s.markdown" in js
+    assert "renderMarkdown((s.markdown" in js, "il documento si rende come markdown (senza il titolo ripetuto)"
     assert "startJobPoll" in view and "setInterval(jobTick" in view
     assert "onViewTeardown(stopJobPoll)" in view, "il polling deve spegnersi cambiando vista"
 
@@ -529,9 +530,9 @@ def test_the_course_view_has_the_slides_section(js):
     # Un corso senza lezioni: il bottone non deve accodare un job che non trova
     # candidati, e la pagina deve dire cosa succede.
     assert "hasLectures" in card
-    assert "non ha ancora lezioni" in card
+    assert 't("slides.no_lectures_notice")' in card
     # Pagine complesse senza rendering: quasi sempre Ollama spento, e va detto.
-    assert "Rendering VLM assente" in card
+    assert 't("slides.vlm_missing"' in card
 
 
 def test_the_course_table_shows_the_card_count(js):
@@ -542,7 +543,7 @@ def test_the_course_table_shows_the_card_count(js):
 
     cell = _function_body(js, "paintCardsCell")
     assert "cardsPending" in cell, "un job in corso deve cambiare lo stato del chip"
-    assert "`#/t/${t.id}`" in cell, "il chip deve portare alla lezione"
+    assert re.search(r"`#/t/\$\{\w+\.id\}`", cell), "il chip deve portare alla lezione"
 
 
 def test_the_course_table_shows_the_display_title(js):
@@ -559,8 +560,8 @@ def test_the_course_table_shows_the_display_title(js):
     view = _function_body(js, "viewProject")
     assert re.search(r"display_title\s*\|\|\s*t\.title", view), \
         "il fallback deve essere il titolo della trascrizione"
-    assert "title: t.title" in view, "il nome del file resta nel tooltip"
-    assert re.search(r"Delete .\$\{lessonName\(t\)\}.\? This cannot be undone", view), \
+    assert re.search(r"title: \w+\.title", view), "il nome del file resta nel tooltip"
+    assert re.search(r"transcript\.delete_text\", \{ name: lessonName\(\w+\) \}", view), \
         "anche la conferma di eliminazione usa il nome mostrato"
 
 
@@ -580,7 +581,7 @@ def test_the_transcript_view_has_the_cards_tab(js):
     assert 'api(`/transcripts/${transcriptId}/cards`' in cards
     assert "deck.apkg" in cards and "deck.tsv" in cards
     assert "cardsForce" in cards, "manca la forzatura della rigenerazione"
-    assert "Materiale invariato" in cards, "una cache hit va spiegata prima di spendere"
+    assert 't("cards.unchanged_title")' in cards, "una cache hit va spiegata prima di spendere"
     assert "{{c" not in cards or "cardText" in cards, "le cancellazioni cloze vanno mostrate"
 
     tick = _function_body(js, "jobTick")
@@ -596,7 +597,7 @@ def test_the_parser_output_is_readable_in_the_ui(js):
     """
     card = _function_body(js, "slideDocsCard")
     assert 'onclick: () => openTexts(doc)' in card
-    assert "Testi" in card
+    assert 't("slides.texts_btn")' in card
 
     viewer = _function_body(js, "openTexts")
     assert 'api(`/slides/${doc.id}`)' in viewer
@@ -613,7 +614,8 @@ def test_the_parser_output_is_readable_in_the_ui(js):
 def test_the_settings_view_covers_slides_and_cards(js):
     settings = _function_body(js, "viewSettings")
     for field_id in ("sCardsMax", "sCardsCtx", "sCardsVision", "sVlmMode", "sVlmModel",
-                     "sMatch", "sEmbed"):
+                     "sMatch", "sMatchMargin", "sEmbed"):
         assert field_id in settings, field_id
-    for key in ("cards_max", "cards_vision", "slides_vlm", "match_threshold", "embed_model"):
+    for key in ("cards_max", "cards_vision", "slides_vlm", "match_threshold",
+                "match_margin", "embed_model"):
         assert key in settings, key

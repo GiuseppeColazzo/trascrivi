@@ -93,12 +93,12 @@ PLAN_TOKENS = 1200
 
 SYSTEM_PROMPT = """You write study notes from university lecture transcripts, in Markdown.
 
-The transcript comes from automatic speech recognition: expect recognition errors, false starts, repetitions and missing punctuation. Read through them.
+The transcript comes from automatic speech recognition: expect recognition errors, false starts, repetitions and missing punctuation. Read through them, and do not copy a recognition error into the notes: a name or term the recogniser got wrong ("Trez" for Threads, "Mecca" for Meta, "COGO" for CO2) is written correctly when the slides, the glossary or the sentence itself make the intended word clear. When it is not clear, keep what was heard and add "(?)".
 
 A summary is a selection, not a transcript. Deciding what to leave out is the job; keeping everything is not being thorough, it is failing the task. Cutting too deep is the other way to fail: a concept the lecturer named and you dropped is a hole the reader walks into while revising.
 
 RULES
-1. Use only what the transcript says. You have no other knowledge of the subject: never add facts, definitions, examples or numbers that are not in the transcript, even if you are sure they are correct.
+1. Use only what the transcript says. Never add facts, definitions, examples or numbers that are not in the transcript, even if you are sure they are correct. Your own knowledge is allowed for one thing only: spelling correctly a name or term the recogniser misheard.
 2. Write the notes in {language_name}.
 3. Stay inside the budget given in the request. Going over it is a failure, not a detail to fix later.
 4. Name everything the lecturer named. Every theory, author, term, distinction, model, mechanism, case or process that the lecture gives a name to must appear in the notes, with one line saying what it is. Completeness is counted in names, not in words: a reader who cannot find a name they heard in the lecture stops trusting the notes.
@@ -107,8 +107,9 @@ RULES
 7. Prefer lists and short paragraphs to long blocks of prose. Bold the term being defined, not whole sentences.
 8. Use a Markdown table whenever the lecture compares things, lists options, or classifies items by attributes.
 9. Use a diagram in a fenced code block only where the lecture describes a process, a flow or an architecture that is clearer as a picture. Two or three in a whole lecture at most.
-10. Keep the lecturer's technical terms, acronyms and symbols exactly as they were said. Do not expand an acronym they did not expand, and do not rename anything.
-11. Keep their uncertainty. "probably", "I think", "in general", "it seems" must not become statements of fact.
+10. Keep the lecturer's technical terms, acronyms and symbols, spelled as the slides spell them. Do not expand an acronym they did not expand, and do not rename anything.
+11. The slides, when given, are reference material for what the lecturer is talking about: use them for the exact spelling of terms, for notation, and to write a formula correctly when the lecturer explains it (in LaTeX between $...$). Do not add a topic that is only on the slides and was not discussed.
+12. Keep their uncertainty. "probably", "I think", "in general", "it seems" must not become statements of fact.
 
 ALWAYS LEAVE OUT
 - housekeeping and logistics: timetables, breaks, exam dates, recordings, who sits where, administrative remarks;
@@ -303,6 +304,52 @@ def word_count(markdown: str) -> int:
 
 
 # ── Contesto del corso ───────────────────────────────────────────────────────
+# Quanto testo di slide entra nel prompt: ~1500 token, un decimo della
+# trascrizione. Abbastanza per termini e formule della lezione, poco per far
+# diventare le slide la fonte del riassunto.
+SLIDE_CONTEXT_CHARS = 6000
+
+
+def slide_context(transcript: dict, text: str, budget: int = SLIDE_CONTEXT_CHARS) -> tuple[str, int]:
+    """
+    Le pagine di slide della lezione, come riferimento per termini e formule.
+
+    Prima i link confermati o calcolati (embeddings); se non ce ne sono, le
+    pagine più vicine per lessico (TF-IDF locale, nessun modello: funziona anche
+    con Ollama spento). Restituisce il blocco e quante pagine contiene.
+    """
+    from . import matching
+    project_id = transcript.get("project_id")
+    if not project_id:
+        return "", 0
+    try:
+        pages = [dict(p) for p in db.linked_pages(int(transcript["id"]))] if transcript.get("id") else []
+        if not pages:
+            pages = matching.lexical_pages(int(project_id), text, limit=14)
+            # In ordine di deck e pagina: le slide si leggono in sequenza.
+            pages.sort(key=lambda p: (p["doc_name"], p["page_no"]))
+    except Exception:  # noqa: BLE001 - il contesto è opzionale, non deve rompere il job
+        log.warning("slide di contesto non disponibili", exc_info=True)
+        return "", 0
+    parts, used, n = [], 0, 0
+    for page in pages:
+        body = (page.get("vlm_md") or "").strip() or (page.get("text") or "").strip()
+        body = re.sub(r"[ \t]+", " ", body)
+        if not body:
+            continue
+        chunk = f"[{page.get('doc_name')} p.{page.get('page_no')}]\n{body[:1200]}"
+        if used + len(chunk) > budget:
+            break
+        parts.append(chunk)
+        used += len(chunk)
+        n += 1
+    if not parts:
+        return "", 0
+    return ("<slides>\nSlide pages that match this lecture (reference for terms, notation and "
+            "formulas, not a source of extra topics):\n\n" + "\n\n".join(parts)
+            + "\n</slides>\n\n"), n
+
+
 def _context_block(project: dict | None, previous: list[dict], glossary: list[dict]) -> str:
     """
     Contesto del corso: aiuta a interpretare i riferimenti, non ad aggiungere contenuto.
@@ -408,9 +455,15 @@ def summarize(provider: dict, transcript: dict, settings: "config.Settings", *,
     context = _context_block(
         db.get_project(int(transcript["project_id"])) if transcript.get("project_id") else None,
         _previous_overviews(transcript),
-        db.list_terms(int(transcript["project_id"])) if transcript.get("project_id") else [],
+        # Solo le correzioni confermate (auto). Il vecchio agente lasciava qui
+        # definizioni ("AI -> artificial intelligence") che il prompt presentava
+        # come "usa questa ortografia": il modello riscriveva i termini.
+        [t for t in db.list_terms(int(transcript["project_id"])) if t.get("auto")]
+        if transcript.get("project_id") else [],
     )
     text = transcript.get("text") or ""
+    slides_block, n_slide_pages = slide_context(transcript, text or _plain_text(segments))
+    context += slides_block
 
     # Il budget di parole è la leva principale sulla lunghezza del risultato:
     # si calcola dalla trascrizione vera, non si lascia decidere al modello.
@@ -456,10 +509,12 @@ def summarize(provider: dict, transcript: dict, settings: "config.Settings", *,
 
     markdown = strip_plan(markdown)
     if len(markdown) < MIN_DOCUMENT_CHARS:
-        raise ValueError(
+        exc = ValueError(
             f"The model returned no usable document ({len(markdown)} characters). "
             f"{llm._error_detail(diag)}"
         )
+        exc.usage = usage   # pagato comunque: `_run_job` lo registra sul job fallito
+        raise exc
     if diag.get("finish_reason") == "length":
         # Il tetto ha tagliato il documento: il costo è già stato pagato e il
         # testo che c'è è valido, quindi non si butta via niente. Ma il taglio
@@ -497,6 +552,7 @@ def summarize(provider: dict, transcript: dict, settings: "config.Settings", *,
         "cost_usd": estimate_cost(usage) or 0.0,
         "elapsed_s": round(time.time() - t0, 1),
         "truncated": truncated,
+        "slide_pages": n_slide_pages,
         # L'usage cumulato resta disponibile per chi salva il job: `jobs._run_job`
         # ci ricava i campi di costo con lo stesso `llm.usage_counts` dell'agente.
         "usage": usage,

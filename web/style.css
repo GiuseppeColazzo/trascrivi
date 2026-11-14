@@ -1224,7 +1224,7 @@ td.actions .summary-cell { display: inline-flex; }
 
 /* Tabella chiave/valore della scheda "Details" */
 table th + td.mono { font-size: 12px; }
-table tr > th:first-child:not(:only-child) { width: 34%; color: var(--text-3); }
+table tbody tr > th:first-child:not(:only-child) { width: 34%; color: var(--text-3); }
 
 /* Scheda Details: due colonne fisse (etichetta, valore) invece di una tabella
    che si allarga a caso. I valori numerici restano incolonnati grazie alle
@@ -1582,11 +1582,10 @@ dialog[open] { animation: dialogIn 220ms var(--ease) both; }
   from { opacity: 0; transform: translateY(6px) scale(0.99); }
   to { opacity: 1; transform: none; }
 }
-dialog::backdrop {
-  background: rgba(6, 6, 7, 0.62);
-  -webkit-backdrop-filter: blur(3px);
-  backdrop-filter: blur(3px);
-}
+/* Niente blur sul fondo: costa un ricalcolo a ogni frame mentre si scorre
+   dentro il dialogo (misurato in modalità lettura: frame mediano 15,5 ms con il
+   blur, 7,3 senza). Un velo più scuro fa lo stesso lavoro visivo. */
+dialog::backdrop { background: rgba(6, 6, 7, 0.72); }
 dialog form { display: flex; flex-direction: column; gap: 14px; }
 dialog h2 { margin: 0; font-size: 1.12rem; }
 dialog p { margin: 0; color: var(--text-2); font-size: 13.5px; }
@@ -1912,6 +1911,7 @@ main { flex: 1 1 auto; width: 100%; }
   header.app .search { order: 2; max-width: none; flex-basis: 160px; }
   header.app .brand { order: 1; }
   header.app .theme-menu { order: 2; margin-left: 0; }
+  header.app .lang-select { order: 2; }
   .nav-item::after { bottom: -4px; }
   .grid > .card { grid-template-columns: minmax(0, 1fr); }
   .grid > .card > .badge { grid-column: 1; grid-row: auto; justify-self: start; }
@@ -2135,4 +2135,122 @@ details > summary { cursor: pointer; }
   body { background: #fff; color: #000; }
   .card { border-color: #ccc; box-shadow: none; }
   main { max-width: none; padding: 0; }
+}
+
+/* ── Coda: una entry per lezione, i passi nell'accordion ─────────────────── */
+details.job-group > summary {
+  font-family: inherit; font-size: inherit; letter-spacing: normal;
+  text-transform: none; color: inherit; align-items: flex-start;
+}
+details.job-group > summary::before { margin-top: 6px; }
+.job-head { flex: 1; min-width: 0; display: grid; gap: 8px; }
+.job-steps { margin-top: 14px; padding-left: 16px; border-left: 2px solid var(--line); gap: 14px; }
+.job-step { display: grid; gap: 6px; }
+.upload-list:empty { display: none; }
+.upload-list { margin-top: 12px; gap: 8px; }
+.upload-item { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.upload-item .grow { min-width: 200px; }
+
+/* ── Ask the course / guida d'esame ─────────────────────────────────────── */
+.ask-input { width: 100%; resize: vertical; }
+details.qa { border-top: 1px solid var(--line); padding-top: 12px; }
+details.qa > summary, details.guide-doc > summary {
+  font-family: inherit; font-size: inherit; letter-spacing: normal; text-transform: none; color: inherit;
+}
+.qa-q { font-weight: 600; }
+details.qa .md, details.guide-doc .md { margin-top: 10px; }
+a.cite {
+  font-family: var(--font-mono); font-size: 0.82em; padding: 1px 5px; border-radius: 4px;
+  background: var(--accent-soft, var(--surface-2)); text-decoration: none; white-space: nowrap;
+}
+#askProvider, #guideProvider { width: auto; flex: 0 1 260px; }
+.lang-select {
+  width: auto; padding: 4px 6px; font-family: var(--font-mono); font-size: 10.5px;
+  letter-spacing: 0.08em; background: transparent; border: 1px solid var(--line); border-radius: var(--r-sm);
+  color: var(--text-2);
+}
+
+/* ── Primo avvio / corso vuoto ──────────────────────────────────────────── */
+.onb-steps { list-style: none; padding: 0; margin: 10px 0 0; display: grid; gap: 10px; }
+.onb-steps li { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.onb-steps li.done { color: var(--text-2); }
+.onb-steps .grow { flex: 1 1 220px; }
+
+/* ── Stato di studio ────────────────────────────────────────────────────── */
+.study-select { width: auto; padding: 3px 6px; font-size: 12px; }
+.study-select.study-todo { border-color: var(--warn, #d9a441); }
+.study-select.study-reviewed { border-color: var(--accent); }
+.study-select.study-confident { border-color: var(--ok); color: var(--ok); }
+tr.study-confident td:nth-child(2) a { color: var(--ok); }
+
+/* ── Modalità lettura del riassunto ─────────────────────────────────────── */
+/* A schermo intero: è il posto dove si studia, non una finestrella. */
+dialog.reading {
+  width: 100vw; height: 100vh; height: 100dvh; max-width: none; max-height: none;
+  margin: 0; inset: 0; padding: 0; border: 0; border-radius: 0;
+  display: flex; flex-direction: column; animation: none;
+}
+dialog.reading::backdrop { background: var(--bg, #0a0b0d); }
+dialog.reading:not([open]) { display: none; }
+.reading-bar { display: flex; align-items: center; gap: 10px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+.reading-body { display: grid; grid-template-columns: minmax(180px, 260px) minmax(0, 78ch); justify-content: center; gap: 56px; padding: 32px 48px; overflow: auto; flex: 1; overscroll-behavior: contain; }
+.reading-body > .reading-doc:only-child { grid-column: 1 / -1; margin: 0 auto; width: 100%; }
+.reading-toc { position: sticky; top: 0; align-self: start; display: grid; gap: 8px; font-size: 13.5px; max-height: calc(100dvh - 140px); overflow: auto; }
+.reading-toc a { color: var(--text-2); text-decoration: none; line-height: 1.35; }
+.reading-toc a:hover { color: var(--text); }
+.reading-doc { max-width: 78ch; width: 100%; margin: 0 auto; font-size: 17px; line-height: 1.7; }
+
+/* ── Confronto versioni ─────────────────────────────────────────────────── */
+dialog.wide { width: min(1000px, 96vw); max-width: none; }
+
+/* ── Telefono ───────────────────────────────────────────────────────────── */
+@media (max-width: 640px) {
+  .reading-body { grid-template-columns: 1fr; padding: 14px; }
+  .reading-toc { position: static; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+  table { display: block; overflow-x: auto; }
+  .split.hero { flex-direction: column; align-items: stretch; }
+  .actions { flex-wrap: wrap; }
+  .split.hero > .grow { flex: 0 0 auto; }
+  .upload-item .grow { min-width: 0; flex-basis: 100%; }
+  #askProvider, #guideProvider { flex: 1 1 100%; }
+}
+@media print {
+  dialog.reading { position: static; width: auto; height: auto; border: 0; }
+  .reading-bar, .reading-toc { display: none !important; }
+  .reading-body { display: block; overflow: visible; }
+}
+
+/* ── Ritocchi dopo il giro GUI ──────────────────────────────────────────── */
+table th.col-num, table td.col-num { width: 3.5em; min-width: 3.5em; padding-right: 4px; white-space: nowrap; }
+th.col-title { min-width: 220px; }
+.card > .row + .row, .card > .row + .check, .card > .check + .hint, .card > .hint + .row,
+.card > .hint + .field, .card > .row + details, .card > .hint + details { margin-top: 10px; }
+details.adv > .row, details.adv > .field { margin-top: 10px; }
+#sumHistory, #sumProvider, #sumStyle { width: auto; flex: 0 1 300px; }
+#sumInstruction { flex: 1 1 220px; }
+.compare { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; max-height: 70vh; overflow: auto; }
+.compare-col { min-width: 0; }
+@media (max-width: 760px) { .compare { grid-template-columns: 1fr; } }
+/* Lo stato vuoto non deve gridare su ogni riga: si accende solo quando lo scegli. */
+.study-select.study-none { background: transparent; border-color: transparent; color: var(--text-3); }
+.study-select.study-none:hover, .study-select.study-none:focus { border-color: var(--line); color: var(--text-2); }
+/* Righe leggibili: oltre ~85 caratteri l occhio perde la riga successiva. */
+.md { max-width: 85ch; }
+.md table { max-width: none; }
+/* La zona "nuove lezioni" ha titolo e sottotitolo in colonna: la regola in riga
+   della zona slide (sopra) la schiacciava su una sola riga. */
+.drop:has(> p) { display: block; padding: 38px 24px; }
+.reading-toc a.active { color: var(--accent); }
+/* In modalità lettura vale la tipografia del documento, non quella dei dialoghi. */
+dialog.reading .reading-doc p { font-size: inherit; color: var(--text); line-height: inherit; }
+dialog.reading .reading-doc h1 { font-size: 2em; margin: 0 0 .6em; }
+dialog.reading .reading-doc h2 { font-size: 1.4em; margin-top: 1.6em; }
+dialog.reading .reading-doc h3 { font-size: 1.15em; }
+dialog.changelog { width: min(640px, 94vw); }
+.changelog-body { max-height: 62vh; overflow: auto; }
+.changelog-body li { margin-bottom: 6px; line-height: 1.5; color: var(--text); }
+/* Stampa dalla modalità lettura: solo il documento, non la pagina che sta sotto. */
+@media print {
+  body:has(dialog.reading[open]) > :not(dialog.reading) { display: none !important; }
+  dialog.reading[open] { position: static; display: block; height: auto; }
 }

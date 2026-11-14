@@ -33,7 +33,6 @@ from pydantic import BaseModel, Field, field_validator
 from trascrivi_audio import MODELS
 
 from . import config, db, decks, jobs, llm, models
-from . import corrections as corr
 from .textutil import build_markdown, parse_raw, segments_to_text, text_to_segments
 
 log = logging.getLogger("trascrivi.api")
@@ -110,19 +109,10 @@ class TranscribeIn(BaseModel):
     clip_seconds: float | None = None
     flush_every: float | None = None
     delete_source: bool | None = None
-    run_agent: bool = False
-    provider_id: int | None = None
-    instruction: str = ""
     run_summary: bool = False
     summary_provider_id: int | None = None
     summary_style: str = ""
     summary_instruction: str = ""
-
-
-class FixIn(BaseModel):
-    provider_id: int | None = None
-    instruction: str = ""
-    chunk_chars: int | None = None
 
 
 class SummaryIn(BaseModel):
@@ -143,11 +133,7 @@ class TranscriptPatch(BaseModel):
     project_id: int | None = None
     text: str | None = None
     segments: list[dict] | None = None
-
-
-class ProposalsIn(BaseModel):
-    ids: list[int]
-    targets: dict[int, int] | None = None
+    study_status: str | None = None
 
 
 class TermIn(BaseModel):
@@ -284,7 +270,18 @@ def formats() -> dict:
 @router.get("/search")
 def search(q: str = Query(min_length=1), project_id: int | None = None,
            limit: int = 50) -> dict:
-    return {"results": db.search_transcripts(q, project_id, limit)}
+    """
+    Trascrizioni (FTS) e riassunti. Ogni risultato di trascrizione porta `at`,
+    il secondo del primo segmento che contiene il termine, così il link apre la
+    lezione nel punto giusto e non in cima.
+    """
+    results = db.search_transcripts(q, project_id, limit)
+    needle = q.strip().lower()
+    for r in results:
+        segments = db.jload(db.scalar("SELECT segments FROM transcripts WHERE id = ?", (r["id"],)), []) or []
+        r["at"] = next((float(s.get("start") or 0) for s in segments
+                        if needle in (s.get("text") or "").lower()), None)
+    return {"results": results, "summaries": db.search_summaries(q, project_id, limit)}
 
 
 # ── Costi ────────────────────────────────────────────────────────────────────
@@ -303,7 +300,11 @@ def costs() -> dict:
     """
     data = db.llm_cost_cells()
     months = sorted({c["month"] for c in data["cells"] if c["month"]}, reverse=True)
+    this_month = time.strftime("%Y-%m")
     return {
+        "budget_usd": float(config.load_settings().monthly_budget_usd or 0),
+        "month_total_usd": round(sum(c["cost_usd"] or 0 for c in data["cells"]
+                                     if c["month"] == this_month), 6),
         "cells": data["cells"],
         "projects": data["projects"],
         "months": months,
@@ -414,7 +415,11 @@ async def upload_source(project_id: int,
 
     target_dir = config.SOURCES / str(project_id)
     target_dir.mkdir(parents=True, exist_ok=True)
-    tmp = target_dir / f".upload-{file.filename or 'audio'}.part"
+    # Nome temporaneo mai derivato dal client: `file.filename` grezzo permetteva
+    # di scrivere fuori dalla cartella ("../../x") e due upload omonimi
+    # condividevano lo stesso .part.
+    import uuid
+    tmp = target_dir / f".upload-{uuid.uuid4().hex}.part"
     size = 0
     try:
         with tmp.open("wb") as out:
@@ -488,6 +493,18 @@ def probe_media_endpoint(path: str) -> dict:
     }
 
 
+@router.get("/media/folder")
+def list_media_folder(path: str) -> dict:
+    """I file audio/video di una cartella (non ricorsivo): il caricamento in blocco."""
+    p = Path((path or "").strip().strip('"').strip("'")).expanduser()
+    if not p.is_absolute() or not p.is_dir():
+        raise HTTPException(400, f"Not an absolute folder path: {p}")
+    from trascrivi_audio import SUPPORTED_FORMATS
+    files = [f for f in p.iterdir() if f.is_file() and f.suffix.lower() in SUPPORTED_FORMATS]
+    return {"path": str(p), "files": [{"path": str(f), "name": f.name, "size": f.stat().st_size}
+                                      for f in sorted(files)]}
+
+
 # ── Slide ────────────────────────────────────────────────────────────────────
 class SlidePatch(BaseModel):
     vlm_enabled: bool | None = None
@@ -513,7 +530,8 @@ def get_slides(project_id: int) -> dict:
 
 
 @router.post("/projects/{project_id}/slides", status_code=201)
-async def upload_slide(project_id: int, file: UploadFile = File(...)) -> dict:
+async def upload_slide(project_id: int, file: UploadFile = File(...),
+                       kind: str = Form("slides")) -> dict:
     """
     Carica un documento di slide e avvia il parsing locale.
 
@@ -526,6 +544,10 @@ async def upload_slide(project_id: int, file: UploadFile = File(...)) -> dict:
 
     if not db.get_project(project_id):
         raise HTTPException(404, "Project not found")
+    # `exam` = esame di un anno passato: stesso parser (OCR incluso), ma resta
+    # fuori dal matching con le lezioni e serve alla guida d'esame.
+    if kind not in ("slides", "exam"):
+        raise HTTPException(422, "kind must be 'slides' or 'exam'")
     name = Path(file.filename or "slides").name
     ext = Path(name).suffix.lower()
     if ext not in slideparser.SLIDE_EXTS:
@@ -553,12 +575,12 @@ async def upload_slide(project_id: int, file: UploadFile = File(...)) -> dict:
         raise HTTPException(500, f"Write failed: {exc}") from exc
 
     sha = digest.hexdigest()
-    duplicate = db.find_duplicate_slide(project_id, sha)
+    duplicate = db.find_duplicate_slide(project_id, sha, kind)
     if duplicate:
         _unlink(tmp)
         return {"slide": duplicate, "duplicate_of": duplicate["id"], "job_id": None}
 
-    doc_id = db.create_slide_doc(project_id, name, ext, sha)
+    doc_id = db.create_slide_doc(project_id, name, ext, sha, kind=kind)
     target = config.slide_source_path(project_id, doc_id, ext)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp.replace(target)
@@ -708,7 +730,8 @@ def create_transcribe_job(body: TranscribeIn) -> dict:
 @router.get("/jobs")
 def get_jobs(status: str | None = None, limit: int = 100) -> dict:
     statuses = [s for s in (status or "").split(",") if s] or None
-    return {"jobs": db.list_jobs(statuses, limit), "queue": jobs.queue_size()}
+    return {"jobs": db.list_jobs(statuses, limit), "queue": jobs.queue_size(),
+            "queue_eta_seconds": jobs.queue_eta()}
 
 
 @router.get("/jobs/{job_id}")
@@ -733,8 +756,12 @@ def cancel_job(job_id: int) -> dict:
         return {"cancelled": True, "started": False}
     if job["status"] != "running":
         raise HTTPException(409, f"Job is {job['status']}, nothing to cancel")
-    started = jobs.request_cancel(job_id)
-    return {"cancelled": True, "started": started}
+    if not jobs.request_cancel(job_id):
+        # Prima rispondeva `cancelled: true` e il job finiva comunque: una sola
+        # chiamata al modello non si può interrompere a metà.
+        raise HTTPException(409, "This step cannot be stopped midway (single model call or "
+                                 "model still loading): it will finish on its own.")
+    return {"cancelled": True, "started": True}
 
 
 @router.post("/jobs/{job_id}/retry")
@@ -744,20 +771,78 @@ def retry_job(job_id: int) -> dict:
     return {"job": db.get_job(job_id)}
 
 
-@router.post("/transcripts/{transcript_id}/fix", status_code=201)
-def create_fix_job(transcript_id: int, body: FixIn) -> dict:
-    transcript = db.get_transcript(transcript_id)
-    if not transcript:
-        raise HTTPException(404, "Transcript not found")
-    provider_id = _resolve_provider(body.provider_id)
-    job_id = db.create_job(
-        "llm_fix",
-        {"transcript_id": transcript_id, "provider_id": provider_id,
-         "instruction": body.instruction, "chunk_chars": body.chunk_chars},
-        project_id=transcript["project_id"], transcript_id=transcript_id,
-    )
+# ── Guida d'esame e "Chiedi al corso" ────────────────────────────────────────
+class GuideIn(BaseModel):
+    provider_id: int | None = None
+    instruction: str = ""
+
+
+class AskIn(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+    provider_id: int | None = None
+
+
+@router.post("/projects/{project_id}/guide", status_code=201)
+def create_guide_job(project_id: int, body: GuideIn) -> dict:
+    if not db.get_project(project_id):
+        raise HTTPException(404, "Project not found")
+    job_id = db.create_job("llm_guide", {"project_id": project_id,
+                                         "provider_id": _resolve_provider(body.provider_id),
+                                         "instruction": body.instruction},
+                           project_id=project_id)
     jobs.enqueue(job_id)
     return {"job": db.get_job(job_id)}
+
+
+@router.get("/projects/{project_id}/guides")
+def get_guides(project_id: int) -> dict:
+    return {"guides": db.rows(
+        "SELECT * FROM guides WHERE project_id = ? ORDER BY id DESC LIMIT 20", (project_id,))}
+
+
+@router.get("/guides/{guide_id}/export")
+def export_guide(guide_id: int) -> Any:
+    g = db.row("SELECT * FROM guides WHERE id = ?", (guide_id,))
+    if not g:
+        raise HTTPException(404, "Guide not found")
+    return PlainTextResponse(g["markdown"], media_type="text/markdown; charset=utf-8",
+                             headers=_download_headers(f"{_slug(g['title']) or 'guide'}.md"))
+
+
+@router.delete("/guides/{guide_id}")
+def delete_guide(guide_id: int) -> dict:
+    db.execute("DELETE FROM guides WHERE id = ?", (guide_id,))
+    return {"deleted": guide_id}
+
+
+@router.post("/projects/{project_id}/ask", status_code=201)
+def ask_course(project_id: int, body: AskIn) -> dict:
+    """Risposta sincrona (~5-15 s): una sola chiamata, niente coda."""
+    from . import ask
+    if not db.get_project(project_id):
+        raise HTTPException(404, "Project not found")
+    provider = db.get_provider(_resolve_provider(body.provider_id))
+    if not provider:
+        raise HTTPException(422, "LLM provider not found")
+    try:
+        return {"question": ask.answer(provider, project_id, body.question)}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - chiave sbagliata, credito, rete: lo si dice
+        # Prima diventava un 500 muto: la UI non poteva spiegare cosa fare.
+        raise HTTPException(502, f"{type(exc).__name__}: {exc}"[:400]) from exc
+
+
+@router.get("/projects/{project_id}/questions")
+def get_questions(project_id: int) -> dict:
+    from . import ask
+    return {"questions": ask.history(project_id)}
+
+
+@router.delete("/questions/{question_id}")
+def delete_question(question_id: int) -> dict:
+    db.execute("DELETE FROM questions WHERE id = ?", (question_id,))
+    return {"deleted": question_id}
 
 
 # ── Carte ────────────────────────────────────────────────────────────────────
@@ -1049,7 +1134,6 @@ def get_transcript(transcript_id: int) -> dict:
     if not t:
         raise HTTPException(404, "Transcript not found")
     t["segments"] = t["segments"] or []
-    t["n_proposals_pending"] = len(db.list_proposals(transcript_id, "pending"))
     summaries = db.list_summaries(transcript_id)
     t["n_summaries"] = len(summaries)
     t["latest_summary_id"] = summaries[0]["id"] if summaries else None
@@ -1059,6 +1143,9 @@ def get_transcript(transcript_id: int) -> dict:
     t["revisions"] = db.list_revisions(transcript_id)
     project = db.get_project(t["project_id"])
     t["project_name"] = project["name"] if project else None
+    # Lo stesso nome e numero che la lezione ha nella tabella del corso.
+    t["display_title"] = db._display_title(summaries[0]["title"] if summaries else None, t["title"])
+    t["lecture_no"] = db.lecture_numbers(t["project_id"]).get(transcript_id)
     return t
 
 
@@ -1070,6 +1157,8 @@ def patch_transcript(transcript_id: int, body: TranscriptPatch) -> dict:
     fields = {k: v for k, v in body.model_dump().items() if v is not None}
     if "project_id" in fields and not db.get_project(int(fields["project_id"])):
         raise HTTPException(422, "Target project does not exist")
+    if "study_status" in fields and fields["study_status"] not in db.STUDY_STATUSES:
+        raise HTTPException(422, f"study_status must be one of {db.STUDY_STATUSES}")
 
     if "text" in fields:
         old_text = transcript["text"]
@@ -1151,8 +1240,16 @@ def _slug(text: str) -> str:
 
 
 def _download_headers(filename: str) -> dict:
-    """Intestazione che fa scaricare il file invece di aprirlo nel browser."""
-    return {"Content-Disposition": f'attachment; filename="{filename}"'}
+    """
+    Intestazione che fa scaricare il file invece di aprirlo nel browser.
+
+    Gli header HTTP sono Latin-1: un titolo con λ o č faceva fallire l'export
+    con 422. Fallback ASCII più `filename*` UTF-8 (RFC 6266).
+    """
+    from urllib.parse import quote
+    ascii_name = filename.encode("ascii", "ignore").decode() or "download"
+    return {"Content-Disposition":
+            f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"}
 
 
 def _unique_path(used: set[str], path: str) -> str:
@@ -1224,88 +1321,6 @@ def dump(body: DumpIn = Body(...)) -> Response:
                     headers=_download_headers(f"trascrivi-dump-{stamp}.zip"))
 
 
-# ── Proposte di correzione ───────────────────────────────────────────────────
-@router.get("/transcripts/{transcript_id}/proposals")
-def get_proposals(transcript_id: int, status: str | None = None) -> dict:
-    if not db.get_transcript(transcript_id):
-        raise HTTPException(404, "Transcript not found")
-    return {"proposals": db.list_proposals(transcript_id, status)}
-
-
-@router.post("/transcripts/{transcript_id}/proposals/accept")
-def accept_proposals(transcript_id: int, body: ProposalsIn) -> dict:
-    """
-    Applica le proposte accettate e aggiorna il testo in modo deterministico.
-
-    Solo le proposte `accepted` finiscono nel piano; quelle `ambiguous` richiedono
-    un `targets` esplicito (id -> indice del segmento) e altrimenti sono saltate.
-    """
-    transcript = db.get_transcript(transcript_id)
-    if not transcript:
-        raise HTTPException(404, "Transcript not found")
-    rows = db.get_proposals(body.ids)
-    if not rows:
-        raise HTTPException(404, "No matching proposals")
-
-    segments = transcript["segments"] or text_to_segments(transcript["text"])
-    for prop in rows:
-        prop["status"] = "accepted"
-    plan = corr.build_plan(segments, rows)
-    result = corr.apply_plan(plan, targets={int(k): int(v) for k, v in (body.targets or {}).items()})
-
-    if result["applied"]:
-        db.update_transcript(transcript_id, {
-            "text": result["text"],
-            "segments": result["segments"],
-        })
-        db.add_revision(transcript_id, "agent_fix", result["applied"],
-                        f"{result['applied']} replacements applied")
-    db.set_proposal_status(body.ids, "accepted")
-
-    return {
-        "applied": result["applied"],
-        "skipped": result["details"],
-        "changed_segments": result["changed_segments"],
-        "text": result["text"],
-        "segments": result["segments"],
-    }
-
-
-@router.post("/transcripts/{transcript_id}/proposals/reject")
-def reject_proposals(transcript_id: int, body: ProposalsIn) -> dict:
-    if not db.get_transcript(transcript_id):
-        raise HTTPException(404, "Transcript not found")
-    n = db.set_proposal_status(body.ids, "rejected")
-    return {"rejected": n}
-
-
-@router.post("/transcripts/{transcript_id}/proposals/undo")
-def undo_pending(transcript_id: int) -> dict:
-    """Elimina le proposte ancora in attesa (es. dopo un fix sbagliato)."""
-    if not db.get_transcript(transcript_id):
-        raise HTTPException(404, "Transcript not found")
-    return {"removed": db.clear_pending_proposals(transcript_id)}
-
-
-@router.post("/transcripts/{transcript_id}/proposals/preview")
-def preview_proposals(transcript_id: int, body: ProposalsIn) -> dict:
-    """Anteprima del risultato (diff riga per riga) senza scrivere nulla."""
-    transcript = db.get_transcript(transcript_id)
-    if not transcript:
-        raise HTTPException(404, "Transcript not found")
-    rows = db.get_proposals(body.ids)
-    for prop in rows:
-        prop["status"] = "accepted"
-    segments = transcript["segments"] or text_to_segments(transcript["text"])
-    plan = corr.build_plan(segments, rows)
-    result = corr.apply_plan(plan, targets={int(k): int(v) for k, v in (body.targets or {}).items()})
-    return {
-        "applied": result["applied"],
-        "skipped": result["details"],
-        "diff": corr.diff_preview(transcript["text"], result["text"]),
-    }
-
-
 # ── Glossario di materia ─────────────────────────────────────────────────────
 @router.get("/terms")
 def get_terms(project_id: int) -> dict:
@@ -1347,19 +1362,6 @@ def _key_state(provider: dict) -> str:
         return "missing"
     raw = db.get_provider(int(provider["id"])) or {}
     return "ok" if llm.decrypt_key(raw.get("api_key_enc")) else "unreadable"
-
-
-@router.get("/agent/prompt")
-def agent_prompt() -> dict:
-    """Il system prompt e i parametri con cui l'agente interroga il modello."""
-    settings = config.load_settings()
-    return {
-        "system_prompt": llm.SYSTEM_PROMPT,
-        "max_output_tokens": llm.MAX_OUTPUT_TOKENS,
-        "temperature": 0,
-        "timeout_seconds": llm.REQUEST_TIMEOUT,
-        "chunk_chars": settings.llm_chunk_chars,
-    }
 
 
 @router.patch("/providers/{provider_id}")
@@ -1416,9 +1418,9 @@ _SETTINGS_FIELDS = {"default_project_id", "default_model", "default_language",
                     "summary_max_tokens", "summary_style",
                     "summary_language", "backup_keep",
                     # Carte e slide (PIANO-slide-e-carte).
-                    "cards_max", "cards_language", "cards_context_chars", "cards_vision",
+                    "cards_enabled", "monthly_budget_usd", "auto_vocabulary", "cards_max", "cards_language", "cards_context_chars", "cards_vision",
                     "slides_vlm", "slides_vlm_model", "slides_vlm_max",
-                    "match_threshold", "embed_model"}
+                    "match_threshold", "match_margin", "embed_model"}
 
 
 @router.get("/settings")

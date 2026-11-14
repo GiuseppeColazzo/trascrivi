@@ -1,7 +1,11 @@
 """
 trascrivi/corrections.py
 ========================
-Edit-plan deterministico: l'agente propone sostituzioni, il codice le verifica.
+Edit-plan deterministico: sostituzioni find -> replace verificate sul testo.
+
+Oggi lo usa solo il glossario del corso (`apply_terms`). L'agente LLM che
+proponeva le sostituzioni è stato tolto: trovava troppo, l'approvazione era di
+fatto manuale, e la correzione dei nomi la fa ora il riassunto.
 
 Perché un edit-plan e non una riscrittura: sostituire *find -> replace* costa
 token proporzionali alle correzioni (non al testo), è verificabile (match esatto,
@@ -441,41 +445,3 @@ def apply_terms(text: str, terms: list[dict]) -> tuple[str, int]:
             text = result["text"]
             n_applied += result["applied"]
     return text, n_applied
-
-
-def dedupe_proposals(items: list[dict]) -> list[dict]:
-    """
-    Scarta le proposte identiche (il chunking ripete un segmento di contesto).
-
-    Tiene la prima occorrenza: le successive non aggiungono informazione e
-    renderebbero la review inutilmente lunga.
-    """
-    seen: set[tuple[str, str]] = set()
-    out: list[dict] = []
-    for it in items:
-        key = (normalize_for_match(it.get("find") or ""), normalize_for_match(it.get("replace") or ""))
-        if not key[0] or key in seen:
-            continue
-        seen.add(key)
-        out.append(it)
-    return out
-
-
-def diff_preview(old_text: str, new_text: str, limit: int = 200) -> list[dict]:
-    """
-    Righe cambiate fra due testi, per l'anteprima prima di applicare.
-
-    Confronto riga per riga con `difflib`: zero dipendenze e sufficiente per un
-    editor di appunti (non serve un diff a livello di carattere).
-    """
-    import difflib
-    out: list[dict] = []
-    for line in difflib.unified_diff(old_text.splitlines(), new_text.splitlines(),
-                                     lineterm="", n=0):
-        if line.startswith(("---", "+++")):
-            continue
-        if line.startswith(("-", "+")):
-            out.append({"kind": line[0], "text": line[1:]})
-        if len(out) >= limit:
-            break
-    return out

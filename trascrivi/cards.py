@@ -39,18 +39,26 @@ log = logging.getLogger("trascrivi.cards")
 # Come per il riassunto: il prompt è versionato perché il contenuto delle carte
 # dipende da lui, e la cache deve invalidarsi quando cambia. p2: regola esplicita
 # sulla cancellazione nei cloze (i modelli locali producevano cloze senza buchi,
-# che Anki mostrerebbe come una carta con niente da ricordare).
-PROMPT_VERSION = "p2"
+# che Anki mostrerebbe come una carta con niente da ricordare). p3: copertura
+# della lezione e limite alle carte prese da una singola pagina/recap. p4: il
+# riassunto è la fonte primaria; copertura minima delle sezioni e limite per
+# pagina applicato nel codice, non solo chiesto al modello.
+PROMPT_VERSION = "p4"
 # Le immagini costano circa un migliaio di token l'una: nel preventivo vanno
 # contate, altrimenti la stima prima della generazione è una bugia.
 VISION_TOKENS_PER_IMAGE = 1000
 VISION_MAX_PAGES = 3
 VISION_IMAGE_LONG_SIDE = 1024
-# Quanta parte del contesto può prendere il riassunto: il resto è slide, che è
-# la ragione per cui questa funzione esiste.
-SUMMARY_SHARE = 0.5
+# Quanta parte del contesto può prendere il riassunto: il resto è slide. Il
+# riassunto è la fonte primaria (sezioni, definizioni, filo della lezione), quindi
+# prende la maggior parte del budget; le slide restano evidenza di supporto. A
+# 12000 caratteri, 0.65 include quasi tutto il riassunto e lascia spazio a 4
+# pagine, invece di riempire il prompt con molte pagine della stessa sezione.
+SUMMARY_SHARE = 0.65
 # Una pagina di slide lunga quanto un libro non serve intera per fare una carta.
 PAGE_CHARS = 1800
+# Il prompt lo chiede, ma i modelli lo ignorano: il limite va applicato qui.
+MAX_CARDS_PER_PAGE = 2
 
 # Provider che sanno leggere un'immagine. DeepSeek no: è l'unico text-only dei
 # tre, e la mappa è esplicita perché la vision mode non deve fallire a runtime
@@ -69,6 +77,10 @@ A card is good when it tests exactly one thing.
 - Atomic: one fact per card. If a sentence carries two facts, that is two cards.
 - Answerable from the material alone: never use outside knowledge, never add examples, numbers or opinions that are not in it.
 - The answer must not be guessable from the question alone, and must not be longer than two lines.
+- The lecture summary is the primary source and defines the whole deck: read all its sections before choosing cards. The slides are supporting evidence, not a separate syllabus.
+- Cover the summary's main sections, not just the opening motivation or one hardware table: for a full deck use at least four different sections when the summary has them, including at least two cards from the second half of the summary. Do not give one section more than three cards, and do not give one slide page more than two.
+- Prefer concepts, definitions, formulas and trade-offs from the summary; use a slide when it adds a concrete number or example. Do not turn every number on a slide into a card.
+- A recap slide or summary table is a map, not source material: prefer the page that explains the fact, and do not make cards from a recap of earlier lectures.
 
 Formulas and notation:
 - Write mathematics as LaTeX between $...$, copied exactly as it appears in the material.
@@ -91,7 +103,11 @@ USER_PROMPT = """<lecture>
 
 {slides}
 
-{existing}Write at most {max_cards} cards from this material."""
+{existing}Write at most {max_cards} cards from this material.
+Before returning, check the whole deck: use at least four different summary sections when they exist,
+including at least two cards from the second half, and never more than two cards from one slide page.
+The first slide pages do not decide the coverage; the summary does. If the deck fails this check,
+replace cards until it passes."""
 
 
 # ── Contesto ─────────────────────────────────────────────────────────────────
@@ -131,14 +147,26 @@ def build_context(transcript: dict, settings, *, limit_pages: int | None = None)
     """
     Il materiale che finisce nel prompt, dentro il budget di caratteri.
 
-    Ordine: il riassunto (metà del budget al massimo), poi le pagine assegnate,
-    poi — se avanza spazio — la trascrizione grezza. Le pagine senza link non
-    entrano: il piano è esplicito sul fatto che il contesto non si sporca da
-    solo (`slide_links` è la scelta dell'utente o del matching confermato).
+    Ordine: il riassunto (la fonte primaria, `SUMMARY_SHARE` del budget), poi le
+    pagine linkate, ordinate da `db.linked_pages` (prima i link confermati, poi
+    lo score). Se esiste almeno un link confermato a mano, le proposte
+    automatiche restano fuori; se non ce ne sono, si usano le proposte ma il
+    chiamante sa quante pagine sono ancora da confermare (`unconfirmed`) e può
+    avvisare in UI.
     """
     budget = int(getattr(settings, "cards_context_chars", 12000) or 12000)
     summary = db.latest_summary(int(transcript["id"]))
-    pages = db.linked_pages(int(transcript["id"]))
+    all_pages = db.linked_pages(int(transcript["id"]))
+    manual = [p for p in all_pages if (p.get("link_source") or "auto") == "manual"]
+    auto = [p for p in all_pages if (p.get("link_source") or "auto") != "manual"]
+    if manual:
+        pages = manual
+        confirmed = True
+        auto_ignored = len(auto)
+    else:
+        pages = auto
+        confirmed = False
+        auto_ignored = 0
     if limit_pages is not None:
         pages = pages[:limit_pages]
 
@@ -155,13 +183,18 @@ def build_context(transcript: dict, settings, *, limit_pages: int | None = None)
         blocks.append(block)
         used += len(block)
 
+    used_pages = pages[:len(blocks)]
     return {
         "summary": summary_text,
         "slides": blocks,
-        "pages": pages[:len(blocks)],
+        "pages": used_pages,
         "chars": used,
         "budget": budget,
         "has_summary": bool(summary),
+        "linked": len(all_pages),
+        "confirmed": confirmed,
+        "unconfirmed": 0 if confirmed else len(used_pages),
+        "auto_ignored": auto_ignored,
     }
 
 
@@ -228,6 +261,7 @@ def inputs_hash(context: dict, settings, provider: dict, *, vision: bool,
         "model": provider.get("model") or "",
         "vision": bool(vision),
         "cards_max": int(getattr(settings, "cards_max", 12) or 12),
+        "max_cards_per_page": MAX_CARDS_PER_PAGE,
         "language": getattr(settings, "cards_language", "") or "",
         "summary": context["summary"],
         "slides": context["slides"],
@@ -275,6 +309,10 @@ def estimate(transcript: dict, provider: dict, settings, *, vision: bool | None 
         "chars": context["chars"],
         "budget": context["budget"],
         "slides": len(context["slides"]),
+        "linked": context["linked"],
+        "confirmed": context["confirmed"],
+        "unconfirmed": context["unconfirmed"],
+        "auto_ignored": context["auto_ignored"],
         "summary": context["has_summary"],
         "tokens_in": text_tokens + VISION_TOKENS_PER_IMAGE * len(images),
         "images": len(images),
@@ -360,6 +398,7 @@ def clean_cards(items: list, *, allowed_latex: set[str], existing_hashes: set[st
     out: list[dict] = []
     rejected: list[str] = []
     seen: set[str] = set()
+    per_page: dict[int, int] = {}
     for item in items or []:
         if not isinstance(item, dict):
             continue
@@ -397,7 +436,16 @@ def clean_cards(items: list, *, allowed_latex: set[str], existing_hashes: set[st
         if slide_ref is not None and slide_ref not in page_numbers:
             # Un numero di pagina che non esiste nel contesto è un'invenzione.
             slide_ref = None
+        if slide_ref is not None and per_page.get(slide_ref, 0) >= MAX_CARDS_PER_PAGE:
+            # Il prompt lo vieta, ma non basta: senza questo taglio una sola
+            # pagina può mangiarsi il mazzo (visto con 4 carte su slide 14).
+            rejected.append("page_cap")
+            log.info("carta scartata per limite pagina: slide %s — %.120s",
+                     slide_ref, front)
+            continue
         seen.add(digest)
+        if slide_ref is not None:
+            per_page[slide_ref] = per_page.get(slide_ref, 0) + 1
         out.append({"uid": uuid.uuid4().hex, "kind": kind, "front": front,
                     "back": back, "slide_ref": slide_ref, "origin": "llm"})
         if len(out) >= cards_max:
@@ -421,12 +469,18 @@ def generate(provider: dict, transcript: dict, settings, *, force: bool = False,
     use_vision = wants_vision(provider, settings, context) if vision is None else (
         vision and supports_vision(provider, settings))
     images = vision_pages(context) if use_vision else []
-    existing = existing_fronts(int(transcript["project_id"]), int(transcript["id"]))
+    latest = db.latest_card_run(int(transcript["id"]))
+    # Se questo run sostituisce le carte generate della lezione, quelle non
+    # contano come "già esistenti": prima finivano nell'anti-duplicato, le carte
+    # nuove identiche venivano scartate e poi le vecchie cancellate — rigenerare
+    # svuotava il mazzo.
+    replacing = force or bool(latest)
+    existing = existing_fronts(int(transcript["project_id"]), int(transcript["id"]),
+                               for_hash=replacing)
     fingerprint = inputs_hash(context, settings, provider, vision=bool(images),
                               existing=existing_fronts(int(transcript["project_id"]),
                                                        int(transcript["id"]),
                                                        for_hash=True))
-    latest = db.latest_card_run(int(transcript["id"]))
     if not force and latest and latest["inputs_hash"] == fingerprint \
             and latest.get("status") == "ok":
         return {"cached": True, "n_new": 0, "n_skipped_dup": 0,
@@ -498,8 +552,9 @@ def generate(provider: dict, transcript: dict, settings, *, force: bool = False,
 
     # Sostituzione: le carte generate non modificate se ne vanno, quelle
     # modificate a mano restano (e sono già nell'elenco degli esistenti).
+    # Un run vuoto non sostituisce niente: meglio le carte vecchie che nessuna.
     removed = db.delete_llm_cards(int(transcript["id"]), keep_edited=True) if (
-        force or latest) else 0
+        replacing and cards) else 0
     db.create_cards(int(transcript["id"]), cards, run_id=run_id)
     if not cards:
         db.update_card_run(run_id, {"status": "empty"})

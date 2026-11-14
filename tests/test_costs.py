@@ -101,8 +101,8 @@ def test_a_summary_covered_by_a_costing_job_is_counted_once(project, make_transc
     scartare il riassunto che il costo ce l'ha.
     """
     t = make_transcript(project, "Lezione 1")
-    _job(project, "llm_summary", cost=0.30, tokens=5000, transcript_id=t)
-    db.create_summary(t, markdown="# L", n_words=10, tokens_in=4000, tokens_out=1000,
+    jid = _job(project, "llm_summary", cost=0.30, tokens=5000, transcript_id=t)
+    db.create_summary(t, job_id=jid, markdown="# L", n_words=10, tokens_in=4000, tokens_out=1000,
                       cost_usd=0.30)
 
     assert _course_total(project) == 0.30
@@ -162,23 +162,3 @@ def _fake_agent_llm(monkeypatch, *, prompt=1200, completion=80, hit=0, miss=1200
     monkeypatch.setattr(llm, "_client", lambda provider: client)
 
 
-def test_the_correction_agent_records_its_own_cost(monkeypatch, project, make_transcript):
-    """
-    Regressione: `run_agent` riceveva la diagnostica di ogni chunk e la
-    scartava, quindi le correzioni non comparivano in nessun conto.
-    """
-    _fake_agent_llm(monkeypatch)
-    provider_id = db.get_provider_by_name("deepseek")["id"]
-    transcript = make_transcript(project, "Lezione 1", segments=[
-        {"start": 0.0, "end": 5.0, "text": "Today we talk about pie torch"},
-    ])
-    job_id = db.create_job("llm_fix", {"transcript_id": transcript, "provider_id": provider_id},
-                           project_id=project, transcript_id=transcript)
-
-    result = jobs.run_agent(job_id, {"transcript_id": transcript, "provider_id": provider_id})
-
-    assert result["usage"]["prompt"] == 1200
-    assert result["usage"]["completion"] == 80
-    stored = llm.usage_counts(result["usage"])
-    assert stored["tokens_in"] == 1200
-    assert stored["cost_usd"] > 0

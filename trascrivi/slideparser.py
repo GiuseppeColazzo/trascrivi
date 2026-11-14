@@ -40,7 +40,7 @@ log = logging.getLogger("trascrivi.slideparser")
 
 # Estensioni accettate dall'upload. Il rendering delle immagini è anche il modo
 # più semplice di gestire una slide esportata come PNG.
-SLIDE_EXTS = {".pdf", ".pptx", ".docx", ".png", ".jpg", ".jpeg", ".webp"}
+SLIDE_EXTS = {".pdf", ".pptx", ".docx", ".png", ".jpg", ".jpeg", ".webp", ".txt", ".md"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
 # Sotto questa soglia di caratteri nativi la pagina è "senza testo": quasi
@@ -404,8 +404,32 @@ def parse_image(path: Path, out_dir: Path, *, should_stop=None,
     }]
 
 
+# ── Testo semplice ───────────────────────────────────────────────────────────
+TEXT_PAGE_CHARS = 3000
+
+
+def parse_text(path: Path, out_dir: Path, *, should_stop=None, on_page=None) -> list[dict]:
+    """
+    Un .txt/.md (tipicamente un esame passato trascritto a mano): pagine da
+    ~3000 caratteri tagliate sulle righe vuote, così una domanda non si spezza.
+    """
+    raw = path.read_bytes().decode("utf-8", errors="replace")
+    pages, current = [], ""
+    for block in raw.replace("\r\n", "\n").split("\n\n"):
+        if current and len(current) + len(block) > TEXT_PAGE_CHARS:
+            pages.append(current)
+            current = ""
+        current = f"{current}\n\n{block}" if current else block
+    if current.strip():
+        pages.append(current)
+    return [{"page_no": i, "text": text.strip(), "has_text": True, "n_images": 0,
+             "ocr_chars": 0, "render_path": None, "render_sha": None}
+            for i, text in enumerate(pages, start=1)]
+
+
 # ── Dispatch, boilerplate, complessità ───────────────────────────────────────
-PARSERS = {".pdf": parse_pdf, ".pptx": parse_pptx, ".docx": parse_docx}
+PARSERS = {".pdf": parse_pdf, ".pptx": parse_pptx, ".docx": parse_docx,
+           ".txt": parse_text, ".md": parse_text}
 
 
 def parse(path: Path, out_dir: Path, *, should_stop=None,

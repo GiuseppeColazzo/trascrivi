@@ -1,0 +1,32 @@
+[
+ {
+  "version": "1.1.0",
+  "date": "2026-11-14",
+  "en": [
+   "Interface in English and Italian: pick the language from the EN/IT menu at the top.",
+   "Ask the course: questions answered from every lecture, with links to the lecture and the minute.",
+   "Exam guide: one document for the whole course; upload past exams (PDF, photos, text) and every question is mapped to the lectures.",
+   "Summaries use the course slides for the spelling of terms and formulas, and fix names the recogniser misheard.",
+   "Add many lectures at once: several files, or a whole folder.",
+   "Jobs page: one entry per lecture, with the steps inside; a notification when the queue is done.",
+   "Lectures are numbered L1, L2… and have a study status (to study, reviewed, confident) with the course progress.",
+   "Reading mode for summaries (full screen, with contents), comparison of two versions, and search that also looks inside summaries and opens the lecture at the right minute.",
+   "Warnings for lectures transcribed with too little text, and Whisper gets the course vocabulary from the slides.",
+   "The correction agent is gone; flashcards are optional (Settings).",
+   "Many fixes: resuming an interrupted transcription, no more lost audio on an empty transcription, safer uploads, exports with any character."
+  ],
+  "it": [
+   "Interfaccia in italiano e inglese: scegli la lingua dal menu EN/IT in alto.",
+   "Chiedi al corso: domande con risposta presa da tutte le lezioni, con link alla lezione e al minuto.",
+   "Guida all'esame: un documento per tutto il corso; carica gli esami passati (PDF, foto, testo) e ogni domanda viene collegata alle lezioni.",
+   "I riassunti usano le slide del corso per scrivere giusti termini e formule, e correggono i nomi capiti male.",
+   "Aggiungi tante lezioni insieme: più file, o una cartella intera.",
+   "Pagina Job: una voce per lezione con i passi dentro; una notifica quando la coda è finita.",
+   "Le lezioni sono numerate L1, L2… e hanno uno stato di studio (da studiare, ripassata, sicura) con il progresso del corso.",
+   "Modalità lettura dei riassunti (a schermo intero, con indice), confronto fra due versioni, e ricerca anche nei riassunti che apre la lezione al minuto giusto.",
+   "Avviso sulle lezioni trascritte con troppo poco testo, e Whisper riceve il vocabolario del corso dalle slide.",
+   "Via il correttore automatico; le flashcard sono facoltative (Impostazioni).",
+   "Tanti bug corretti: ripresa delle trascrizioni interrotte, niente più audio perso con una trascrizione vuota, upload più sicuri, export con qualunque carattere."
+  ]
+ }
+]

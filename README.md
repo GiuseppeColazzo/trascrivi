@@ -5,12 +5,12 @@ existing `faster-whisper` engine of this repository in a small FastAPI server: y
 university subject, add a lecture either by dragging the file into the browser or by pointing at an
 absolute path on disk, and a background worker transcribes it while the page shows progress, realtime
 speed and an ETA. The finished transcript lands in a searchable registry where you can read it, edit it
-line by line, export it as `.txt`/`.md`/`.json`/segments, and optionally hand it to an LLM **correction
-agent** that proposes anchored, individually reviewable fixes instead of rewriting your text, or to a
-**summary** step that turns a lecture into exam notes where every bullet carries a sentence quoted
-verbatim from the transcript — and each quote is checked against the transcript before it is stored.
-Courses also carry a deterministic glossary of `find → replace` rules, so a correction accepted once is
-applied silently to every later lecture of that course. Everything runs offline on your machine — no
+line by line, export it as `.txt`/`.md`/`.json`/segments, and hand it to a **summary** step that turns
+the lecture into Markdown study notes (with the matching slides as reference for terms and formulas).
+On a whole course you can **ask questions** answered with citations to lecture and minute, and generate
+an **exam guide** that maps the questions of past exams to the lectures. Recordings can be queued in
+bulk (several files, or a whole folder). Courses also carry a deterministic glossary of `find → replace`
+rules applied silently to every new lecture of that course. Everything runs offline on your machine — no
 account, no telemetry, and no network call at all unless you explicitly configure a cloud LLM provider.
 
 The stack is deliberately minimal: **FastAPI + uvicorn**, one process and one background worker thread,
@@ -163,102 +163,42 @@ source (uploaded copy in data/sources/, or a path referenced in place)
 6. **Materialisation.** On success the raw text is parsed into segments, the course glossary is applied,
    and the transcript (plus its FTS5 index entry and a first revision record) is written.
 
-### The correction agent
+### No more correction agent
 
-The design point worth understanding: **the LLM never rewrites the transcript.** Instead, the model is
-asked for a list of *anchored edits*:
+The LLM correction agent (anchored find → replace proposals reviewed one by one) was removed in
+November 2026. In practice it proposed too much, approval was manual, and only 5 runs were ever
+made (3 cancelled). Its useful part — names and terms the recogniser got wrong — is now done by the
+**summary**, which is told to write a misheard name correctly when the slides, the glossary or the
+sentence make it clear, and to mark it with "(?)" when they do not. The deterministic **course
+glossary** (`find → replace`, applied on import) stays. Old proposals stay in the database, untouched.
 
-```json
-{ "find": "...", "replace": "...", "reason": "...", "kind": "...", "confidence": 0.0 }
-```
+### Course study tools
 
-plus an optional glossary. The app then applies the edits itself as a deterministic substitution.
+Two features work on a whole course instead of a single lecture. Both read the lecture summaries,
+so a course needs at least one summary first.
 
-Why it is built that way:
+- **Ask the course** (course page). A question gets an answer built from the notes of every
+  lecture plus the 8 transcript passages closest to the question (local TF-IDF, no embeddings, no
+  Ollama). Each point is cited as `[L3]` or `[L3 12:40]`; the citation is a link that opens the
+  lecture at that minute. The notes go in the system message, which stays identical between
+  questions, so DeepSeek serves it from its prompt cache. Answers are kept per course.
+- **Exam guide** (course page, a job). One Markdown document for the whole course: a map of the
+  lectures, the core concepts grouped by theme with lecture references, and a checklist. When the
+  course has **past exams**, every question that came up in previous years is mapped to the
+  lectures that cover it, with an answer outline, plus a table of what the exams ask most. Without
+  past exams it lists likely questions. Download it as `.md`.
+- **Past exams** (course page). Drop old exams in any format: `.txt`, `.md`, `.docx`, PDF (scanned
+  PDFs and photos go through the same local OCR as the slides). They are parsed like slides
+  (`slide_docs.kind = 'exam'`) but never assigned to lectures: they only feed the guide.
 
-- **Cost scales with the number of corrections, not the transcript length.** A two-hour lecture may need
-  twenty fixes; you pay for those, not for re-emitting the lecture.
-- **The substitution is deterministic and verifiable.** For each proposal the engine knows the exact
-  match, the number of occurrences, and whether it overlaps or conflicts with another edit. Nothing is
-  "mostly" applied.
-- **Every proposal is individually acceptable or rejectable.** You see find → replace with the reason
-  and confidence, preview a line-by-line diff, accept all, reject all, or apply only the ones you select.
+### Slides as context for the summary
 
-Prompting is **chunked at ~4000 characters** (`llm_chunk_chars` in Settings) with **one segment of
-overlap** between consecutive chunks so a correction spanning a boundary is still visible, and
-`temperature=0` because we want substitution, not creativity.
-
-#### What the agent is allowed to change
-
-The system prompt is deliberately restrictive, because a permissive one produces noise rather than
-corrections. The model is told its **only** job is to fix words the recogniser heard wrong when the
-intended word is unmistakable from the sentence, and it is told explicitly never to propose
-rephrasing, style changes, spelling variants, capitalisation, or punctuation-only edits. Its test for
-every candidate is: *"would a human typing this transcript while listening have written something
-different?"*
-
-Measured on the same 30-segment chunk, the restrictive prompt returned **7 edits in 3.2 s** against
-**30 edits in 8.8 s** for a permissive one, and the 30 were mostly style preferences. The 7 are the
-kind of thing you actually want:
-
-| Recogniser output | Correction | Why it is decidable |
-|---|---|---|
-| `four people if the Aligno have access to Oveni` | `poor people …` | "four people if" is not a phrase |
-| `the lawsuit between Mecca and other people` | `… Meta …` | a lawsuit about a tech company |
-| `COGO changes decline` | `CO2 changes climate` | domain vocabulary |
-| `gave back` | `give-back` | noun, not a verb, in this sentence |
-| `environmental research of knowledge` | `environmental erosion of knowledge` | collocation |
-
-The prompt also **caps the output at 5 items per chunk and requires `confidence >= 0.9`** (anything
-lower is dropped before review). This matters more than it looks: given room, the model fills the quota
-with guesses — with a cap of 15 the same chunk produced 14 edits whose confidence was 0.4–0.7, including
-invented wording like *"It hasn't been the same as what has happened"*. With the low cap it returns 6,
-all defensible, at **1/3 of the output tokens**. Volume is not value here: a wrong suggestion costs the
-reader more than a missed correction.
-
-#### Proposal flags
-
-Every proposal is validated against the actual segments and tagged. You can only apply what the engine
-was able to anchor.
-
-| Flag | Meaning |
-|---|---|
-| `ok` | The `find` text matches exactly one segment. Ready to apply. |
-| `ambiguous` | `find` occurs more than once. The app refuses to guess and asks you to pick the segment from a dropdown. |
-| `unmatched` | The `find` text was not found verbatim in the transcript. |
-| `conflict` | Applying this edit would overlap an edit already claimed by another proposal. |
-| `noop` | `find` and `replace` are identical (the model does this: 217 of 563 proposals on one real lecture) — discarded before it reaches the review list. |
-| `too_large` | The edit rewrites more than `max_delta_chars = 160` characters. This is what stops a model from rewriting whole sentences. |
-| `duplicate` | The same `find → replace` pair was already proposed. |
-
-If a chunk is still too big to fit in one answer (the JSON gets cut off mid-object), the agent
-**halves that chunk and retries**, down to a floor of two segments, instead of losing the section.
-
-#### Cost of a lecture
-
-Measured on a real 88-minute lecture (203 segments, 65 756 characters → 18 chunks, 28 s of wall clock):
-
-| | Before | Now (cap 5, confidence ≥ 0.9) |
-|---|---|---|
-| Proposals returned | 563 | 61 |
-| Input tokens | 27 558 | 29 088 |
-| Output tokens | 12 018 | **4 714** |
-| Off-peak cost, 10 lectures | $0.078 | **$0.034** |
-
-At the published `deepseek-flash` rates ([api-docs.deepseek.com](https://api-docs.deepseek.com/quick_start/pricing),
-USD per 1M tokens; a cache hit is 50× cheaper than a miss):
-
-| Rate | 1 lecture | 10 lectures |
-|---|---|---|
-| Off-peak ($0.003 hit / $0.15 miss / $0.60 output) | **$0.003** | **$0.03** |
-| Peak ($0.006 hit / $0.30 miss / $1.20 output) | $0.007 | $0.07 |
-
-Output dominates the bill (~78% before, ~50% now), which is why the low cap pays off twice: fewer
-proposals mean less to read *and* less to pay for. The input side is nearly free because the system
-prompt is served from DeepSeek's context cache across all 18 chunks.
-
-The agent is **opt-in per job** and can be **re-run on any existing transcript** from the Transcript
-screen.
+When a course has slides, the summary prompt carries the pages that match the lecture (about 1 500
+tokens). Confirmed or embedding-based assignments are used when they exist; otherwise the pages are
+picked by local TF-IDF against the transcript, which works with Ollama switched off. Measured on the
+real courses: the lecture on tiling/parallelism picks pages 89–148 of the right deck. The model uses
+them for the spelling of terms, for notation and for formulas the lecturer explains (in LaTeX in the
+`.md` file), and is told not to add topics that are only on the slides.
 
 ### The summary
 
@@ -367,6 +307,9 @@ guarantees:
 
 ### Slides, flashcards and Anki export
 
+> Flashcards are **optional** and off by default: turn them on in Settings → *Slide e carte*
+> (`cards_enabled`) to get the Cards tab, the chip in the course table and the deck export.
+
 The slides of a course can be used as **extra context** for flashcards, and Trascrivi is where you review
 and export the deck. Nothing here is automatic: uploading a deck, parsing it and matching it to lectures
 never calls a model over the network, and the cards are generated **only when you press the button**, with
@@ -394,11 +337,14 @@ the page render. It is the answer to "why did this card come out like that" — 
 skipped is usually visible there in ten seconds.
 
 **2. Match.** *Associa alle lezioni* runs `embed_match`: pages and lecture summaries are embedded locally
-with Ollama (`nomic-embed-text:v1.5`), each page picks the most similar lecture above `match_threshold`,
-and runs shorter than three pages are absorbed by their neighbours (or dropped, if the two neighbours
-disagree). The proposals appear in the *Associa* dialog with a page preview and a score; **Accetta tutte**
-confirms them in one click, and a range can be removed or added by hand. A confirmed link (`manual`) is
-never overwritten by a later matching run.
+with Ollama (`nomic-embed-text:v1.5`). The lecture vector uses the title, the overview and up to 4000
+characters of the summary, so it describes the lecture and not only its opening recap. Each page picks the
+most similar lecture above `match_threshold`, but only if it is at least `match_margin` ahead of the
+second-best lecture; a page that is too close to two lectures stays unassigned. Runs shorter than three
+pages are absorbed by their neighbours (or dropped, if the two neighbours disagree). The proposals appear
+in the *Associa* dialog with a page preview and a score; **Accetta tutte** confirms them in one click, and
+a range can be removed or added by hand. A confirmed link (`manual`) is never overwritten by a later
+matching run.
 
 The matching also runs by itself, with no button: at the end of every `parse_slides` (upload or *Rileggi*),
 at the end of every transcription, and at the end of every `llm_summary` when the course has slides on file —
@@ -412,16 +358,25 @@ runs, finds no candidate and proposes **nothing** (a job that finishes with `0 p
 and *Associa alle lezioni* is disabled until a lecture exists. The proposals appear by themselves when the
 first transcription of that course finishes, and are refined when its summary is written.
 
-**3. Cards.** The **Cards** tab of a lecture shows the estimate — linked slides, context characters,
-estimated input tokens, images if vision is on, and whether the material is unchanged since the last run —
-then *Genera carte*. The context is the lecture summary plus the linked pages (`text` + `vlm_md`), inside
-`cards_context_chars`; the existing fronts of the course go into the prompt so the model does not rewrite a
-question that already exists.
+**3. Cards.** The **Cards** tab of a lecture shows the estimate — slides actually used in the context, how
+many pages are linked, context characters, estimated input tokens, images if vision is on, and whether the
+material is unchanged since the last run — then *Genera carte*. The context is the lecture summary plus the
+linked pages (`text` + `vlm_md`), inside `cards_context_chars`. The summary is the primary source and gets
+most of the budget; the slides are supporting evidence. When at least one link is confirmed by hand
+(`manual`), only confirmed links are used; otherwise the automatic proposals are used and the estimate
+marks them as unconfirmed. Pages are ordered by confirmation and score, not by filename, so the deck that
+actually matches the lecture fills the budget first. The existing fronts of the course go into the prompt
+so the model does not rewrite a question that already exists.
+
+The prompt asks the deck to cover several summary sections, including the technical core, instead of
+spending every card on the opening motivation or one hardware table. It also asks for at most two cards
+from the same slide page.
 
 | Rule | Why it is there |
 |---|---|
 | the output is JSON `{"cards": [...]}` | one call, no per-card round trip; a bare array or a single card is accepted too |
 | dedup on normalized text | the same question with different punctuation is not a new card |
+| at most two cards per slide page | the prompt asks for it and the parser enforces it: a single page cannot fill the deck |
 | a card quoting LaTeX that is **not** in the material is dropped | a formula the model remembered is a formula nobody can check — this is the concrete form of "no invented formulas" |
 | `inputs_hash` cache | the same material is not paid twice; **forza** regenerates anyway |
 | regeneration replaces only untouched LLM cards | what you edited by hand stays, and is passed to the model as an existing front |
@@ -464,6 +419,16 @@ terms, so nothing the model proposes is ever applied without your say-so.
 
 ## Web UI tour
 
+> **Languages.** The interface is in English by default and in Italian from the EN/IT menu in the
+> header (the choice is remembered in the browser). Strings live in `web/i18n/en.json` and
+> `web/i18n/it.json`, flat keys with dot namespaces, `{name}` placeholders and
+> `{"one": …, "other": …}` plurals; `t(key, vars)` in `web/i18n.js` falls back to English.
+> `tests/test_i18n.py` fails when the two files drift apart or `app.js` uses a key that does not exist.
+> Planned work and its status is tracked in [ROADMAP.md](ROADMAP.md). Release notes live in
+> `web/changelog.json` (English and Italian): the app shows them once after each new version, and
+> again from "What's new" in the footer. Bump `trascrivi/__init__.py` and the changelog together —
+> a test fails when they disagree.
+
 The frontend is hash-routed, so every screen has a shareable URL. A light/dark toggle in the header is
 persisted in `localStorage`.
 
@@ -474,7 +439,7 @@ persisted in `localStorage`.
 | **New lecture** | `#/p/<id>/new` | The two ways to add audio (drag & drop / file picker, or an absolute local path validated live through `/api/media/probe`) plus the full transcription form: model, language, device, compute type, beam size, VAD, word timestamps, initial prompt for course vocabulary, and the two optional LLM follow-ups — the correction agent and the summary, each with its own provider picker. The model and language menus carry flags (below). |
 | **Jobs** | `#/jobs` | Queue and history with progress bar, `x realtime` speed, ETA, and Cancel / Retry / Resume. The header badge shows the running count. |
 | **Transcript** | `#/t/<id>` | The registry entry: editor (one line = one segment, timestamps re-attached on save), **Segments** tab, **Proposals** tab with the agent's review and diff preview, **Summary** tab, **Cards** tab (estimate, generate/regenerate, edit, suspend, download `.apkg`/`.tsv`) and **Info** with revision history and exports. |
-| **Settings** | `#/settings` | Transcription defaults, agent chunk size, flush interval, summary defaults (style, output language, output token cap), **Slide e carte** (VLM mode and model, embedding model, matching threshold, cards per lecture, context size, cards language, images in the prompt), backups to keep, default provider, disk usage (audio copies / data dir / free space), database backup, *Delete all audio copies*, *Unload models from RAM*, and the LLM provider configuration. |
+| **Settings** | `#/settings` | Transcription defaults, agent chunk size, flush interval, summary defaults (style, output language, output token cap), **Slide e carte** (VLM mode and model, embedding model, matching threshold and margin, cards per lecture, context size, cards language, images in the prompt), backups to keep, default provider, disk usage (audio copies / data dir / free space), database backup, *Delete all audio copies*, *Unload models from RAM*, and the LLM provider configuration. |
 
 ### Transcription options
 
@@ -671,7 +636,7 @@ The test suite is `pytest`-based and runs against the standard library plus the 
 | `tests/test_slideparser.py` | the parser on real files built in-test: a hand-written PDF read without OCR, a page without text going through the OCR (with reading order), **RapidOCR reading a page we rendered ourselves**, PPTX text + speaker notes + pictures, DOCX paragraphs and tables, boilerplate removal (and not removing it below three pages), complexity signals, the missing-library message |
 | `tests/test_matching.py` | page → lecture assignment with deterministic fake embeddings: threshold, short-run smoothing (absorbed / dropped / kept at the edge), cached vectors, manual links surviving a new run, and the matching API |
 | `tests/test_vlm.py` | the VLM pass with a fake client: `auto` takes only complex pages, `on` takes every page with a render, the per-document cap, the cache, `math_uncertain` from both signals, and a missing/broken VLM not breaking a good parse |
-| `tests/test_cards.py` | context assembly and its budget, inputs-hash cache and invalidation, force + hand-edited cards kept, dedup, unverified LaTeX rejected, bad cloze rejected, slide number outside the context dropped, the card cap, garbage saved as nothing, the per-run ledger, the local estimate (images counted), and the cards API |
+| `tests/test_cards.py` | context assembly and its budget, inputs-hash cache and invalidation, force + hand-edited cards kept, dedup, unverified LaTeX rejected, bad cloze rejected, slide number outside the context dropped, the card cap and the two-cards-per-slide-page cap, garbage saved as nothing, the per-run ledger, the local estimate (images counted), and the cards API |
 | `tests/test_decks.py` | `.apkg` read back as SQLite: stable GUIDs from `uid`, suspended cards out, `(slide N)` on the back, the tags, the `.tsv` shape matching `decks/`, and the download endpoints |
 | `tests/test_tools_demo.py` | the synthetic dataset behind `tools/shots.py`, so a broken fixture is a test failure instead of a Playwright traceback |
 

@@ -15,8 +15,6 @@ from trascrivi.corrections import (
     apply_terms,
     build_plan,
     chunk_text_with_map,
-    dedupe_proposals,
-    diff_preview,
     locate_in_spans,
     normalize_for_match,
 )
@@ -385,27 +383,6 @@ def test_chunk_text_with_map_and_locate_in_spans():
     # match a metà parola e find vuoto non sono accettati
     assert locate_in_spans(joined, spans, "torc") is None
     assert locate_in_spans(joined, spans, "") is None
-
-
-def test_dedupe_proposals():
-    items = [
-        {"find": "pie torch", "replace": "PyTorch"},
-        {"find": "pie  torch", "replace": "PyTorch"},   # stessa chiave normalizzata
-        {"find": "", "replace": "senza find"},
-        {"find": "lecture", "replace": "lesson"},
-    ]
-
-    out = dedupe_proposals(items)
-
-    assert [it["find"] for it in out] == ["pie torch", "lecture"]
-    assert dedupe_proposals([]) == []
-
-
-def test_diff_preview_marks_removed_and_added_lines():
-    diff = diff_preview("a\nb\nc", "a\nB\nc")
-
-    assert diff == [{"kind": "-", "text": "b"}, {"kind": "+", "text": "B"}]
-    assert diff_preview("uguale", "uguale") == []
 
 
 def test_apply_plan_on_empty_plan():

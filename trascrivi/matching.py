@@ -10,8 +10,8 @@ pagina: su un corso di dieci lezioni una singola pagina di formule è vicina a
 molte lezioni, e una proposta sbagliata sporca il contesto di una carta per
 sempre. Quindi:
 
-* soglia alta (`match_threshold`), perché meglio nessuna assegnazione che una
-  sbagliata;
+* soglia alta (`match_threshold`) e margine (`match_margin`) sulla seconda
+  lezione, perché meglio nessuna assegnazione che una sbagliata;
 * **smoothing dei run corti**: una pagina isolata che finisce in mezzo a un
   blocco di un'altra lezione è quasi sempre rumore — viene riassorbita dal
   vicino, o scartata quando i due vicini litigano;
@@ -26,9 +26,11 @@ si mescolano.
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import logging
 import math
+import re
 
 from . import db, llm
 
@@ -37,9 +39,10 @@ log = logging.getLogger("trascrivi.matching")
 # Sotto questa lunghezza il testo di una pagina non dice niente (una slide di
 # soli titoli): il vettore sarebbe dominato dal rumore.
 MIN_PAGE_CHARS = 40
-# Il riassunto può essere lungo: la parte utile per riconoscere l'argomento è
-# l'inizio (titolo + overview). Il resto sono dettagli che diluiscono.
-SUMMARY_CHARS = 1200
+# 1200 caratteri erano solo il titolo e l'apertura, spesso il riepilogo della
+# lezione precedente: il vettore descriveva quella, non la lezione. 4000
+# caratteri bastano a includere i temi principali senza diluire il confronto.
+SUMMARY_CHARS = 4000
 # Un run più corto di così viene riassorbito dal vicino (o scartato).
 MIN_RUN = 3
 
@@ -152,9 +155,15 @@ def ensure_summary_vectors(project_id: int, model: str, provider: dict | None = 
 
 
 def score_pages(doc_id: int, summaries: dict[int, list[float]], model: str,
-                threshold: float = 0.55) -> list[tuple[int | None, float]]:
+                threshold: float = 0.60,
+                margin: float = 0.0) -> list[tuple[int | None, float]]:
     """
-    Per ogni pagina: la lezione più simile e il suo score (o `None` sotto soglia).
+    Per ogni pagina: la lezione più simile e il suo score.
+
+    `None` sotto soglia o quando la seconda lezione è troppo vicina: una pagina
+    a metà fra due lezioni è ambigua, e un link sbagliato costa più di nessun
+    link. Lo score resta quello vero anche quando l'id è `None`, così lo
+    smoothing sa distinguere un buco "vuoto" da uno lasciato aperto apposta.
     """
     pages = db.list_slide_pages(doc_id)
     vectors = db.load_vectors(page_kind(doc_id), model)
@@ -164,12 +173,17 @@ def score_pages(doc_id: int, summaries: dict[int, list[float]], model: str,
         if not vec or not summaries:
             out.append((None, 0.0))
             continue
-        best_id, best_score = None, 0.0
+        best_id, best_score, second_score = None, 0.0, 0.0
         for transcript_id, summary_vec in summaries.items():
             score = _dot(vec, summary_vec)
             if score > best_score:
+                second_score = best_score
                 best_id, best_score = transcript_id, score
+            elif score > second_score:
+                second_score = score
         if best_score < threshold:
+            best_id = None
+        elif margin > 0 and best_score - second_score < margin:
             best_id = None
         out.append((best_id, round(best_score, 4)))
     return out
@@ -178,11 +192,23 @@ def score_pages(doc_id: int, summaries: dict[int, list[float]], model: str,
 def _settings_threshold() -> float:
     from . import config
 
-    return float(config.load_settings().match_threshold or 0.55)
+    return float(config.load_settings().match_threshold or 0.60)
 
 
-def smooth(assignments: list[tuple[int | None, float]], min_run: int = MIN_RUN
-           ) -> list[tuple[int | None, float]]:
+def _nearest_assigned(assignments: list[tuple[int | None, float]],
+                      start: int, step: int) -> int | None:
+    """Il primo id assegnato verso sinistra/destra, saltando i buchi."""
+    index = start
+    while 0 <= index < len(assignments):
+        transcript_id = assignments[index][0]
+        if transcript_id is not None:
+            return transcript_id
+        index += step
+    return None
+
+
+def smooth(assignments: list[tuple[int | None, float]], min_run: int = MIN_RUN,
+           *, fill_none_below: float | None = None) -> list[tuple[int | None, float]]:
     """
     Riassorbe i run corti.
 
@@ -198,46 +224,51 @@ def smooth(assignments: list[tuple[int | None, float]], min_run: int = MIN_RUN
       vicini litigano: meglio niente che una scelta a caso);
     * run corto **assegnato** al bordo (l'inizio di un deck) -> resta com'è: un
       blocco di due pagine all'inizio è l'inizio di una lezione, non rumore.
+
+    I vicini si cercano nelle assegnazioni **originali**, non in quelle già
+    modificate: un run scartato non deve trasformare il suo vicino in un buco e
+    tenerlo in vita. Con `fill_none_below` un buco con uno score alto (una
+    pagina ambigua lasciata fuori dal margine) non viene riempito.
     """
     current = list(assignments)
-    for _ in range(200):
-        runs = _runs(current)
-        changed = False
-        for index, (start, end, transcript_id, score) in enumerate(runs):
-            if end - start + 1 >= min_run:
-                continue
-            has_left, has_right = index > 0, index + 1 < len(runs)
-            left = runs[index - 1][2] if has_left else None
-            right = runs[index + 1][2] if has_right else None
-            length = end - start + 1
+    for start, end, transcript_id, score in _runs(assignments):
+        if end - start + 1 >= min_run:
+            continue
+        left = _nearest_assigned(assignments, start - 1, -1)
+        right = _nearest_assigned(assignments, end + 1, 1)
+        run_scores = [s for _tid, s in assignments[start:end + 1]]
+        ambiguous = (fill_none_below is not None
+                     and max(run_scores or [0.0]) >= fill_none_below)
 
-            if left is not None and left == right:
-                # Buco o pagina isolata dentro un blocco: è di quel blocco,
-                # anche se la pagina non somigliava a niente (una slide di soli
-                # titoli in mezzo a una lezione è di quella lezione).
+        if transcript_id is None:
+            # Un buco si chiude solo se sembra vuoto, non se il matching l'ha
+            # lasciato aperto perché due lezioni erano troppo vicine.
+            if left is not None and left == right and not ambiguous:
                 target = left
-            elif transcript_id is None and not (has_left and has_right):
-                # Buco al bordo del documento: si chiude solo se la pagina
-                # somigliava a qualcosa. Una pagina che non somiglia a nessuna
-                # lezione resta senza assegnazione (meglio niente che sbagliata).
-                neighbour = left if left is not None else right
-                target = neighbour if (score > 0 and neighbour is not None) else None
-            elif transcript_id is not None and left is not None and right is not None:
-                # Conteso fra due lezioni diverse: i vicini litigano.
-                target = None
+            elif (left is None) != (right is None) and score > 0 and not ambiguous:
+                target = left if left is not None else right
             else:
-                # Blocco corto al bordo (l'inizio di un deck) o in mezzo a un
-                # buco: non è rumore, resta com'è.
-                target = transcript_id
-            if target == transcript_id:
-                continue
-            for i in range(start, end + 1):
-                current[i] = (target, score)
-            changed = True
-            break  # i run sono cambiati: si ricalcolano
-        if not changed:
-            break
+                target = None
+        elif _immediate(assignments, start - 1) is not None and _immediate(assignments, end + 1) is not None:
+            # Dentro un blocco -> assorbe; conteso fra due lezioni -> niente.
+            # Per un run ASSEGNATO contano i vicini diretti: cercarli oltre un buco
+            # rietichettava un blocco B isolato come A (A, buco, B, buco, A).
+            near_left, near_right = _immediate(assignments, start - 1), _immediate(assignments, end + 1)
+            target = near_left if near_left == near_right else None
+        else:
+            # Blocco corto al bordo (o in mezzo a un buco): non è rumore.
+            target = transcript_id
+
+        if target == transcript_id:
+            continue
+        for index in range(start, end + 1):
+            current[index] = (target, score)
     return current
+
+
+def _immediate(assignments: list[tuple[int | None, float]], index: int) -> int | None:
+    """L'assegnazione della pagina adiacente (None fuori dal documento o in un buco)."""
+    return assignments[index][0] if 0 <= index < len(assignments) else None
 
 
 def _runs(assignments: list[tuple[int | None, float]]) -> list[tuple[int, int, int | None, float]]:
@@ -281,20 +312,22 @@ def match_project(project_id: int, on_progress=None) -> dict:
     if provider is None:
         raise ValueError("Ollama is not configured: slide matching needs local embeddings")
 
-    docs = db.list_slide_docs(project_id)
+    # Gli esami degli anni passati non si assegnano alle lezioni.
+    docs = [d for d in db.list_slide_docs(project_id) if (d.get("kind") or "slides") == "slides"]
     ensure_summary_vectors(project_id, model, provider)
     summaries = db.load_vectors("summary", model)
     # Solo le lezioni di questo corso possono essere proposte: il vettore di un
     # altro corso risponderebbe su una pagina che non gli appartiene.
     course_ids = {int(t["id"]) for t in db.list_transcripts(project_id)}
     summaries = {k: v for k, v in summaries.items() if k in course_ids}
-    threshold = float(settings.match_threshold or 0.55)
+    threshold = float(settings.match_threshold or 0.60)
+    margin = max(0.0, float(getattr(settings, "match_margin", 0.02) or 0.0))
 
     total_links = 0
     for index, doc in enumerate(docs, start=1):
         ensure_page_vectors(int(doc["id"]), model, provider)
-        assignments = score_pages(int(doc["id"]), summaries, model, threshold)
-        assignments = smooth(assignments)
+        assignments = score_pages(int(doc["id"]), summaries, model, threshold, margin)
+        assignments = smooth(assignments, fill_none_below=threshold)
         page_numbers = [int(p["page_no"]) for p in db.list_slide_pages(int(doc["id"]))]
         ranges = to_ranges(assignments, page_numbers)
         db.replace_auto_links(int(doc["id"]), ranges)
@@ -305,3 +338,108 @@ def match_project(project_id: int, on_progress=None) -> dict:
              project_id, total_links, len(docs))
     return {"project_id": project_id, "docs": len(docs), "links": total_links,
             "model": model}
+
+
+# ── Recupero lessicale (TF-IDF, nessun modello) ──────────────────────────────
+# Gli embeddings chiedono Ollama acceso, e nel DB reale il matching falliva 25
+# volte su 56 per questo. Per scegliere le pagine da dare come contesto al
+# riassunto basta il lessico: slide e lezione condividono i termini tecnici rari
+# ("tiling", "roofline", "Abernathy-Utterback"). Misurato sui corsi reali: la
+# lezione su tiling/parallelismo pesca le pagine 89-148 del deck giusto.
+_WORD_RE = re.compile(r"[a-zà-ÿ0-9]{3,}")
+
+
+def tokens(text: str) -> list[str]:
+    return _WORD_RE.findall((text or "").lower())
+
+
+def _tfidf(counts: collections.Counter, idf: dict[str, float]) -> dict[str, float]:
+    vec = {w: (1 + math.log(n)) * idf[w] for w, n in counts.items() if idf.get(w, 0) > 0}
+    norm = math.sqrt(sum(x * x for x in vec.values())) or 1.0
+    return {w: x / norm for w, x in vec.items()}
+
+
+def rank_lexical(query: str, docs: list[dict], key: str = "text") -> list[tuple[float, dict]]:
+    """Ordina `docs` per similarità TF-IDF (coseno) con `query`. Puro Python."""
+    if not docs or not (query or "").strip():
+        return []
+    doc_tokens = [collections.Counter(tokens(d.get(key) or "")) for d in docs]
+    df: collections.Counter = collections.Counter()
+    for counts in doc_tokens:
+        df.update(counts.keys())
+    # IDF smussato (come sklearn): resta positivo anche con uno o due documenti.
+    idf = {w: math.log((1 + len(docs)) / (1 + n)) + 1 for w, n in df.items()}
+    qv = _tfidf(collections.Counter(tokens(query)), idf)
+    scored = []
+    for doc, counts in zip(docs, doc_tokens):
+        dv = _tfidf(counts, idf)
+        scored.append((sum(qv.get(w, 0.0) * x for w, x in dv.items()), doc))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored
+
+
+def lexical_pages(project_id: int, text: str, *, limit: int = 12,
+                  min_score: float = 0.08, kind: str = "slides") -> list[dict]:
+    """Le pagine di slide del corso più vicine a `text`, con lo score."""
+    pages = [dict(p) for p in db.rows(
+        """SELECT d.id AS doc_id, d.name AS doc_name, p.page_no, p.text, p.vlm_md
+           FROM slide_pages p JOIN slide_docs d ON d.id = p.doc_id
+           WHERE d.project_id = ? AND d.status = 'ready'
+             AND COALESCE(d.kind, 'slides') = ?""", (int(project_id), kind))]
+    for page in pages:
+        page["text"] = page_text(page)
+    out = []
+    ranked = rank_lexical(text, [p for p in pages if len(p["text"]) >= MIN_PAGE_CHARS])
+    # Taglio relativo: sui corsi reali le pagine giuste stanno vicine alla
+    # migliore, la coda (pagine di altre lezioni) scende piano e senza salto.
+    floor = max(min_score, ranked[0][0] * 0.75) if ranked else min_score
+    for score, page in ranked:
+        if score < floor or len(out) >= limit:
+            break
+        out.append({**page, "score": round(score, 3)})
+    return out
+
+
+# ── Vocabolario del corso per Whisper ────────────────────────────────────────
+# Whisper accetta un `initial_prompt`: nomi e sigle lì dentro vengono
+# riconosciuti molto meglio ("Abernathy-Utterback", "GEMM", "ONNX"). Il campo
+# esisteva ma andava compilato a mano; qui lo si ricava dalle slide del corso.
+# Tenuto corto apposta: un prompt lungo può far ripetere o inventare a Whisper.
+_TERM_RE = re.compile(r"\b(?:[A-Z]{2,}[A-Za-z0-9]*|[A-Z][a-z]+(?:-[A-Z][a-z]+)+|[A-Z][a-z]{2,}[A-Z][A-Za-z]*)\b")
+VOCAB_TERMS = 30
+
+
+def course_vocabulary(project_id: int, limit: int = VOCAB_TERMS) -> str:
+    """
+    I termini tecnici più ricorrenti nelle slide del corso: sigle (GEMM, KV),
+    nomi composti (Abernathy-Utterback), CamelCase (PyTorch). Contati per
+    numero di pagine in cui compaiono, così una sigla ripetuta su una sola
+    slide non vince. Più i termini del glossario del corso.
+    """
+    pages = db.rows(
+        """SELECT p.text FROM slide_pages p JOIN slide_docs d ON d.id = p.doc_id
+           WHERE d.project_id = ? AND COALESCE(d.kind, 'slides') = 'slides'""",
+        (int(project_id),))
+    df: collections.Counter = collections.Counter()
+    lower: collections.Counter = collections.Counter()
+    for page in pages:
+        text = page["text"] or ""
+        df.update(set(_TERM_RE.findall(text)))
+        lower.update(set(_WORD_RE.findall(text)))   # solo minuscole: le maiuscole non matchano
+    # Un titolo in maiuscolo ("WHAT", "THE") è una parola comune: la si riconosce
+    # perché compare anche in minuscolo. I numeri romani (II, IV) non sono termini.
+    roman = re.compile(r"^[IVXL]+$")
+    terms = [w for w, n in df.most_common()
+             if n >= 2 and len(w) <= 30 and not roman.match(w)
+             and not (w.isupper() and lower[w.lower()] >= 1)][:limit]
+    # Solo le correzioni vere (auto): le altre voci sono note, a volte definizioni
+    # intere ("Meta -> technology company involved in…"), e nel prompt di Whisper
+    # farebbero più danni che altro.
+    glossary = [t["replace"] for t in db.list_terms(int(project_id))
+                if t.get("auto") and (t.get("replace") or "").strip()]
+    seen, out = set(), []
+    for term in glossary + terms:
+        if term.lower() not in seen:
+            seen.add(term.lower())
+            out.append(term)
+    return ", ".join(out[:limit + 10])

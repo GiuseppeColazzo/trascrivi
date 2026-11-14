@@ -300,7 +300,7 @@ def test_an_uploaded_image_is_ocr_ed(tmp_path, monkeypatch):
 
 
 def test_an_unknown_format_is_rejected_with_the_allowed_list(tmp_path):
-    path = tmp_path / "note.txt"
+    path = tmp_path / "note.xyz"
     path.write_text("niente")
     with pytest.raises(ValueError, match="Unsupported slide format"):
         slideparser.parse(path, tmp_path / "doc")

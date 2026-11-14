@@ -95,7 +95,7 @@
       }
 
       const bullet = /^(\s*)[-*+]\s+(.*)$/.exec(line);
-      const numbered = /^(\s*)\d+[.)]\s+(.*)$/.exec(line);
+      const numbered = /^(\s*)(\d+)[.)]\s+(.*)$/.exec(line);
       if (bullet || numbered) {
         flushPara();
         const tag = bullet ? "ul" : "ol";
@@ -103,14 +103,17 @@
         if (listTag !== tag) {
           closeList();
           listTag = tag;
-          out.push(`<${tag} class="md-list">`);
+          // Una lista numerata interrotta da punti annidati riparte dal suo
+          // numero, non da 1 (le domande della guida: 1, punti, 2, punti…).
+          const start = numbered && Number(numbered[2]) > 1 ? ` start="${Number(numbered[2])}"` : "";
+          out.push(`<${tag} class="md-list"${start}>`);
         }
         // L'annidamento si rende con un rientro, non con una lista dentro una
         // lista: `<ul>` figlio diretto di `<ul>` è HTML non valido e i browser lo
         // riparano a modo loro. Il rientro dà lo stesso risultato e non sorprende.
         const depth = Math.min(3, Math.floor(indent / 2));
         const style = depth ? ` style="margin-left:${depth * 18}px"` : "";
-        out.push(`<li${style}>${inlineMd((bullet || numbered)[2])}</li>`);
+        out.push(`<li${style}>${inlineMd(bullet ? bullet[2] : numbered[3])}</li>`);
         continue;
       }
 

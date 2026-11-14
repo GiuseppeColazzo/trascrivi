@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
-<meta name="description" content="Trascrivi — local lecture transcription registry: courses, transcripts and agent-reviewed corrections. Audio never leaves this machine.">
+<meta name="description" content="Trascrivi — local lecture transcription registry: courses, transcripts and study notes. Audio never leaves this machine.">
 <meta name="theme-color" content="#0a0b0d" id="metaThemeColor">
 <meta name="author" content="Trascrivi">
 <meta name="robots" content="noindex, nofollow">
@@ -14,11 +14,11 @@
      titolo e la descrizione compaiono in ogni anteprima di link (chat, note). -->
 <meta property="og:type" content="website">
 <meta property="og:title" content="Trascrivi — lecture registry">
-<meta property="og:description" content="Courses, transcripts and reviewed corrections. Local only: no telemetry, the audio never leaves this machine.">
+<meta property="og:description" content="Courses, transcripts and study notes. Local only: no telemetry, the audio never leaves this machine.">
 <meta property="og:locale" content="en">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="Trascrivi — lecture registry">
-<meta name="twitter:description" content="Courses, transcripts and reviewed corrections. Local only.">
+<meta name="twitter:description" content="Courses, transcripts and study notes. Local only.">
 
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230a0b0d'/%3E%3Crect x='9' y='9' width='14' height='14' fill='none' stroke='%23ff4a17' stroke-width='2'/%3E%3Cpath d='M16 3.5v5.5M16 23v5.5M3.5 16H9M23 16h5.5' stroke='%23ece9e3' stroke-width='1.4'/%3E%3C/svg%3E">
 <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230a0b0d'/%3E%3Crect x='9' y='9' width='14' height='14' fill='none' stroke='%23ff4a17' stroke-width='2'/%3E%3C/svg%3E">
@@ -35,30 +35,34 @@
 </head>
 <body>
 
-<a class="skip-link" href="#view">Skip to content</a>
+<a class="skip-link" href="#view" data-i18n="shell.skip">Skip to content</a>
 
 <header class="app">
   <a class="brand" href="#/">
     <span class="mark" aria-hidden="true"></span>
     <span class="wordmark">Trascrivi</span>
-    <span class="brand-kicker">Lecture registry</span>
+    <span class="brand-kicker" data-i18n="shell.kicker">Lecture registry</span>
   </a>
 
   <nav aria-label="Primary">
-    <button type="button" class="nav-item" data-nav="#/">Library</button>
-    <button type="button" class="nav-item" data-nav="#/jobs">Jobs<span id="navJobs" class="badge accent hidden">0</span></button>
-    <button type="button" class="nav-item" data-nav="#/costs">Costs</button>
-    <button type="button" class="nav-item" data-nav="#/settings">Settings</button>
+    <button type="button" class="nav-item" data-nav="#/"><span data-i18n="nav.library">Library</span></button>
+    <button type="button" class="nav-item" data-nav="#/jobs"><span data-i18n="nav.jobs">Jobs</span><span id="navJobs" class="badge accent hidden">0</span></button>
+    <button type="button" class="nav-item" data-nav="#/costs"><span data-i18n="nav.costs">Costs</span></button>
+    <button type="button" class="nav-item" data-nav="#/settings"><span data-i18n="nav.settings">Settings</span></button>
   </nav>
 
   <div class="search">
-    <label class="sr-only" for="globalSearch">Search all transcripts</label>
+    <label class="sr-only" for="globalSearch" data-i18n="search.label">Search all transcripts</label>
     <svg class="search-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
       <circle cx="7" cy="7" r="4.4"></circle><path d="M10.4 10.4 14 14" stroke-linecap="round"></path>
     </svg>
-    <input id="globalSearch" type="search" placeholder="Search transcripts…" autocomplete="off" spellcheck="false">
+    <input id="globalSearch" type="search" placeholder="Search transcripts…" data-i18n-attr="placeholder:search.placeholder" autocomplete="off" spellcheck="false">
     <kbd class="search-kbd" aria-hidden="true">/</kbd>
   </div>
+
+  <!-- Lingua dell'interfaccia: inglese di default, italiano (web/i18n/*.json). -->
+  <label class="sr-only" for="langSelect" data-i18n="shell.language">Language</label>
+  <select id="langSelect" class="lang-select"><option value="en">EN</option><option value="it">IT</option></select>
 
   <!-- Tema: tre scelte (sistema, chiaro, scuro) in una lista, non un
        interruttore sole/luna che ignora la preferenza di sistema. -->
@@ -73,17 +77,17 @@
     <div class="theme-list" id="themeList" role="menu" aria-label="Colour theme" hidden>
       <button type="button" class="theme-option" role="menuitem" data-theme-choice="auto">
         <span class="theme-ico" data-ico="auto" aria-hidden="true"></span>
-        <span>System</span>
+        <span data-i18n="theme.system">System</span>
         <span class="theme-hint" data-hint="auto"></span>
       </button>
       <button type="button" class="theme-option" role="menuitem" data-theme-choice="light">
         <span class="theme-ico" data-ico="light" aria-hidden="true"></span>
-        <span>Light</span>
+        <span data-i18n="theme.light">Light</span>
         <span class="theme-hint" data-hint="light"></span>
       </button>
       <button type="button" class="theme-option" role="menuitem" data-theme-choice="dark">
         <span class="theme-ico" data-ico="dark" aria-hidden="true"></span>
-        <span>Dark</span>
+        <span data-i18n="theme.dark">Dark</span>
         <span class="theme-hint" data-hint="dark"></span>
       </button>
     </div>
@@ -104,14 +108,16 @@
 
 <footer class="app-foot">
   <span class="foot-mark" aria-hidden="true"></span>
-  <span>Local instance</span>
+  <span data-i18n="foot.local">Local instance</span>
   <span class="foot-sep" aria-hidden="true">/</span>
-  <span>No telemetry</span>
+  <span data-i18n="foot.telemetry">No telemetry</span>
   <span class="foot-sep" aria-hidden="true">/</span>
-  <span>Audio never leaves this machine</span>
+  <span data-i18n="foot.audio">Audio never leaves this machine</span>
   <span class="foot-spacer"></span>
   <nav aria-label="Footer">
-    <a href="#/about">About &amp; privacy</a>
+    <a href="#" id="whatsNew" data-i18n="foot.whats_new">What's new</a>
+    <span class="foot-sep" aria-hidden="true">/</span>
+    <a href="#/about" data-i18n="foot.about">About &amp; privacy</a>
   </nav>
 </footer>
 
@@ -119,11 +125,11 @@
 
 <dialog id="confirmDialog">
   <form method="dialog">
-    <h2 id="confirmTitle">Confirm</h2>
+    <h2 id="confirmTitle" data-i18n="dialog.confirm">Confirm</h2>
     <p id="confirmText"></p>
     <div class="split">
-      <button value="cancel">Cancel</button>
-      <button id="confirmOk" class="danger" value="ok">Delete</button>
+      <button value="cancel" data-i18n="common.cancel">Cancel</button>
+      <button id="confirmOk" class="danger" value="ok" data-i18n="common.delete">Delete</button>
     </div>
   </form>
 </dialog>
@@ -132,19 +138,20 @@
      fa, invece del prompt() di sistema, che non ha stile né contesto. -->
 <dialog id="promptDialog">
   <form method="dialog">
-    <h2 id="promptTitle">Rename</h2>
+    <h2 id="promptTitle" data-i18n="common.rename">Rename</h2>
     <div class="field">
-      <label for="promptInput" id="promptLabel">Name</label>
+      <label for="promptInput" id="promptLabel" data-i18n="common.name">Name</label>
       <input id="promptInput" type="text" autocomplete="off" spellcheck="false">
     </div>
     <p id="promptError" class="field-error hidden"></p>
     <div class="split">
-      <button value="cancel" type="submit">Cancel</button>
-      <button id="promptOk" class="primary" value="ok" type="submit">Save</button>
+      <button value="cancel" type="submit" data-i18n="common.cancel">Cancel</button>
+      <button id="promptOk" class="primary" value="ok" type="submit" data-i18n="common.save">Save</button>
     </div>
   </form>
 </dialog>
 
+<script src="/i18n.js"></script>
 <script src="/markdown.js"></script>
 <script src="/app.js" type="module"></script>
 <script>

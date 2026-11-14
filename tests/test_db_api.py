@@ -126,42 +126,6 @@ def test_search_transcripts_filters_by_project(project):
     assert [h["project_id"] for h in filtered] == [project]
 
 
-def test_proposals_lifecycle(make_transcript):
-    tid = make_transcript()
-
-    assert db.create_proposals(tid, None, [
-        {"find": "pie torch", "replace": "PyTorch", "kind": "term", "confidence": 0.9}
-    ]) == 1
-    assert db.create_proposals(tid, None, []) == 0
-
-    props = db.list_proposals(tid)
-    assert len(props) == 1
-    assert props[0]["status"] == "pending"
-    assert props[0]["flag"] == "ok"
-    assert props[0]["confidence"] == 0.9
-    assert db.list_proposals(tid, "accepted") == []
-
-    prop_id = props[0]["id"]
-    assert [p["id"] for p in db.get_proposals([prop_id])] == [prop_id]
-    assert db.get_proposals([]) == []
-
-    assert db.set_proposal_status([prop_id], "accepted") == 1
-    accepted = db.list_proposals(tid, "accepted")
-    assert accepted[0]["applied_at"] is not None
-    assert db.set_proposal_status([], "rejected") == 0
-
-    assert db.clear_pending_proposals(tid) == 0
-    assert db.create_proposals(tid, None, [{"find": "lecture", "replace": "lesson"}]) == 1
-    assert db.clear_pending_proposals(tid) == 1
-    assert db.list_proposals(tid, "pending") == []
-
-    db.add_revision(tid, "agent_fix", 3, "three replacements")
-    revisions = db.list_revisions(tid)
-    assert revisions[0]["kind"] == "agent_fix"
-    assert revisions[0]["n_changes"] == 3
-    assert revisions[0]["summary"] == "three replacements"
-
-
 def test_upsert_term_updates_instead_of_duplicating(project):
     db.upsert_term(project, "pie torch", "PyTorch")
     db.upsert_term(project, "pie torch", "PyTorch 2", auto=True, note="nota aggiornata")
@@ -258,7 +222,7 @@ def test_health_endpoint(client):
     assert response.status_code == 200
     body = response.json()
     assert body["ok"] is True
-    assert body["version"] == "1.0.0"
+    assert body["version"] == "1.1.0"
     assert isinstance(body["hardware"]["cpu_count"], int)
     assert body["hardware"]["cached_models"] == []          # nessun modello caricato
     assert [p["name"] for p in body["providers"]] == ["ollama", "deepseek", "openrouter"]
@@ -398,7 +362,6 @@ def test_api_transcript_list_and_get(client, make_transcript):
         "Today we talk about PyTorch",
         "Please open your notebooks",
     ]
-    assert body["n_proposals_pending"] == 0
     assert body["revisions"] == []
     assert body["project_name"] == "Analisi 1"
 
@@ -641,90 +604,6 @@ def test_api_search_endpoint(client):
     assert client.get("/api/search").status_code == 422          # q obbligatoria
 
 
-def test_api_proposals_preview_then_accept(client, make_transcript):
-    tid = make_transcript(segments=TWO_SEGMENTS)
-    db.create_proposals(tid, None, [
-        {"find": "pie torch", "replace": "PyTorch", "kind": "term", "confidence": 0.9},
-        {"find": "lecture", "replace": "lesson", "kind": "asr_error"},
-    ])
-    ids = [p["id"] for p in client.get(f"/api/transcripts/{tid}/proposals").json()["proposals"]]
-    assert len(ids) == 2
-
-    preview = client.post(f"/api/transcripts/{tid}/proposals/preview", json={"ids": ids})
-    assert preview.status_code == 200
-    preview_body = preview.json()
-    assert preview_body["applied"] == 2
-    kinds = {d["kind"] for d in preview_body["diff"]}
-    assert "-" in kinds and "+" in kinds
-    # l'anteprima non scrive nulla
-    assert client.get(f"/api/transcripts/{tid}").json()["text"] == segments_to_text(TWO_SEGMENTS)
-
-    accepted = client.post(f"/api/transcripts/{tid}/proposals/accept", json={"ids": ids})
-    assert accepted.status_code == 200
-    body = accepted.json()
-    assert body["applied"] == 2
-    assert body["changed_segments"] == 2
-    assert body["text"] == "we use PyTorch\nthe lesson starts"
-
-    stored = client.get(f"/api/transcripts/{tid}").json()
-    assert [s["text"] for s in stored["segments"]] == ["we use PyTorch", "the lesson starts"]
-    assert stored["text"] == "we use PyTorch\nthe lesson starts"
-    assert stored["revisions"][0]["kind"] == "agent_fix"
-    assert stored["revisions"][0]["n_changes"] == 2
-    assert all(p["status"] == "accepted"
-               for p in client.get(f"/api/transcripts/{tid}/proposals").json()["proposals"])
-
-    assert client.post(f"/api/transcripts/{tid}/proposals/accept",
-                       json={"ids": []}).status_code == 404
-    assert client.post("/api/transcripts/9999/proposals/accept",
-                       json={"ids": ids}).status_code == 404
-
-
-def test_api_proposals_ambiguous_needs_explicit_target(client, make_transcript):
-    tid = make_transcript(segments=[
-        {"start": 0.0, "end": 5.0, "text": "pie torch is fast"},
-        {"start": 5.0, "end": 10.0, "text": "pie torch is also slow"},
-    ])
-    db.create_proposals(tid, None, [{"find": "pie torch", "replace": "PyTorch"}])
-    prop = client.get(f"/api/transcripts/{tid}/proposals").json()["proposals"][0]
-
-    skipped = client.post(f"/api/transcripts/{tid}/proposals/accept",
-                          json={"ids": [prop["id"]]})
-    assert skipped.status_code == 200
-    assert skipped.json()["applied"] == 0
-    assert skipped.json()["skipped"][0]["skip_reason"] == "ambiguous"
-    assert client.get(f"/api/transcripts/{tid}").json()["text"] == (
-        "pie torch is fast\npie torch is also slow"
-    )
-
-    chosen = client.post(f"/api/transcripts/{tid}/proposals/accept",
-                         json={"ids": [prop["id"]], "targets": {str(prop["id"]): 1}})
-    assert chosen.status_code == 200
-    body = chosen.json()
-    assert body["applied"] == 1
-    assert [s["text"] for s in body["segments"]] == ["pie torch is fast",
-                                                     "PyTorch is also slow"]
-
-
-def test_api_proposals_reject_leaves_text_untouched(client, make_transcript):
-    tid = make_transcript(segments=TWO_SEGMENTS)
-    db.create_proposals(tid, None, [{"find": "pie torch", "replace": "PyTorch"}])
-    prop = client.get(f"/api/transcripts/{tid}/proposals").json()["proposals"][0]
-    before = client.get(f"/api/transcripts/{tid}").json()["text"]
-
-    rejected = client.post(f"/api/transcripts/{tid}/proposals/reject", json={"ids": [prop["id"]]})
-
-    assert rejected.status_code == 200
-    assert rejected.json() == {"rejected": 1}
-    assert [p["id"] for p in client.get(f"/api/transcripts/{tid}/proposals",
-                                        params={"status": "rejected"}).json()["proposals"]] == [prop["id"]]
-    assert client.get(f"/api/transcripts/{tid}/proposals",
-                      params={"status": "pending"}).json()["proposals"] == []
-    assert client.get(f"/api/transcripts/{tid}").json()["text"] == before
-    assert client.post("/api/transcripts/9999/proposals/reject",
-                       json={"ids": [prop["id"]]}).status_code == 404
-
-
 def test_api_providers_never_leak_key_material(client):
     response = client.get("/api/providers")
 
@@ -773,11 +652,3 @@ def test_api_providers_report_whether_the_key_is_usable(client):
     assert "api_key_enc" not in client.get("/api/providers").text
 
 
-def test_agent_prompt_endpoint_exposes_the_instructions(client):
-    info = client.get("/api/agent/prompt").json()
-
-    assert "replacements" in info["system_prompt"]
-    assert "glossary" in info["system_prompt"]
-    assert info["temperature"] == 0
-    assert info["max_output_tokens"] >= 4000
-    assert info["chunk_chars"] > 0

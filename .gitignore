@@ -41,3 +41,22 @@ models/
 .smoke/__app_under_test.mjs
 .smoke/bench_summary_results.json
 
+
+# Avanzi di strumenti che scrivono nella cartella corrente quando la temp di
+# sistema non è scrivibile: tempfile (`tmpXXXXXX`, es. i col.db di genanki),
+# pip (`pip-build-tracker-*`, `pip-install-*`, ...).
+/tmp*/
+/pip-*/
+/_research/
+
+# Collaudo GUI (Playwright): copia del DB, screenshot e temp. Si rigenerano.
+.smoke/gui_data/
+.smoke/gui_shots/
+.smoke/pwtmp/
+.smoke/*.png
+
+# Materiale dei corsi: slide reali e mazzi generati da lezioni vere. Servono in
+# locale (tools/vlm_ab.py, .smoke/e2e_slides.py) ma sono contenuti dei docenti,
+# non codice: non vanno su un repository pubblico.
+slide_samples/
+decks/

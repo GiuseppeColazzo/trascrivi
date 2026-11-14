@@ -66,6 +66,13 @@ class Settings:
     delete_sources_after_job: bool = True
     backup_keep: int = 5               # numero di backup da conservare
     # ── Carte e slide (PIANO-slide-e-carte) ──────────────────────────────────
+    # Se l'initial prompt è vuoto, Whisper riceve i termini tecnici delle slide
+    # del corso e del glossario (matching.course_vocabulary).
+    auto_vocabulary: bool = True
+    # Avviso quando la spesa LLM del mese supera questa cifra (0 = nessun avviso).
+    monthly_budget_usd: float = 0.0
+    # Le carte sono opzionali: spente, la UI non mostra tab, colonna né export.
+    cards_enabled: bool = False
     cards_max: int = 12                # carte massime chieste in una generazione
     cards_language: str = ""           # vuoto = lingua del riassunto
     cards_context_chars: int = 12000   # budget di contesto (riassunto + slide)
@@ -77,7 +84,10 @@ class Settings:
     slides_vlm: str = "auto"           # off/auto/on
     slides_vlm_model: str = "gemma3:4b"
     slides_vlm_max: int = 80           # tetto di pagine VLM per documento
-    match_threshold: float = 0.55      # similarità minima pagina -> lezione
+    match_threshold: float = 0.60      # similarità minima pagina -> lezione
+    # La seconda lezione più simile deve restare almeno questo margine indietro:
+    # una pagina a metà fra due lezioni è meglio lasciarla senza link.
+    match_margin: float = 0.02
     embed_model: str = "nomic-embed-text:v1.5"
     extra: dict = field(default_factory=dict)
 

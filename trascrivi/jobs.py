@@ -71,11 +71,13 @@ def resume_start(job: dict) -> float:
     `[mm:ss]` e `[hh:mm:ss]` sono gestiti. Senza timestamp si riparte da zero
     (meglio rifare che lasciare un buco nel mezzo).
     """
-    out = job.get("output_path")
-    if not out:
+    if not job.get("id"):
         return 0.0
     from trascrivi_audio import last_transcribed_seconds
-    path = Path(out)
+    # Il parziale sta sempre in `partial_path(job_id)`. Prima si leggeva
+    # `job["output_path"]`, che nessuno scriveva mai: ogni "Resume" ripartiva
+    # da 0:00 e sovrascriveva il parziale.
+    path = config.partial_path(int(job["id"]))
     if not path.exists():
         return 0.0
     offset = last_transcribed_seconds(path)
@@ -122,6 +124,16 @@ def run_transcribe(job_id: int, payload: dict) -> dict:
         payload.get("device") or "auto",
         payload.get("compute_type") or "auto",
     )
+
+    initial_prompt = payload.get("initial_prompt") or ""
+    if not initial_prompt and config.load_settings().auto_vocabulary:
+        from . import matching
+        try:
+            initial_prompt = matching.course_vocabulary(int(payload["project_id"]))
+        except Exception:  # noqa: BLE001 - il vocabolario aiuta, non deve fermare il job
+            log.warning("vocabolario del corso non disponibile", exc_info=True)
+        if initial_prompt:
+            log.info("job %s: vocabolario del corso per Whisper: %s", job_id, initial_prompt[:200])
 
     out_path = config.partial_path(job_id)
     start_at = resume_start(db.get_job(job_id) or {})
@@ -177,14 +189,25 @@ def run_transcribe(job_id: int, payload: dict) -> dict:
         clip_seconds=payload.get("clip_seconds"),
         resume_from=start_at,
         flush_every=float(payload.get("flush_every") or config.load_settings().flush_every),
-        initial_prompt=payload.get("initial_prompt") or None,
+        initial_prompt=initial_prompt or None,
         audio_duration=float(probed_duration) if probed_duration else None,
         progress_cb=on_progress,
         should_stop=should_stop,
         return_segments=True,
     )
 
+    if _shutdown.is_set():
+        # Il server si sta chiudendo: non è un annullamento dell'utente. Niente
+        # trascrizione troncata; il parziale resta e il job diventa `interrupted`,
+        # così Retry riprende da dove era arrivato.
+        return {"interrupted": True, "transcript_id": None}
     cancelled = stop_flag.is_set()
+    if not segments and not cancelled:
+        # Era il caso della lezione 65: 75 minuti di audio, 0 segmenti, job
+        # "done", riassunto fallito e copia dell'audio cancellata. Un risultato
+        # vuoto è un errore: l'audio resta, e Retry è possibile.
+        raise ValueError("The transcription produced no text (silence, wrong language or "
+                         "unreadable audio). The audio was kept: check the language and retry.")
     if cancelled and segments:
         # Completa quel che c'è: l'utente ha fermato il job, non perso il lavoro.
         log.info("job %s interrotto dall'utente: salvo %d segmenti", job_id, len(segments))
@@ -210,6 +233,18 @@ def run_transcribe(job_id: int, payload: dict) -> dict:
         text, applied_terms = corr.apply_terms(text, terms)
         segments = text_to_segments(text, segments)
 
+    previous = (db.get_job(job_id) or {}).get("transcript_id")
+    if previous and db.get_transcript(int(previous)):
+        # Un job annullato aveva già salvato la parte trascritta: il Retry la
+        # completa invece di creare una seconda lezione.
+        transcript_id = int(previous)
+        db.update_transcript(transcript_id, {"text": text, "segments": segments,
+                                             "duration": float(duration or 0.0)})
+        _cleanup_partial(out_path, keep=cancelled)
+        return {"transcript_id": transcript_id, "cancelled": cancelled,
+                "segments": len(segments), "duration": float(duration or 0.0),
+                "language": detected_lang, "device": cfg.device, "speed": None,
+                "glossary_applied": applied_terms}
     transcript_id = db.create_transcript(
         project_id=project_id,
         title=title,
@@ -238,142 +273,6 @@ def run_transcribe(job_id: int, payload: dict) -> dict:
         "speed": round((float(duration or 0.0) / elapsed), 2) if elapsed > 0 else None,
         "glossary_applied": applied_terms,
     }
-
-
-def run_agent(job_id: int, payload: dict) -> dict:
-    """Interroga il provider LLM e salva le proposte di correzione."""
-    transcript_id = int(payload["transcript_id"])
-    transcript = db.get_transcript(transcript_id)
-    if transcript is None:
-        raise ValueError("Transcript not found")
-
-    provider = db.get_provider(int(payload["provider_id"])) if payload.get("provider_id") else None
-    if provider is None:
-        raise ValueError("LLM provider not configured")
-    settings = config.load_settings()
-    budget = int(payload.get("chunk_chars") or settings.llm_chunk_chars or llm.chunk_budget())
-
-    segments = transcript["segments"] or text_to_segments(transcript["text"])
-    if not segments:
-        raise ValueError("This transcript is empty")
-
-    # Ripartire pulito: le proposte ancora in attesa di una esecuzione
-    # precedente non hanno più senso.
-    removed = db.clear_pending_proposals(transcript_id)
-    if removed:
-        log.info("job %s: rimosse %d proposte pending precedenti", job_id, removed)
-
-    chunks = llm.chunk_segments(segments, budget=budget)
-    stop_flag = threading.Event()
-    with _lock:
-        _stop_flags[job_id] = stop_flag
-
-    raw_proposals: list[dict] = []
-    glossary: list[dict] = []
-    failures: list[str] = []
-    # Il costo delle correzioni non era registrato da nessuna parte: si accumula
-    # qui, chunk per chunk, e `_run_job` lo salva sul job. `miss` è il primo
-    # pezzo del prompt, che è sempre a prezzo pieno.
-    usage = {"prompt": 0, "completion": 0, "hit": 0, "miss": 0}
-    t0 = time.time()
-
-    for i, chunk in enumerate(chunks, start=1):
-        if stop_flag.is_set():
-            break
-        _mapped, spans = corr.chunk_text_with_map(chunk)
-        try:
-            # `ask_chunk` dimezza lo spezzone se la risposta non ci sta dentro:
-            # un chunk grande fa troncare il JSON delle proposte a metà.
-            proposals, chunk_glossary, chunk_diag, origin = llm.ask_chunk(
-                provider, chunk, extra_instruction=payload.get("instruction") or ""
-            )
-            llm.add_usage(usage, chunk_diag)
-            for prop in proposals:
-                # La proposta va cercata nel sub-chunk che l'ha generata: dopo una
-                # divisione gli indici del chunk padre non valgono più.
-                sub = origin.get(id(prop)) or chunk
-                sub_text, sub_spans = corr.chunk_text_with_map(sub)
-                local = corr.locate_in_spans(sub_text, sub_spans,
-                                             corr.normalize_for_match(prop["find"]))
-                if local is None and sub is not chunk:
-                    local = corr.locate_in_spans(
-                        _mapped, spans, corr.normalize_for_match(prop["find"]))
-                prop["segment_index"] = local[0] if local else None
-            raw_proposals.extend(proposals)
-            if chunk_glossary:
-                glossary.extend(chunk_glossary)
-        except llm.ChunkTooLarge as exc:
-            log.warning("job %s: chunk %d/%d non elaborabile: %s", job_id, i, len(chunks), exc)
-            failures.append(str(exc)[:200])
-        except Exception as exc:  # noqa: BLE001 - un chunk rotto non uccide il job
-            log.warning("job %s: chunk %d/%d fallito: %s", job_id, i, len(chunks), exc)
-            failures.append(str(exc)[:200])
-
-        elapsed = max(0.001, time.time() - t0)
-        _set_progress(
-            job_id,
-            progress=round(i / len(chunks), 4),
-            message=f"chunk {i}/{len(chunks)} . {len(raw_proposals)} proposals",
-            speed=round(i / elapsed, 3),
-            eta_seconds=round((len(chunks) - i) * (elapsed / i), 1),
-        )
-
-    if stop_flag.is_set() and not raw_proposals:
-        return {"cancelled": True, "proposals": 0}
-
-    items = corr.dedupe_proposals(raw_proposals)
-    # Il glossario dell'agente diventa un suggerimento per il progetto, senza
-    # sovrascrivere termini esistenti.
-    for entry in glossary[:10]:
-        if entry.get("meaning"):
-            db.upsert_term(transcript["project_id"], entry["term"], entry["meaning"],
-                           auto=False, note=entry["term"])
-    if items:
-        db.create_proposals(
-            transcript_id,
-            job_id,
-            [{**it, "occurrences": _count_occurrences(segments, it["find"]),
-              "flag": _validate_flag(segments, it), "context": _brief_context(it)}
-             for it in items],
-        )
-
-    message = f"{len(items)} proposals from {len(chunks)} chunks"
-    if failures:
-        message += f" . {len(failures)} chunk(s) failed"
-    return {
-        "proposals": len(items),
-        "chunks": len(chunks),
-        "failures": failures,
-        "cancelled": stop_flag.is_set(),
-        "message": message,
-        "usage": usage,
-    }
-
-
-def _brief_context(item: dict) -> str:
-    return f"{item.get('find', '')[:60]} -> {item.get('replace', '')[:60]}"
-
-
-def _count_occurrences(segments: list[dict], find: str) -> int:
-    """Quante volte il `find` compare nella trascrizione (per la UI)."""
-    norm = corr.normalize_for_match(find or "")
-    if not norm:
-        return 0
-    return sum(corr.normalize_for_match(seg.get("text", "")).count(norm) for seg in segments)
-
-
-def _validate_flag(segments: list[dict], item: dict) -> str:
-    """Quante volte il `find` compare: 0 = inutilizzabile, >1 = ambiguo."""
-    if (item.get("find") or "") == (item.get("replace") or "").strip():
-        return "noop"
-    hits = _count_occurrences(segments, item.get("find") or "")
-    if not corr.normalize_for_match(item.get("find") or ""):
-        return "unmatched"
-    if hits == 0:
-        return "unmatched"
-    if hits > 1:
-        return "ambiguous"
-    return "ok"
 
 
 def _cleanup_partial(path: Path, keep: bool = False) -> None:
@@ -421,21 +320,15 @@ def _maybe_queue_agent(job: dict, payload: dict, result: dict) -> None:
     trascrizione: così l'ordine è garantito e il fallimento di un job LLM non
     tocca il lavoro di trascrizione, che è già salvato.
 
-    Due follow-up possibili, indipendenti fra loro:
-    * `run_summary`  -> riassunto della lezione appena trascritta;
-    * `run_agent`    -> correzione degli errori di riconoscimento.
+    L'unico follow-up è `run_summary`: il riassunto della lezione appena
+    trascritta. (L'agente di correzione è stato tolto: la correzione dei nomi
+    riconosciuti male ora la fa il riassunto, con slide e glossario come
+    riferimento.)
     """
     transcript_id = result.get("transcript_id")
     if not transcript_id:
         return
-    wanted_summary = bool(payload.get("run_summary"))
-
-    if payload.get("run_agent"):
-        _queue_llm_job(job, "llm_fix",
-                       {"transcript_id": transcript_id, "provider_id": payload.get("provider_id"),
-                        "instruction": payload.get("instruction") or ""},
-                       transcript_id, "agent")
-    if wanted_summary:
+    if payload.get("run_summary"):
         _queue_llm_job(job, "llm_summary",
                        {"transcript_id": transcript_id,
                         "provider_id": payload.get("summary_provider_id")
@@ -520,6 +413,9 @@ def run_summary(job_id: int, payload: dict) -> dict:
         "target_words": result["target_words"],
         "cost_usd": result["cost_usd"],
         "message": message,
+        # Senza, il job del riassunto restava a costo 0 (la vista costi lo
+        # recuperava dalla tabella summaries, la lista job no).
+        "usage": result.get("usage") or {},
     }
 
 
@@ -556,7 +452,9 @@ def run_parse_slides(job_id: int, payload: dict) -> dict:
         pages, boilerplate = slideparser.parse(path, path.parent,
                                                should_stop=stop_flag.is_set,
                                                on_page=on_page)
-    except slideparser.MissingDependency as exc:
+    except Exception as exc:  # noqa: BLE001 - qualunque errore, non solo le dipendenze
+        # Prima solo MissingDependency segnava l'errore: un PDF rotto lasciava
+        # il documento "parsing" per sempre.
         db.update_slide_doc(doc_id, {"status": "error", "error": str(exc)[:500]})
         raise
 
@@ -582,8 +480,13 @@ def run_parse_slides(job_id: int, payload: dict) -> dict:
 
     # Il matching è un altro giro (embeddings): meglio un job suo, così l'utente
     # vede due passi distinti e può rifare la sola assegnazione.
+    if (doc.get("kind") or "slides") != "slides":
+        # Un esame passato non va assegnato alle lezioni: serve alla guida.
+        return {"doc_id": doc_id, "pages": len(pages), "complex": n_complex,
+                "vlm_pages": vlm_pages, "boilerplate": boilerplate,
+                "cancelled": stop_flag.is_set(), "message": message}
     embed_job = db.create_job("embed_match", {"project_id": doc["project_id"],
-                                              "doc_id": doc_id},
+                                              "doc_id": doc_id, "auto": True},
                               project_id=doc["project_id"])
     enqueue(embed_job)
 
@@ -604,7 +507,15 @@ def run_embed_match(job_id: int, payload: dict) -> dict:
         _set_progress(job_id, progress=round(done / max(1, total), 3),
                       message=f"document {done}/{total}")
 
-    result = matching.match_project(project_id, on_progress=on_progress)
+    try:
+        result = matching.match_project(project_id, on_progress=on_progress)
+    except (RuntimeError, ValueError) as exc:
+        # Accodato in automatico (dopo trascrizione/riassunto/parsing) con Ollama
+        # spento: non è un errore dell'utente. Prima riempiva la coda di job
+        # falliti (25 su 56 nel DB reale). Dal bottone "Associa" invece fallisce.
+        if payload.get("auto") and ("Embeddings" in str(exc) or "Ollama" in str(exc)):
+            return {"links": 0, "message": "skipped: Ollama is not running"}
+        raise
     return {**result, "message": f"{result['links']} page ranges . {result['model']}"}
 
 
@@ -636,6 +547,24 @@ def run_cards(job_id: int, payload: dict) -> dict:
     return result
 
 
+def run_guide(job_id: int, payload: dict) -> dict:
+    """Guida d'esame del corso: tutti i riassunti (+ esami passati) in una chiamata."""
+    from . import guide
+
+    provider = db.get_provider(int(payload["provider_id"])) if payload.get("provider_id") else None
+    if provider is None:
+        raise ValueError("LLM provider not configured")
+
+    def on_progress(fraction: float, message: str) -> None:
+        _set_progress(job_id, progress=round(min(0.95, fraction), 3), message=message)
+
+    result = guide.generate(provider, int(payload["project_id"]), config.load_settings(),
+                            instructions=payload.get("instruction") or "",
+                            on_progress=on_progress)
+    db.execute("UPDATE guides SET job_id = ? WHERE id = ?", (job_id, result["guide_id"]))
+    return result
+
+
 def _queue_matching(project_id: int | None) -> int | None:
     """
     Accoda un `embed_match` per il corso, se serve e se non ce n'è già uno.
@@ -650,12 +579,12 @@ def _queue_matching(project_id: int | None) -> int | None:
     if not project_id:
         return None
     project_id = int(project_id)
-    if not db.list_slide_docs(project_id):
+    if not any((d.get("kind") or "slides") == "slides" for d in db.list_slide_docs(project_id)):
         return None
     if db.row("SELECT id FROM jobs WHERE kind = 'embed_match' AND project_id = ? "
               "AND status IN ('queued', 'running')", (project_id,)):
         return None
-    job_id = db.create_job("embed_match", {"project_id": project_id},
+    job_id = db.create_job("embed_match", {"project_id": project_id, "auto": True},
                            project_id=project_id)
     enqueue(job_id)
     log.info("accodato embed_match %s per il corso %s", job_id, project_id)
@@ -689,8 +618,6 @@ def _run_job(job: dict) -> None:
     try:
         if kind == "transcribe":
             result = run_transcribe(job_id, payload)
-        elif kind == "llm_fix":
-            result = run_agent(job_id, payload)
         elif kind == "llm_summary":
             result = run_summary(job_id, payload)
         elif kind == "parse_slides":
@@ -699,10 +626,16 @@ def _run_job(job: dict) -> None:
             result = run_embed_match(job_id, payload)
         elif kind == "llm_cards":
             result = run_cards(job_id, payload)
+        elif kind == "llm_guide":
+            result = run_guide(job_id, payload)
         else:
             raise ValueError(f"Unknown job kind: {kind}")
 
         cancelled = bool(result.get("cancelled"))
+        if result.get("interrupted"):
+            db.update_job(job_id, status="interrupted", finished_at=db.now(),
+                          message="server stopped: retry to resume", eta_seconds=None)
+            return
         # `progress` è NOT NULL: su un job annullato si conserva l'ultimo valore
         # raggiunto invece di azzerarlo (una barra che torna a 0 sembra un errore).
         current_progress = float((db.get_job(job_id) or {}).get("progress") or 0.0)
@@ -734,7 +667,9 @@ def _run_job(job: dict) -> None:
         log.exception("job %s (%s) fallito", job_id, kind)
         db.update_job(job_id, status="failed", finished_at=db.now(),
                       error=f"{type(exc).__name__}: {exc}"[:500],
-                      message="failed")
+                      message="failed",
+                      # Una chiamata pagata con risultato inutilizzabile costa lo stesso.
+                      **(llm.usage_counts(exc.usage) if getattr(exc, "usage", None) else {}))
     finally:
         with _lock:
             _running.pop(job_id, None)
@@ -753,7 +688,7 @@ def _message_for(kind: str, result: dict) -> str:
         return f"{result.get('links', 0)} page ranges"
     if kind == "llm_cards":
         return f"{result.get('n_new', 0)} cards"
-    return f"{result.get('proposals', 0)} proposals"
+    return "done"
 
 
 def _worker_loop() -> None:
@@ -764,7 +699,8 @@ def _worker_loop() -> None:
             _wake.clear()
             _wake.wait(timeout=2.0)
             continue
-        _run_job(job)
+        if db.claim_job(int(job["id"])):
+            _run_job(job)
     log.info("worker dei job fermato")
 
 
@@ -803,6 +739,9 @@ def enqueue(job_id: int) -> None:
 def recover_stale_jobs() -> int:
     """All'avvio: i job 'running' rimasti da un processo morto diventano interrotti."""
     n = db.mark_interrupted_jobs()
+    # Un documento rimasto "parsing" è morto con il processo: lo si dice.
+    db.execute("UPDATE slide_docs SET status = 'error', error = 'Server stopped while parsing: "
+               "use Reparse' WHERE status = 'parsing'")
     if n:
         log.warning("%d job interrotti recuperati all'avvio", n)
     return n
@@ -834,6 +773,34 @@ def reset_job_for_retry(job_id: int) -> bool:
                   message="requeued", error=None, started_at=None, finished_at=None)
     enqueue(job_id)
     return True
+
+
+def queue_eta() -> float | None:
+    """
+    Secondi stimati per svuotare la coda: l'audio che resta da trascrivere
+    diviso la velocità media delle ultime trascrizioni, più ~40 s per ogni
+    passo LLM (riassunto, guida…) in coda. Una stima, non una promessa.
+    """
+    queued = db.rows("SELECT kind, payload FROM jobs WHERE status = 'queued'")
+    running = db.rows("SELECT kind, eta_seconds FROM jobs WHERE status = 'running'")
+    if not queued and not running:
+        return None
+    speeds = [r["speed"] for r in db.rows(
+        "SELECT speed FROM jobs WHERE kind = 'transcribe' AND status = 'done' AND speed > 0 "
+        "ORDER BY id DESC LIMIT 10")]
+    speed = sum(speeds) / len(speeds) if speeds else 10.0
+    total = sum(float(r["eta_seconds"] or 40) for r in running)
+    for job in queued:
+        if job["kind"] == "transcribe":
+            payload = db.jload(job["payload"], {}) or {}
+            duration = db.scalar("SELECT duration FROM sources WHERE id = ?",
+                                 (payload.get("source_id"),), default=0) or 0
+            total += float(duration) / speed + 20   # + caricamento del modello
+        elif job["kind"] in ("llm_summary", "llm_guide", "llm_cards"):
+            total += 40
+        else:
+            total += 15
+    return round(total)
 
 
 def queue_size() -> int:

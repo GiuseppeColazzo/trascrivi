@@ -119,7 +119,7 @@ def test_the_parser_job_writes_pages_and_schedules_the_matching(monkeypatch, pro
     assert pages[0]["complex"] == 1 and pages[1]["complex"] == 0
     assert result["complex"] == 1
 
-    assert ("embed_match", {"project_id": project, "doc_id": doc_id}) in queued
+    assert ("embed_match", {"project_id": project, "doc_id": doc_id, "auto": True}) in queued
 
 
 def test_a_missing_file_marks_the_document_as_failed(project):

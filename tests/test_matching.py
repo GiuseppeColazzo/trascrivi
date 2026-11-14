@@ -101,6 +101,20 @@ def test_a_page_below_the_threshold_gets_no_lecture(project, course, fake_embedd
     assert [l["page_to"] for l in links] == [3], links
 
 
+def test_a_page_too_close_to_two_lectures_is_not_assigned(project, course, monkeypatch):
+    """Il margine sulla seconda lezione: 1.00 contro 0.99 non è una scelta."""
+    def _embed(provider, texts, model):
+        return [[0.99, 0.141] if "pruning" in text.lower() else [1.0, 0.0]
+                for text in texts]
+
+    monkeypatch.setattr(llm, "embed_texts", _embed)
+    doc_id = _doc(project, ["convolution layers in a deep network, page one"])
+
+    matching.match_project(project)
+
+    assert db.list_slide_links(doc_id=doc_id) == []
+
+
 def test_a_single_page_run_is_absorbed_by_its_neighbours(project, course, fake_embeddings):
     """
     Cinque pagine di convoluzioni con una di pruning in mezzo sono un blocco di
@@ -371,6 +385,40 @@ def test_the_threshold_comes_from_settings(project, course, mock_settings, fake_
     assert db.list_slide_links(doc_id=doc_id)
 
 
+# ── Smoothing: niente cascade, niente buchi ambigui riempiti ─────────────────
+def test_smoothing_does_not_keep_an_isolated_false_positive():
+    """
+    Un run scartato non deve diventare un buco che tiene in vita il vicino:
+    i vicini si guardano nelle assegnazioni originali, non in quelle già mutate.
+    """
+    assignments = [
+        (8, 0.80), (8, 0.80), (9, 0.80), (17, 0.70),
+        (8, 0.80), (16, 0.70), (8, 0.80), (8, 0.80),
+    ]
+
+    out = matching.smooth(assignments, fill_none_below=0.60)
+
+    assert all(transcript_id != 16 for transcript_id, _score in out), out
+    assert all(transcript_id != 17 for transcript_id, _score in out), out
+
+
+def test_smoothing_does_not_fill_an_ambiguous_page_into_a_block():
+    """Un buco con score alto è una pagina ambigua, non una slide vuota."""
+    assignments = [(8, 0.80), (8, 0.80), (None, 0.71), (8, 0.80), (8, 0.80)]
+
+    out = matching.smooth(assignments, fill_none_below=0.60)
+
+    assert out[2][0] is None, out
+
+
+def test_smoothing_fills_a_blank_page_inside_a_block():
+    assignments = [(8, 0.80), (8, 0.80), (None, 0.0), (8, 0.80), (8, 0.80)]
+
+    out = matching.smooth(assignments, fill_none_below=0.60)
+
+    assert out[2][0] == 8, out
+
+
 # ── API ──────────────────────────────────────────────────────────────────────
 def test_the_api_lists_proposals_and_accepts_them(client, project, course,
                                                  fake_embeddings):
@@ -419,3 +467,12 @@ def test_the_match_endpoint_queues_a_job(monkeypatch, client, project):
     res = client.post(f"/api/projects/{project}/slides/match")
     assert res.status_code == 201
     assert res.json()["job"]["kind"] == "embed_match"
+
+
+def test_a_short_block_isolated_by_gaps_keeps_its_lecture():
+    """A, buco, B, buco, A: il blocco B non diventa A (vicini cercati oltre i buchi)."""
+    from trascrivi.matching import smooth
+    a, b = 1, 2
+    pages = [(a, .8)] * 3 + [(None, .1)] * 6 + [(b, .75)] * 2 + [(None, .1)] * 6 + [(a, .8)] * 3
+    out = smooth(pages)
+    assert [tid for tid, _ in out[9:11]] == [b, b]

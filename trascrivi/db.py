@@ -299,6 +299,43 @@ CREATE TABLE IF NOT EXISTS vectors (
   PRIMARY KEY (kind, ref_id, model)
 );
 
+-- Guida d'esame del corso: un documento che sintetizza tutti i riassunti e,
+-- se ci sono, gli esami degli anni passati. Più versioni convivono.
+CREATE TABLE IF NOT EXISTS guides (
+  id          INTEGER PRIMARY KEY,
+  project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  job_id      INTEGER,
+  title       TEXT NOT NULL DEFAULT '',
+  markdown    TEXT NOT NULL DEFAULT '',
+  provider    TEXT NOT NULL DEFAULT '',
+  model       TEXT NOT NULL DEFAULT '',
+  n_lectures  INTEGER NOT NULL DEFAULT 0,
+  n_exam_pages INTEGER NOT NULL DEFAULT 0,
+  labels      TEXT NOT NULL DEFAULT '{}',
+  tokens_in   INTEGER NOT NULL DEFAULT 0,
+  tokens_out  INTEGER NOT NULL DEFAULT 0,
+  cache_hit   INTEGER NOT NULL DEFAULT 0,
+  cost_usd    REAL NOT NULL DEFAULT 0,
+  created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_guides_project ON guides(project_id, id);
+
+-- Domande fatte al corso ("Chiedi al corso"), con risposta e fonti citate.
+CREATE TABLE IF NOT EXISTS questions (
+  id          INTEGER PRIMARY KEY,
+  project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  question    TEXT NOT NULL,
+  answer      TEXT NOT NULL DEFAULT '',
+  sources     TEXT NOT NULL DEFAULT '[]',
+  model       TEXT NOT NULL DEFAULT '',
+  tokens_in   INTEGER NOT NULL DEFAULT 0,
+  tokens_out  INTEGER NOT NULL DEFAULT 0,
+  cache_hit   INTEGER NOT NULL DEFAULT 0,
+  cost_usd    REAL NOT NULL DEFAULT 0,
+  created_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_questions_project ON questions(project_id, id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
   title, text, content='transcripts', content_rowid='id', tokenize='unicode61'
 );
@@ -388,7 +425,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
                  ("cache_hit", "INTEGER DEFAULT 0"),
                  ("cost_usd", "REAL DEFAULT 0")],
         "proposals": [("segment_index", "INTEGER"), ("context", "TEXT DEFAULT ''")],
-        "transcripts": [("source_ref", "TEXT")],
+        # `study_status`: '' / todo / reviewed / confident — il ripasso dello studente.
+        "transcripts": [("source_ref", "TEXT"), ("study_status", "TEXT NOT NULL DEFAULT ''")],
         "providers": [("fallback_model", "TEXT DEFAULT ''")],
         # `summaries` è nata con una struttura a punti e citazioni, poi sostituita
         # dal documento markdown: `n_words` è arrivata dopo, e `target_words` /
@@ -402,6 +440,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # `vectors` è nata senza l'impronta del testo: aggiunta quando si è
         # visto che un riassunto riscritto lasciava il vettore vecchio.
         "vectors": [("source_sha", "TEXT NOT NULL DEFAULT ''")],
+        # Un documento del corso può essere slide o esame di un anno passato: lo
+        # stesso parser (PDF, scansioni con OCR, immagini, testo), usi diversi.
+        "slide_docs": [("kind", "TEXT NOT NULL DEFAULT 'slides'")],
+        # Le etichette L1, L2… con cui la guida cita le lezioni, fissate al momento
+        # della generazione: cancellare una lezione rinumera le altre.
+        "guides": [("labels", "TEXT NOT NULL DEFAULT '{}'")],
     }
     for table, columns in wanted.items():
         existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -592,11 +636,21 @@ JOB_FIELDS = {"payload", "status", "progress", "audio_seconds", "total_seconds",
 
 def create_job(kind: str, payload: dict, project_id: int | None = None,
                transcript_id: int | None = None) -> int:
-    return execute(
+    job_id = execute(
         "INSERT INTO jobs(kind, project_id, transcript_id, payload, status, created_at) "
         "VALUES (?, ?, ?, ?, 'queued', ?)",
         (kind, project_id, transcript_id, jdump(payload), now()),
     )
+    # SQLite riusa gli id dopo una cancellazione (corso eliminato con i suoi job):
+    # un parziale rimasto con lo stesso id verrebbe "ripreso" da una lezione
+    # diversa, saltandone l'inizio. Un job nuovo parte sempre da zero.
+    stale = config.partial_path(job_id)
+    if stale.exists():
+        try:
+            stale.unlink()
+        except OSError:
+            log.warning("parziale orfano non rimovibile: %s", stale)
+    return job_id
 
 
 def get_job(job_id: int) -> dict | None:
@@ -604,11 +658,27 @@ def get_job(job_id: int) -> dict | None:
 
 
 def list_jobs(statuses: Sequence[str] | None = None, limit: int = 100) -> list[dict]:
+    """
+    I job più recenti, con il payload già decodificato e i nomi da mostrare.
+
+    Il payload arrivava alla UI come stringa JSON: `payload.title` era sempre
+    undefined e ogni job finiva etichettato "transcription"/"correction agent".
+    """
+    where, params = "", [limit]
     if statuses:
-        marks = ",".join("?" for _ in statuses)
-        return rows(f"SELECT * FROM jobs WHERE status IN ({marks}) ORDER BY id DESC LIMIT ?",
-                    (*statuses, limit))
-    return rows("SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,))
+        where = f"WHERE j.status IN ({','.join('?' for _ in statuses)})"
+        params = [*statuses, limit]
+    out = rows(
+        f"""SELECT j.*, COALESCE((SELECT s.title FROM summaries s WHERE s.transcript_id = j.transcript_id AND s.title != '' ORDER BY s.id DESC LIMIT 1), t.title) AS transcript_title, p.name AS project_name
+            FROM jobs j
+            LEFT JOIN transcripts t ON t.id = j.transcript_id
+            LEFT JOIN projects p ON p.id = j.project_id
+            {where} ORDER BY j.id DESC LIMIT ?""",
+        params,
+    )
+    for job in out:
+        job["payload"] = jload(job.get("payload"), {}) or {}
+    return out
 
 
 def update_job(job_id: int, **fields) -> None:
@@ -621,6 +691,16 @@ def update_job(job_id: int, **fields) -> None:
 
 def next_queued_job() -> dict | None:
     return row("SELECT * FROM jobs WHERE status = 'queued' ORDER BY id ASC LIMIT 1")
+
+
+def claim_job(job_id: int) -> bool:
+    """Passa un job da queued a running in modo atomico: un cancel arrivato
+    fra la lettura e l'avvio vince, invece di essere sovrascritto."""
+    with connect() as conn:
+        cur = conn.execute("UPDATE jobs SET status = 'running' WHERE id = ? AND status = 'queued'",
+                           (job_id,))
+        conn.commit()
+        return cur.rowcount == 1
 
 
 # ── Costi delle chiamate LLM ─────────────────────────────────────────────────
@@ -640,7 +720,7 @@ FROM (
            SUM(j.tokens_in + j.tokens_out + j.cache_hit) AS tokens,
            COUNT(*) AS n_jobs
     FROM jobs j
-    WHERE j.kind IN ('llm_summary', 'llm_fix')
+    WHERE j.kind IN ('llm_summary', 'llm_fix', 'llm_cards', 'llm_guide')
       AND j.finished_at IS NOT NULL
     GROUP BY j.project_id, month, j.kind
 
@@ -659,14 +739,28 @@ FROM (
            COUNT(*) AS n_jobs
     FROM summaries s
     JOIN transcripts t ON t.id = s.transcript_id
+    -- Un riassunto è già contato solo se il SUO job ha registrato i token.
+    -- Prima bastava un qualunque job dello stesso mese sulla stessa lezione, e
+    -- rigenerare un riassunto faceva sparire dalla vista il costo del vecchio.
     WHERE NOT EXISTS (
           SELECT 1 FROM jobs j
-          WHERE j.kind = 'llm_summary' AND j.transcript_id = s.transcript_id
+          WHERE j.kind = 'llm_summary'
             AND j.tokens_in + j.tokens_out + j.cache_hit > 0
-            AND strftime('%Y-%m', j.finished_at, 'unixepoch', 'localtime')
-                = strftime('%Y-%m', s.created_at, 'unixepoch', 'localtime')
+            AND j.id = s.job_id
       )
     GROUP BY t.project_id, month
+
+    UNION ALL
+
+    -- "Chiedi al corso" non passa dalla coda: il costo sta sulla domanda.
+    SELECT q.project_id AS project_id,
+           strftime('%Y-%m', q.created_at, 'unixepoch', 'localtime') AS month,
+           'llm_ask' AS kind,
+           SUM(q.cost_usd) AS cost_usd,
+           SUM(q.tokens_in + q.tokens_out) AS tokens,
+           COUNT(*) AS n_jobs
+    FROM questions q
+    GROUP BY q.project_id, month
 )
 GROUP BY project_id, month, kind
 """
@@ -698,7 +792,7 @@ def mark_interrupted_jobs() -> int:
         cur = conn.execute(
             "UPDATE jobs SET status='interrupted', finished_at=?, "
             "message=COALESCE(message, 'Server stopped while this job was running') "
-            "WHERE status IN ('running', 'queued')",
+            "WHERE status = 'running'",
             (now(),),
         )
         conn.commit()
@@ -789,25 +883,66 @@ def list_transcripts(project_id: int | None = None, limit: int = 200) -> list[di
                "WHERE l.transcript_id = transcripts.id) AS n_slide_links, "
                "(SELECT r.status FROM card_runs r WHERE r.transcript_id = transcripts.id "
                "ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS last_card_run, "
-               "created_at, updated_at")
+               "study_status, created_at, updated_at")
     if project_id is None:
         sql = (f"SELECT {columns} FROM transcripts "
                "ORDER BY updated_at DESC LIMIT ?")
         params: Sequence[Any] = (limit,)
     else:
+        # Dentro un corso l'ordine è quello delle lezioni (L1, L2, …).
         sql = (f"SELECT {columns} FROM transcripts "
-               "WHERE project_id = ? ORDER BY updated_at DESC LIMIT ?")
+               "WHERE project_id = ? ORDER BY created_at, id LIMIT ?")
         params = (project_id, limit)
     out = rows(sql, params)
     # `summary_title` è solo il valore di passaggio: la lista è "leggera" e
     # porta quello che serve alla UI, cioè il nome già pronto da mostrare.
+    numbers: dict[int, dict[int, int]] = {}
     for t in out:
         t["display_title"] = _display_title(t.pop("summary_title", None), t["title"])
+        pid = int(t["project_id"])
+        if pid not in numbers:
+            numbers[pid] = lecture_numbers(pid)
+        t["lecture_no"] = numbers[pid].get(int(t["id"]))
+    _flag_low_coverage(out)
     return out
 
 
+def _flag_low_coverage(transcripts: list[dict]) -> None:
+    """
+    `low_coverage`: la lezione ha molto meno testo al minuto delle altre del
+    corso. Nel DB reale la lezione 31 aveva 18k caratteri su 84 minuti contro
+    i ~60k delle altre: Whisper o il filtro dei silenzi avevano saltato dei
+    pezzi, e il riassunto era nato su metà lezione senza che nessuno lo sapesse.
+    Soglia: sotto il 55% della mediana del corso, su lezioni di almeno 10 minuti.
+    """
+    by_course: dict[int, list[float]] = {}
+    for t in transcripts:
+        minutes = (t.get("duration") or 0) / 60
+        t["chars_per_min"] = round((t.get("length") or 0) / minutes) if minutes >= 10 else None
+        if t["chars_per_min"]:
+            by_course.setdefault(int(t["project_id"]), []).append(t["chars_per_min"])
+    for t in transcripts:
+        rates = sorted(by_course.get(int(t["project_id"]), []))
+        median = rates[len(rates) // 2] if len(rates) >= 3 else None
+        t["low_coverage"] = bool(median and t["chars_per_min"] is not None
+                                 and t["chars_per_min"] < 0.55 * median)
+
+
 TRANSCRIPT_FIELDS = {"title", "description", "language", "segments", "text", "project_id",
-                     "source_id", "source_ref", "duration", "model", "device"}
+                     "source_id", "source_ref", "duration", "model", "device", "study_status"}
+STUDY_STATUSES = ("", "todo", "reviewed", "confident")
+
+
+def lecture_numbers(project_id: int) -> dict[int, int]:
+    """
+    Il numero della lezione nel corso (1, 2, …), in ordine di creazione.
+
+    Un'unica numerazione per tabella del corso, "Ask the course" e guida
+    d'esame: le citazioni [L3] puntano alla stessa lezione che la tabella chiama L3.
+    """
+    return {int(r["id"]): i for i, r in enumerate(rows(
+        "SELECT id FROM transcripts WHERE project_id = ? ORDER BY created_at, id",
+        (int(project_id),)), start=1)}
 
 
 def update_transcript(transcript_id: int, fields: dict) -> None:
@@ -817,6 +952,11 @@ def update_transcript(transcript_id: int, fields: dict) -> None:
     if "segments" in clean and not isinstance(clean["segments"], str):
         clean["segments"] = jdump(clean["segments"])
     sets = ", ".join(f"{k} = ?" for k in clean)
+    if set(clean) == {"study_status"}:
+        # Segnare una lezione "ripassata" non la modifica: niente updated_at
+        # (riordinerebbe le liste) e niente reindicizzazione del testo.
+        execute(f"UPDATE transcripts SET {sets} WHERE id = ?", (*clean.values(), transcript_id))
+        return
     execute(f"UPDATE transcripts SET {sets}, updated_at = ? WHERE id = ?",
             (*clean.values(), now(), transcript_id))
 
@@ -855,65 +995,41 @@ def search_transcripts(query: str, project_id: int | None = None, limit: int = 5
         return []
 
 
-# ── Proposte di correzione ───────────────────────────────────────────────────
-def create_proposals(transcript_id: int, job_id: int | None, items: list[dict]) -> int:
-    ts = now()
-    payload = [
-        (transcript_id, job_id, it["find"], it["replace"], it.get("reason", ""),
-         it.get("kind", "other"), it.get("confidence"), it.get("status", "pending"),
-         it.get("flag", "ok"), it.get("occurrences", 0), it.get("context", ""),
-         it.get("segment_index"), ts)
-        for it in items
-    ]
-    if not payload:
-        return 0
-    with connect() as conn:
-        conn.executemany(
-            """INSERT INTO proposals(transcript_id, job_id, find, replace, reason, kind,
-                                     confidence, status, flag, occurrences, context,
-                                     segment_index, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            payload,
-        )
-        conn.commit()
-    return len(payload)
-
-
-def list_proposals(transcript_id: int, status: str | None = None) -> list[dict]:
-    if status:
-        return rows("SELECT * FROM proposals WHERE transcript_id = ? AND status = ? "
-                    "ORDER BY id", (transcript_id, status))
-    return rows("SELECT * FROM proposals WHERE transcript_id = ? ORDER BY id", (transcript_id,))
-
-
-def get_proposals(ids: Sequence[int]) -> list[dict]:
-    if not ids:
+def search_summaries(query: str, project_id: int | None = None, limit: int = 30) -> list[dict]:
+    """I riassunti che contengono il termine (ultima versione per lezione), con un estratto."""
+    q = (query or "").strip()
+    if not q:
         return []
-    marks = ",".join("?" for _ in ids)
-    return rows(f"SELECT * FROM proposals WHERE id IN ({marks}) ORDER BY id", tuple(ids))
+    # LOWER() di SQLite piega solo l'ASCII ("CITTÀ" non trovava "città"): si
+    # leggono le ultime versioni e si confronta in Python.
+    sql = """SELECT s.id, s.transcript_id, s.title, t.project_id, p.name AS project_name, s.markdown
+             FROM summaries s
+             JOIN transcripts t ON t.id = s.transcript_id
+             LEFT JOIN projects p ON p.id = t.project_id
+             WHERE s.id = (SELECT MAX(id) FROM summaries WHERE transcript_id = s.transcript_id)"""
+    params: list[Any] = []
+    if project_id is not None:
+        sql += " AND t.project_id = ?"
+        params.append(project_id)
+    sql += " ORDER BY s.id DESC"
+    needle = q.lower()
+    plain = lambda text: re.sub(r"[*#`>|]+", "", text)  # noqa: E731 - estratto leggibile, non markdown
+    out = []
+    for r in rows(sql, params):
+        md = r.pop("markdown") or ""
+        pos = md.lower().find(needle)
+        if pos < 0:
+            continue
+        start = max(0, pos - 80)
+        r["snippet"] = (("…" if start else "") + plain(md[start:pos]) + "[[" + md[pos:pos + len(q)] + "]]"
+                        + plain(md[pos + len(q):pos + len(q) + 120]) + "…")
+        out.append(r)
+        if len(out) >= limit:
+            break
+    return out
 
 
-def set_proposal_status(ids: Sequence[int], status: str) -> int:
-    if not ids:
-        return 0
-    marks = ",".join("?" for _ in ids)
-    with connect() as conn:
-        cur = conn.execute(
-            f"UPDATE proposals SET status = ?, applied_at = ? WHERE id IN ({marks})",
-            (status, now(), *ids),
-        )
-        conn.commit()
-        return cur.rowcount
-
-
-def clear_pending_proposals(transcript_id: int) -> int:
-    with connect() as conn:
-        cur = conn.execute("DELETE FROM proposals WHERE transcript_id = ? AND status='pending'",
-                           (transcript_id,))
-        conn.commit()
-        return cur.rowcount
-
-
+# ── Revisioni ─────────────────────────────────────────────────────────────
 def add_revision(transcript_id: int, kind: str, n_changes: int, summary: str = "") -> int:
     return execute(
         "INSERT INTO revisions(transcript_id, kind, n_changes, summary, created_at) "
@@ -1119,11 +1235,12 @@ SLIDE_PAGE_FIELDS = {"text", "complex", "vlm_md", "math_uncertain", "n_images",
                      "ocr_chars", "has_text", "render_path", "render_sha"}
 
 
-def create_slide_doc(project_id: int, name: str, ext: str, sha256: str) -> int:
+def create_slide_doc(project_id: int, name: str, ext: str, sha256: str,
+                     kind: str = "slides") -> int:
     return execute(
-        "INSERT INTO slide_docs(project_id, name, ext, sha256, status, created_at) "
-        "VALUES (?, ?, ?, ?, 'parsing', ?)",
-        (project_id, name, ext, sha256, now()),
+        "INSERT INTO slide_docs(project_id, name, ext, sha256, status, created_at, kind) "
+        "VALUES (?, ?, ?, ?, 'parsing', ?, ?)",
+        (project_id, name, ext, sha256, now(), kind),
     )
 
 
@@ -1146,9 +1263,11 @@ def list_slide_docs(project_id: int) -> list[dict]:
     )
 
 
-def find_duplicate_slide(project_id: int, sha256: str) -> dict | None:
-    return row("SELECT * FROM slide_docs WHERE project_id = ? AND sha256 = ?",
-               (project_id, sha256))
+def find_duplicate_slide(project_id: int, sha256: str, kind: str = "slides") -> dict | None:
+    # Lo stesso PDF può essere slide in un caricamento ed esame in un altro: il
+    # duplicato si cerca solo fra documenti dello stesso tipo.
+    return row("SELECT * FROM slide_docs WHERE project_id = ? AND sha256 = ? "
+               "AND COALESCE(kind, 'slides') = ?", (project_id, sha256, kind))
 
 
 def update_slide_doc(doc_id: int, fields: dict) -> None:
@@ -1292,16 +1411,27 @@ def list_slide_links(project_id: int | None = None, doc_id: int | None = None,
 
 
 def linked_pages(transcript_id: int) -> list[dict]:
-    """Le pagine assegnate a una lezione, in ordine: è il contesto delle carte."""
+    """
+    Le pagine assegnate a una lezione, in ordine di priorità per il contesto.
+
+    Prima i link confermati a mano, poi quelli automatici; dentro ogni gruppo
+    vince lo score, non il nome del file. L'ordine alfabetico faceva entrare per
+    prime le pagine di un deck secondario (e a parità di budget il deck giusto
+    restava fuori), quindi qui l'ordine è deliberatamente una classifica.
+    Le pagine di uno stesso intervallo restano in ordine di pagina.
+    """
     return rows(
         """SELECT d.id AS doc_id, d.name AS doc_name, p.page_no, p.text, p.vlm_md,
-                  p.math_uncertain, p.complex, p.render_path, l.score
+                  p.math_uncertain, p.complex, p.render_path,
+                  l.id AS link_id, l.score, l.source AS link_source,
+                  l.page_from, l.page_to
            FROM slide_links l
            JOIN slide_docs d ON d.id = l.doc_id
            JOIN slide_pages p ON p.doc_id = l.doc_id
                              AND p.page_no BETWEEN l.page_from AND l.page_to
            WHERE l.transcript_id = ?
-           ORDER BY d.name, p.page_no""",
+           ORDER BY CASE WHEN l.source = 'manual' THEN 0 ELSE 1 END,
+                    COALESCE(l.score, 0) DESC, d.name, l.page_from, p.page_no""",
         (transcript_id,),
     )
 

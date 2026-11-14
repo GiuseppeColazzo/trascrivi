@@ -7,8 +7,6 @@ from cryptography.fernet import Fernet
 
 from trascrivi import config, llm
 from trascrivi.llm import (
-    _clean_proposals,
-    chunk_segments,
     decrypt_key,
     encrypt_key,
     extract_json,
@@ -63,36 +61,6 @@ def test_extract_content_handles_empty_choices():
     assert diag["finish_reason"] is None
 
 
-def test_empty_model_reply_explains_the_token_limit(monkeypatch):
-    """Il messaggio deve spiegare il taglio al limite di token, non 'JSON rotto'."""
-    class FakeCompletions:
-        def create(self, **kwargs):
-            return _Response([_Choice("", "length", {})], _Usage())
-
-    fake_client = type("FakeClient", (), {
-        "chat": type("Chat", (), {"completions": FakeCompletions()})(),
-    })()
-    monkeypatch.setattr(llm, "_client", lambda provider: fake_client)
-
-    with pytest.raises(ValueError) as excinfo:
-        llm.ask_for_replacements({"name": "deepseek", "model": "deepseek-flash"}, "text")
-
-    message = str(excinfo.value)
-    assert "cut off at the token limit" in message
-    assert "finish_reason='length'" in message
-
-
-def test_reasoning_exhaustion_suggests_a_non_reasoning_model(monkeypatch):
-    """Se i token sono finiti nel ragionamento, il messaggio deve dirlo."""
-    diag = {"finish_reason": "length", "reasoning_tokens": 8000,
-            "completion_tokens": 8000, "content_chars": 0}
-
-    detail = llm._error_detail(diag)
-
-    assert "internal reasoning" in detail
-    assert "deepseek-flash" in detail
-
-
 def test_unreadable_key_is_reported_not_silently_ignored(monkeypatch, tmp_path):
     """Una chiave non decifrabile deve dare un errore che dice cosa fare."""
     monkeypatch.setattr(config, "SECRET_KEY_PATH", tmp_path / "secret.key")
@@ -142,106 +110,7 @@ def test_extract_json_garbage_returns_none():
 
 
 # ── chunk_segments ───────────────────────────────────────────────────────────
-def test_chunk_segments_respects_budget_and_repeats_last_segment_as_context():
-    segments = [{"start": float(i), "end": i + 1.0, "text": c * 10}
-                for i, c in enumerate("abcd")]
-
-    chunks = chunk_segments(segments, budget=25)
-
-    # a+b stanno nel budget, c lo sfora
-    assert [[s["text"][0] for s in c] for c in chunks] == [["a", "b"], ["b", "c", "d"]]
-    # l'ultimo segmento del blocco precedente è ripetuto in testa come contesto
-    assert chunks[1][0] is chunks[0][-1]
-    # i segmenti "propri" di ogni blocco rispettano il budget
-    for i, chunk in enumerate(chunks):
-        own = chunk[1:] if i else chunk
-        assert sum(len(s["text"]) for s in own) <= 25
-
-
-def test_chunk_segments_keeps_an_oversized_segment_alone():
-    big = {"start": 0.0, "end": 1.0, "text": "x" * 100}
-
-    chunks = chunk_segments([big], budget=25)
-
-    assert chunks == [[big]]
-
-
-def test_chunk_segments_covers_all_segments_in_order():
-    segments = [{"start": float(i), "end": i + 1.0, "text": f"riga {i} " * 5} for i in range(7)]
-
-    chunks = chunk_segments(segments, budget=60)
-
-    assert len(chunks) > 1
-    flattened = [s for i, chunk in enumerate(chunks) for s in (chunk if i == 0 else chunk[1:])]
-    assert flattened == segments
-    assert chunks[0] == segments[: len(chunks[0])]
-
-
 # ── _clean_proposals ─────────────────────────────────────────────────────────
-def test_clean_proposals_drops_invalid_entries_and_normalizes_fields():
-    payload = {
-        "replacements": [
-            {"find": "  pie torch  ", "replace": "PyTorch", "kind": "TERM",
-             "confidence": "0.95", "reason": "termine tecnico"},
-            {"replace": "senza find"},
-            {"find": "x", "confidence": "non-un-numero"},
-            {"find": "y", "confidence": 0.9},
-            "non sono un dict",
-        ]
-    }
-
-    out = _clean_proposals(payload)
-
-    # L'entry senza confidenza valida (None) resta: la soglia si applica solo a
-    # un valore numerico, non all'assenza del campo.
-    assert [p["find"] for p in out] == ["pie torch", "x", "y"]
-    assert out[0] == {"find": "pie torch", "replace": "PyTorch", "reason": "termine tecnico",
-                      "kind": "term", "confidence": 0.95}
-    assert out[1]["replace"] == ""
-    assert out[1]["kind"] == "other"
-    assert out[1]["confidence"] is None
-    assert out[2]["confidence"] == 0.9
-
-
-def test_clean_proposals_drops_low_confidence_guesses():
-    """
-    Il modello riempie la quota di ipotesi quando glielo si consente: sotto la
-    soglia la proposta non deve arrivare in review. Misurato: con cap 15 le
-    proposte avevano confidenza 0.4-0.7 e molte erano inapplicabili.
-    """
-    payload = {"replacements": [
-        {"find": "a electoral band", "replace": "exponential", "confidence": 0.6},
-        {"find": "technological religions", "replace": "technological revolutions", "confidence": 0.95},
-        {"find": "the quality as well", "replace": "the inequality as well", "confidence": 0.4},
-        {"find": "the Pillar M's", "replace": "the algorithms", "confidence": 0.9},
-    ]}
-
-    out = _clean_proposals(payload)
-
-    assert [p["find"] for p in out] == ["technological religions", "the Pillar M's"]
-
-
-def test_clean_proposals_without_replacements_key():
-    assert _clean_proposals({}) == []
-    assert _clean_proposals({"replacements": None}) == []
-
-
-def test_clean_proposals_drops_noop_replacements():
-    """
-    Il modello restituisce a volte `replace` identico a `find` (misurato: 217 su
-    563 su una lezione reale): non è una correzione e non deve arrivare in review.
-    """
-    payload = {"replacements": [
-        {"find": "since the new birth age", "replace": "since the new birth age"},
-        {"find": "spazio in coda", "replace": "spazio in coda "},
-        {"find": "human country", "replace": "humanity"},
-    ]}
-
-    out = _clean_proposals(payload)
-
-    assert [p["find"] for p in out] == ["human country"]
-
-
 # ── chiavi cifrate ───────────────────────────────────────────────────────────
 def test_encrypt_decrypt_roundtrip_with_env_secret(monkeypatch):
     monkeypatch.setenv("TRASCRIVI_SECRET", Fernet.generate_key().decode("ascii"))
